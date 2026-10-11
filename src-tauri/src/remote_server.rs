@@ -2639,6 +2639,7 @@ fn codex_for_remote_session(
     };
     let codex = ctx.state::<CodexAppServerState>();
     if !codex.is_owned(&session_id) {
+        if codex.retained_pm_session(ctx, &session_id) { return Some(Err("PM_RUNTIME_RESTART_FORBIDDEN".into())); }
         return None;
     }
     Some(Ok((codex, session_id)))
@@ -2719,10 +2720,18 @@ fn invoke_rust_for_remote(
         }
         "agent:get-supported-session-types" => Ok(agent_cmd::agent_supported_session_type_ids()),
         "agent:list-presets" => Ok(agent_cmd::agent_supported_session_presets()),
+        "claude:get-pm-runtime" => string_param(params, "sessionId", channel).and_then(|session_id| {
+            ctx.state::<CodexAppServerState>().get_pm_runtime(&ctx, &session_id)
+        }),
         "claude:start-session" => {
             let options = params.get("options").cloned().unwrap_or(Value::Null);
             let maybe_options = Some(options.clone());
             if !should_handle_codex(&maybe_options) {
+                if let Some(id) = params.get("sessionId").and_then(Value::as_str) {
+                    if ctx.state::<CodexAppServerState>().retained_pm_session(ctx, id) {
+                        return Some(Err("PM_RUNTIME_IMMUTABLE".into()));
+                    }
+                }
                 return None;
             }
             string_param(params, "sessionId", channel).and_then(|session_id| {
@@ -2736,6 +2745,11 @@ fn invoke_rust_for_remote(
             let options = params.get("options").cloned().unwrap_or(Value::Null);
             let maybe_options = Some(options.clone());
             if !should_handle_codex(&maybe_options) {
+                if let Some(id) = params.get("sessionId").and_then(Value::as_str) {
+                    if ctx.state::<CodexAppServerState>().retained_pm_session(ctx, id) {
+                        return Some(Err("PM_RUNTIME_IMMUTABLE".into()));
+                    }
+                }
                 return None;
             }
             string_param(params, "sessionId", channel).and_then(|session_id| {
@@ -2782,6 +2796,10 @@ fn invoke_rust_for_remote(
             route.and_then(|(codex, session_id)| {
                 let prompt = string_param(params, "prompt", channel)?;
                 let images = optional_string_vec_param(params, "images");
+                if codex.is_pm_session(&session_id) {
+                    return codex.send_pm_message(&ctx, &session_id, &prompt, &images, params)
+                        .map_err(bridge_error_message);
+                }
                 codex
                     .send_message(&ctx, session_id, prompt, images)
                     .map_err(bridge_error_message)

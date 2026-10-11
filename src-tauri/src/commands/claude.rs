@@ -2622,6 +2622,11 @@ impl ClaudeRuntimeRouter {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, BridgeError> {
+        if let Some(id) = params.get("sessionId").and_then(Value::as_str) {
+            if self.codex.retained_pm_session(&self.app, id) {
+                return Err(BridgeError { message: "PM_RUNTIME_SIDECAR_FALLBACK_FORBIDDEN".into() });
+            }
+        }
         call_sidecar_with_timeout_blocking(
             self.app.clone(),
             self.sidecar.clone(),

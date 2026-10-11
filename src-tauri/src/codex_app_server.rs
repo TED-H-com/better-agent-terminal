@@ -5,6 +5,9 @@
 // thread/turn/item notifications back into the existing claude:* event shape
 // consumed by the renderer.
 
+#[path = "codex_pm_runtime.rs"]
+mod pm_runtime;
+
 use crate::app_data;
 use crate::codex_account_store;
 use crate::codex_auth;
@@ -328,6 +331,7 @@ struct PendingApproval {
 
 #[derive(Default)]
 struct CodexRuntime {
+    pm: Option<Arc<pm_runtime::PmState>>,
     connection: Mutex<Option<Arc<CodexConnection>>>,
     last_connection_activity: Mutex<Option<Instant>>,
     idle_reaper_running: AtomicBool,
@@ -778,7 +782,7 @@ fn is_codex_agent_preset(options: &Value) -> bool {
 }
 
 pub fn should_handle_codex(options: &Option<Value>) -> bool {
-    options.as_ref().map(is_codex_agent_preset).unwrap_or(false)
+    options.as_ref().map(|value| value.get("pmRuntimeProfile").is_some() || is_codex_agent_preset(value)).unwrap_or(false)
 }
 
 fn effective_cwd(options: &Value, context: &str) -> Result<String, BridgeError> {
@@ -3270,6 +3274,7 @@ impl CodexAppServerState {
     }
 
     fn mark_shared_auth_valid(&self, app: &HostContext, reason: &str) {
+        if self.runtime.as_ref().is_some_and(|runtime| runtime.pm.is_some()) { return; }
         if !codex_unified_enabled(app) {
             return;
         }
@@ -3295,6 +3300,7 @@ impl CodexAppServerState {
     }
 
     fn mark_shared_auth_needs_login(&self, app: &HostContext, reason: &str) {
+        if self.runtime.as_ref().is_some_and(|runtime| runtime.pm.is_some()) { return; }
         if !codex_unified_enabled(app) {
             return;
         }
@@ -3540,7 +3546,7 @@ impl CodexAppServerState {
     fn drop_connection(&self, app: &HostContext, reason: &str) {
         if matches!(reason, "unified-switch" | "unified-migrate" | "account-login" | "account-remove" | "legacy-switch" | "sync-active-changed") {
             let runtimes = self.inner.session_runtimes.lock().expect("codex runtime map lock")
-                .values().cloned().collect::<Vec<_>>();
+                .values().filter(|runtime| runtime.pm.is_none()).cloned().collect::<Vec<_>>();
             for runtime in runtimes {
                 *runtime.pending_unarchive.lock().expect("codex unarchive lock") = None;
                 Self { inner: self.inner.clone(), runtime: Some(runtime) }.take_connection_for_reap();
@@ -4909,7 +4915,7 @@ impl CodexAppServerState {
     // we never spawn an app-server just to read usage.
     pub fn fetch_account_rate_limits(&self, app: &HostContext) -> Option<Value> {
         let connection = self.live_connection().or_else(|| {
-            let runtimes = self.inner.session_runtimes.lock().ok()?.values().cloned().collect::<Vec<_>>();
+            let runtimes = self.inner.session_runtimes.lock().ok()?.values().filter(|runtime| runtime.pm.is_none()).cloned().collect::<Vec<_>>();
             runtimes.into_iter().find_map(|runtime|
                 Self { inner: self.inner.clone(), runtime: Some(runtime) }.live_connection())
         })?;
@@ -4939,6 +4945,9 @@ impl CodexAppServerState {
     }
 
     fn ensure_connection(&self, app: &HostContext) -> Result<Arc<CodexConnection>, String> {
+        if self.runtime.as_ref().is_some_and(|runtime| runtime.pm.is_some()) {
+            return self.live_connection().ok_or_else(|| "PM_RUNTIME_RESTART_FORBIDDEN".into());
+        }
         let _spawn_guard = self.spawn_lock().lock().map_err(|_| "codex spawn lock poisoned")?;
         let (active_changed, current_auth_id) =
             self.sync_unified_active_from_shared(app, "ensure-connection")?;
@@ -5152,6 +5161,10 @@ impl CodexAppServerState {
         session_id: String,
         options: Option<Value>,
     ) -> Result<Value, BridgeError> {
+        if options.as_ref().is_some_and(|value| value.get("pmRuntimeProfile").is_some()) {
+            return self.start_pm_session(app, session_id, options.unwrap());
+        }
+        self.reject_pm_session(app, &session_id)?;
         let operation_lock = self.turn_operation_lock(&session_id);
         let guard = operation_lock.lock()
             .map_err(|_| bridge_error("Codex turn operation lock poisoned"))?;
@@ -5337,6 +5350,7 @@ impl CodexAppServerState {
         session_id: String,
         context_markdown: String,
     ) -> Result<Value, BridgeError> {
+        self.reject_pm_session(app, &session_id)?;
         let item = codex_context_transfer_item(&context_markdown).map_err(bridge_error)?;
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let _turn_operation_guard = turn_operation_lock
@@ -5406,6 +5420,8 @@ impl CodexAppServerState {
         sdk_session_id: String,
         options: Option<Value>,
     ) -> Result<Value, BridgeError> {
+        if options.as_ref().is_some_and(|value| value.get("pmRuntimeProfile").is_some()) { return Err(bridge_error("PM_RUNTIME_RESUME_FORBIDDEN")); }
+        self.reject_pm_session(app, &session_id)?;
         let operation_lock = self.turn_operation_lock(&session_id);
         let _guard = operation_lock.lock()
             .map_err(|_| bridge_error("Codex turn operation lock poisoned"))?;
@@ -5611,6 +5627,7 @@ impl CodexAppServerState {
         prompt: String,
         images: Vec<String>,
     ) -> Result<Value, BridgeError> {
+        if self.pm_state(&session_id).is_some() { return Err(bridge_error("PM_RUNTIME_SEND_IDENTITY_REQUIRED")); }
         let owner = self.for_session(&session_id);
         if self.inner.reloading_sessions.lock().expect("codex reload lock").contains(&session_id) {
             return Err(bridge_error("Session is reloading; wait before sending a message"));
@@ -6135,6 +6152,7 @@ impl CodexAppServerState {
         app: &HostContext,
         session_id: String,
     ) -> Result<Value, BridgeError> {
+        if self.pm_state(&session_id).is_some() { return Ok(self.stop_pm_session(&session_id, "explicit_abort")); }
         log_codex(app, &session_id, "abort_session requested");
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let _turn_operation_guard = turn_operation_lock
@@ -6258,6 +6276,7 @@ impl CodexAppServerState {
     }
 
     pub fn stop_session(&self, session_id: String) -> Value {
+        if self.pm_state(&session_id).is_some() { return self.stop_pm_session(&session_id, "explicit_stop"); }
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let turn_operation_guard = turn_operation_lock
             .lock()
@@ -6295,6 +6314,7 @@ impl CodexAppServerState {
         app: &HostContext,
         session_id: String,
     ) -> Result<Value, BridgeError> {
+        self.reject_pm_session(app, &session_id)?;
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let _turn_operation_guard = turn_operation_lock
             .lock()
@@ -6383,6 +6403,7 @@ impl CodexAppServerState {
     }
 
     pub fn reload_session(&self, app: &HostContext, session_id: &str) -> Result<Value, BridgeError> {
+        self.reject_pm_session(app, &session_id)?;
         if !self.inner.reloading_sessions.lock().expect("codex reload lock").insert(session_id.to_string()) {
             return Err(bridge_error("Session is already reloading"));
         }
@@ -6478,6 +6499,7 @@ impl CodexAppServerState {
     }
 
     pub fn rest_session(&self, app: &HostContext, session_id: &str) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         session.is_resting = true;
@@ -6504,6 +6526,7 @@ impl CodexAppServerState {
     }
 
     pub fn wake_session(&self, session_id: &str) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         session.is_resting = false;
@@ -6556,6 +6579,7 @@ impl CodexAppServerState {
             .expect("codex sessions lock")
             .get(session_id)
             .map(CodexSession::metadata)
+            .map(|mut meta| { if let Some(pm) = self.pm_state(session_id) { meta["pmRuntime"] = pm.view(); } meta })
     }
 
     pub fn get_context_usage(&self, session_id: &str) -> Option<Value> {
@@ -6587,6 +6611,7 @@ impl CodexAppServerState {
     }
 
     pub fn set_model(&self, app: &HostContext, session_id: &str, model: String) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         if session.model == model {
@@ -6612,6 +6637,7 @@ impl CodexAppServerState {
     }
 
     pub fn set_fast_mode(&self, app: &HostContext, session_id: &str, enabled: bool) -> Option<Result<Value, BridgeError>> {
+        if self.pm_state(&session_id).is_some() { return Some(Err(bridge_error("PM_RUNTIME_IMMUTABLE"))); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         if enabled && !crate::commands::settings::fast_mode_debug_enabled() {
@@ -6629,6 +6655,7 @@ impl CodexAppServerState {
     }
 
     pub fn set_effort(&self, app: &HostContext, session_id: &str, effort: String) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         let next = normalize_effort(Some(&effort));
@@ -6653,6 +6680,7 @@ impl CodexAppServerState {
         session_id: &str,
         mode: String,
     ) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         let next = normalize_sandbox(Some(&mode));
@@ -6675,6 +6703,7 @@ impl CodexAppServerState {
         session_id: &str,
         policy: String,
     ) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         let next = normalize_approval(Some(&policy));
@@ -6696,6 +6725,7 @@ impl CodexAppServerState {
         app: &HostContext,
         session_id: &str,
     ) -> Result<Value, BridgeError> {
+        self.reject_pm_session(app, &session_id)?;
         let (thread_id, model, cwd, approval_policy, sandbox_mode, meta) = {
             let sessions = self.inner.sessions.lock().expect("codex sessions lock");
             let session = sessions

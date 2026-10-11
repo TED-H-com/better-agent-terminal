@@ -4,6 +4,7 @@ fn main() {
     // share the same compiled application library.
     ensure_bundle_mode_marker();
     export_app_version();
+    export_source_revision();
     configure_windows_common_controls_manifest();
     // Tauri's build-time codegen (context, capabilities, resource copy) is only
     // needed for the desktop shell. A headless `--no-default-features` build
@@ -84,4 +85,13 @@ fn configure_windows_common_controls_manifest() {
 fn is_windows_msvc_target() -> bool {
     std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+}
+
+fn export_source_revision() {
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/refs/heads");
+    let revision = std::process::Command::new("git").args(["rev-parse", "HEAD"])
+        .current_dir(manifest_dir()).output().ok().filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok()).unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=BAT_SOURCE_REVISION={}", revision.trim());
 }

@@ -470,6 +470,7 @@ dependencies = [
  "flate2",
  "image",
  "keyring-core",
+ "libc",
  "rand 0.10.1",
  "rcgen",
  "reqwest 0.12.28",
