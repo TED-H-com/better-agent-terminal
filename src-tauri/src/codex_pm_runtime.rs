@@ -1543,6 +1543,7 @@ fn pm_session(id: &str, cwd: &str, model: &str) -> CodexSession {
         last_output_tokens: 0,
         last_cache_read_tokens: 0,
         num_turns: 0,
+        input_state: NativeInputState::default(),
         last_turn_started_at: None,
         last_turn_first_token_ms: None,
         last_turn_duration_ms: None,

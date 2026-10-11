@@ -478,6 +478,39 @@ pub struct CodexAppServerState {
     runtime: Option<Arc<CodexRuntime>>,
 }
 
+/// Process-local ordinary input identity; unrelated to SDK usage/turn totals.
+/// Every accepted handler entry is counted before preparation or queue waits.
+#[derive(Clone)]
+struct NativeInputState(Arc<Mutex<NativeInputCounters>>);
+struct NativeInputCounters { epoch: String, received: u64, pending: u64 }
+impl Default for NativeInputState {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(NativeInputCounters {
+            epoch: format!("{:032x}", rand::random::<u128>()), received: 0, pending: 0,
+        })))
+    }
+}
+impl NativeInputState {
+    fn begin(&self) -> NativeInputGuard {
+        let mut value = self.0.lock().expect("native input identity lock");
+        value.received = value.received.saturating_add(1);
+        value.pending = value.pending.saturating_add(1);
+        NativeInputGuard(self.clone())
+    }
+    fn view(&self) -> Value {
+        let value = self.0.lock().expect("native input identity lock");
+        json!({"schema":"bat_input_state_v1", "epoch":value.epoch,
+            "received":value.received, "pending":value.pending})
+    }
+}
+struct NativeInputGuard(NativeInputState);
+impl Drop for NativeInputGuard {
+    fn drop(&mut self) {
+        let mut value = self.0.0.lock().expect("native input identity lock");
+        value.pending = value.pending.saturating_sub(1);
+    }
+}
+
 #[derive(Clone)]
 struct CodexSession {
     session_id: String,
@@ -515,6 +548,7 @@ struct CodexSession {
     last_output_tokens: u64,
     last_cache_read_tokens: u64,
     num_turns: u64,
+    input_state: NativeInputState,
     last_turn_started_at: Option<Instant>,
     last_turn_first_token_ms: Option<u64>,
     last_turn_duration_ms: Option<u64>,
@@ -616,6 +650,7 @@ impl CodexSession {
             "outputTokens": self.output_tokens,
             "durationMs": self.start_time.elapsed().as_millis() as u64,
             "numTurns": self.num_turns,
+            "inputState": self.input_state.view(),
             "contextWindow": self.context_window,
             "maxOutputTokens": 0,
             "contextTokens": context_tokens,
@@ -4639,6 +4674,7 @@ impl CodexAppServerState {
                     continue;
                 }
 
+                session.input_state = NativeInputState::default();
                 let was_active = session.is_running
                     || session.is_resting
                     || session.abort_requested
@@ -5217,6 +5253,7 @@ impl CodexAppServerState {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 0,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -5351,6 +5388,7 @@ impl CodexAppServerState {
         context_markdown: String,
     ) -> Result<Value, BridgeError> {
         self.reject_pm_session(app, &session_id)?;
+        let _input = self.begin_native_input(&session_id)?;
         let item = codex_context_transfer_item(&context_markdown).map_err(bridge_error)?;
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let _turn_operation_guard = turn_operation_lock
@@ -5517,6 +5555,7 @@ impl CodexAppServerState {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 0,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -5620,6 +5659,12 @@ impl CodexAppServerState {
         Ok(json!({ "ok": true, "sessionId": session_id, "sdkSessionId": sdk_session_id }))
     }
 
+    fn begin_native_input(&self, session_id: &str) -> Result<NativeInputGuard, BridgeError> {
+        let input = self.inner.sessions.lock().expect("codex sessions lock")
+            .get(session_id).ok_or_else(|| bridge_error("Codex session not started"))?.input_state.clone();
+        Ok(input.begin())
+    }
+
     pub fn send_message(
         &self,
         app: &HostContext,
@@ -5628,6 +5673,7 @@ impl CodexAppServerState {
         images: Vec<String>,
     ) -> Result<Value, BridgeError> {
         if self.pm_state(&session_id).is_some() { return Err(bridge_error("PM_RUNTIME_SEND_IDENTITY_REQUIRED")); }
+        let _input = self.begin_native_input(&session_id)?;
         let owner = self.for_session(&session_id);
         if self.inner.reloading_sessions.lock().expect("codex reload lock").contains(&session_id) {
             return Err(bridge_error("Session is reloading; wait before sending a message"));
@@ -6371,6 +6417,7 @@ impl CodexAppServerState {
             session.last_output_tokens = 0;
             session.last_cache_read_tokens = 0;
             session.num_turns = 0;
+            session.input_state = NativeInputState::default();
             session.last_turn_started_at = None;
             session.last_turn_first_token_ms = None;
             session.last_turn_duration_ms = None;
@@ -6419,6 +6466,7 @@ impl CodexAppServerState {
             let session = sessions.get_mut(session_id)
                 .ok_or_else(|| bridge_error("Codex session not started"))?;
             session.check_reload_available()?;
+            session.input_state = NativeInputState::default();
             let (partial, interrupted_tools, had_work) = session.prepare_reload();
             (session.clone(), partial, interrupted_tools, had_work)
         };
@@ -8416,6 +8464,7 @@ mod tests {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 1,
+            input_state: NativeInputState::default(),
             last_turn_started_at: Some(Instant::now()),
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -9265,6 +9314,7 @@ mod tests {
             last_output_tokens: 50,
             last_cache_read_tokens: 25,
             num_turns: 1,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -9317,6 +9367,7 @@ mod tests {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 0,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -9377,6 +9428,7 @@ mod tests {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 1,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -10230,4 +10282,52 @@ invalid json
         ));
         assert!(state.inner.connection.try_lock().unwrap().is_none());
     }
+    #[test]
+    fn native_input_identity_counts_pending_entries_not_sdk_usage() {
+        let input = NativeInputState::default();
+        let epoch = input.view()["epoch"].clone();
+        let first = input.begin();
+        let second = input.begin();
+        assert_eq!(input.view()["received"], 2);
+        assert_eq!(input.view()["pending"], 2);
+        drop(first);
+        assert_eq!(input.view()["pending"], 1);
+        drop(second);
+        assert_eq!(input.view(), json!({"schema":"bat_input_state_v1", "epoch":epoch, "received":2, "pending":0}));
+        assert_ne!(NativeInputState::default().view()["epoch"], epoch);
+    }
+
+    #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn native_input_identity_is_visible_while_original_send_waits_for_turn_lock() {
+        let (app, _) = session_sync_test_host();
+        let state = CodexAppServerState::default();
+        let mut session = test_codex_session();
+        session.is_running = false;
+        let identity = session.input_state.clone();
+        state.inner.sessions.lock().unwrap().insert("session-1".into(), session);
+        let turn = state.turn_operation_lock("session-1");
+        let held = turn.lock().unwrap();
+        std::thread::scope(|scope| {
+            let sending = scope.spawn(|| state.send_message(&app, "session-1".into(), "queued input".into(), vec![]));
+            let until = Instant::now() + Duration::from_secs(2);
+            while identity.view()["received"] == 0 {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            let meta = state.get_session_meta("session-1").unwrap();
+            assert_eq!(meta["isStreaming"], false);
+            assert_eq!(meta["numTurns"], 1);
+            assert_eq!(meta["inputState"]["received"], 1);
+            assert_eq!(meta["inputState"]["pending"], 1);
+            // End only this fake session before releasing the gate; no provider starts.
+            state.inner.sessions.lock().unwrap().remove("session-1");
+            drop(held);
+            let result = sending.join().unwrap();
+            assert!(result.is_err() || result.unwrap()["cancelled"] == true);
+        });
+        assert_eq!(identity.view()["pending"], 0);
+        assert_eq!(identity.view()["received"], 1);
+    }
+
 }

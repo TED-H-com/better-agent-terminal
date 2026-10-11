@@ -22,7 +22,7 @@ import { join } from 'node:path'
 
 const { dispatch } = await import('../src/server.mjs')
 const { __setSdkOverrideForTests } = await import('../src/lib/sdk-loader.mjs')
-const { sessions, ensureSession } = await import('../src/lib/state.mjs')
+const { sessions, ensureSession, buildSessionMeta } = await import('../src/lib/state.mjs')
 
 let nextRequestId = 1
 function send(method, params) {
@@ -122,8 +122,16 @@ try {
       assert.deepEqual(reply.result, { ok: true, accepted: true, queued: false })
       assert.equal(sdk.state.pushed.length, 1, 'the prompt should have reached the SDK')
       assert.equal(sdk.state.resultYielded, false, 'reply must not wait for the turn to finish')
+      const identity = buildSessionMeta(sessions.get(sessionId)).inputState
+      assert.equal(identity.schema, 'bat_input_state_v1')
+      assert.match(identity.epoch, /^[a-f0-9]{32}$/)
+      assert.equal(identity.received, 1)
+      assert.equal(identity.pending, 1, 'ACK must retain pending native work')
       // Let the turn finish so it does not leak into later cases.
       sdk.state.release?.()
+      await sessions.get(sessionId).sendQueue
+      const completed = buildSessionMeta(sessions.get(sessionId)).inputState
+      assert.deepEqual(completed, { ...identity, pending: 0 })
     } finally {
       sessions.delete(sessionId)
       __setSdkOverrideForTests(undefined)
@@ -147,6 +155,10 @@ try {
 
       // Second send arrives mid-turn, so it queues behind the live one.
       const secondReply = send('claude.sendMessage', { sessionId, prompt: 'second', suppressUserEcho: true })
+      await Promise.resolve()
+      const pending = buildSessionMeta(sessions.get(sessionId)).inputState
+      assert.equal(pending.received, 2, 'queued entry counts before SDK turn starts')
+      assert.equal(pending.pending, 2)
       const interrupted = await send('claude.interruptTurn', { sessionId })
       assert.equal(interrupted.result?.ok, true, `interruptTurn failed: ${JSON.stringify(interrupted.result)}`)
       assert.equal(sdk.state.releasedOnInterrupt, true, 'interrupt should have ended the live turn')
@@ -155,6 +167,11 @@ try {
       assert.equal(second.error, undefined, `unexpected RPC error: ${JSON.stringify(second.error)}`)
       assert.deepEqual(second.result, { ok: false, cancelled: true })
       assert.equal(sdk.state.pushed.length, 1, 'the cancelled prompt must never reach the SDK')
+      assert.deepEqual(buildSessionMeta(sessions.get(sessionId)).inputState, { ...pending, pending: 0 })
+      sessions.delete(sessionId)
+      const fresh = seedSession(sessionId, cwd)
+      assert.notEqual(buildSessionMeta(fresh).inputState.epoch, pending.epoch)
+      assert.equal(buildSessionMeta(fresh).inputState.received, 0)
     } finally {
       sessions.delete(sessionId)
       __setSdkOverrideForTests(undefined)

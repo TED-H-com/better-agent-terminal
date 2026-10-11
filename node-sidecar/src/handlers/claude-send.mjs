@@ -35,6 +35,8 @@ import {
   sessions,
   ensureSession,
   buildSessionMeta,
+  beginNativeInput,
+  newNativeInputState,
   saveSessionConfig,
   appendSessionMessage,
   appendSessionStream,
@@ -1116,6 +1118,7 @@ export async function reloadClaudeSession(sessionId) {
   if (!s) throw new Error('Session not started')
   if (s.reloading) throw new Error('Session is already reloading')
   s.reloading = true
+  s.inputState = newNativeInputState()
   s.runtimeGeneration = (s.runtimeGeneration || 0) + 1
   const previousQueue = s.sendQueue
   // A stuck old RPC must not keep future sends chained behind a dead agent.
@@ -1394,6 +1397,7 @@ registerHandler('claude.sendMessage', async (params) => {
       acceptedAt: Date.now(),
     })
   }
+  const finishInput = beginNativeInput(s)
   if (!isCodexSession(sessionId)) {
     emitUserEcho(params, sessionId, prompt, images)
   }
@@ -1435,6 +1439,7 @@ registerHandler('claude.sendMessage', async (params) => {
     return performSendMessage(params, onAccepted)
   })
   const queued = run.finally(() => {
+    finishInput()
     if (s.sendQueue === queued) s.sendQueue = null
   })
   s.sendQueue = queued
