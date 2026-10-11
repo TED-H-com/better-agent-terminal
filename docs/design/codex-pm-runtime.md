@@ -58,8 +58,18 @@ native user echo must match both that ID and the exact input digest. A lost ACK,
 thread-not-found response, timeout or broken pipe cannot recreate a thread or
 resend. Ordinary Codex send behavior is unchanged.
 
+The final native spawn/registration and every PM stdin frame share a short stop
+serialization gate. Stop requests cancellation before waiting for that gate;
+accepted stop means no later frame or launch can begin. PM stdin is nonblocking,
+and a bounded write loop checks cancellation and the original deadline even when
+the native process stops reading. The gate is released before waiting for any
+response. Partial frames retain the fsynced consumed send slot and remain unknown
+across restart; they cannot become proof of an unsent operation or permit retry.
+
 Read `claude:get-pm-runtime {sessionId}`. It returns `{sessionId, pmRuntime}`;
 start results and live `get-session-meta.pmRuntime` contain the same record.
+Ordinary replay metadata excludes this full proof record to avoid duplicating native
+output inside bounded replay events. The dedicated readback retains the full proof.
 The record includes profile/version, server-generated runtime ID, correlation
 digest, BAT version/source/binary digest, pinned Codex version/source/binary
 digest, original process identity (`pid`, Linux `startTicks`, `bootIdDigest`),

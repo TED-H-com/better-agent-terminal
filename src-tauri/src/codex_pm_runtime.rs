@@ -283,6 +283,10 @@ pub(super) struct PmState {
     started: Instant,
     timeout: Duration,
     stop_lock: Mutex<()>,
+    effect_gate: Mutex<()>,
+    cancel_requested: AtomicBool,
+    #[cfg(test)]
+    before_launch: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     poisoned: AtomicBool,
     stop_requested: AtomicBool,
     items: Mutex<NativeItems>,
@@ -332,6 +336,10 @@ impl PmState {
             started,
             timeout,
             stop_lock: Mutex::new(()),
+            effect_gate: Mutex::new(()),
+            cancel_requested: AtomicBool::new(false),
+            #[cfg(test)]
+            before_launch: Mutex::new(None),
             poisoned: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
             items: Mutex::new(NativeItems::default()),
@@ -346,13 +354,76 @@ impl PmState {
     }
     fn remaining(&self) -> Result<Duration, String> {
         require(
-            !self.stop_requested.load(Ordering::Acquire),
+            !self.stop_requested.load(Ordering::Acquire)
+                && !self.cancel_requested.load(Ordering::Acquire),
             "PM_RUNTIME_STOPPED",
         )?;
         self.timeout
             .checked_sub(self.started.elapsed())
             .filter(|d| !d.is_zero())
             .ok_or_else(|| "PM_RUNTIME_DEADLINE_EXPIRED".into())
+    }
+    fn accept_stop(&self) {
+        // Cancellation interrupts a nonblocking partial write; acquiring the gate
+        // is the stop linearization point. Never hold it while awaiting an ACK.
+        self.cancel_requested.store(true, Ordering::Release);
+        let _gate = self.effect_gate.lock().expect("PM effect gate");
+        self.stop_requested.store(true, Ordering::Release);
+    }
+    fn write_frame(&self, connection: &CodexConnection, message: Value) -> Result<(), String> {
+        let mut bytes = serde_json::to_vec(&message).map_err(|_| "PM_RUNTIME_INPUT_INVALID")?;
+        bytes.push(b'\n');
+        require(bytes.len() <= LINE_LIMIT, "PM_RUNTIME_INPUT_INVALID")?;
+        // A contended stdin lock cannot prevent stop from acquiring its gate.
+        let mut stdin = connection
+            .stdin
+            .lock()
+            .map_err(|_| "PM_RUNTIME_PIPE_UNAVAILABLE")?;
+        let _gate = self
+            .effect_gate
+            .lock()
+            .map_err(|_| "PM_RUNTIME_LOCK_UNAVAILABLE")?;
+        let mut written = 0;
+        while written < bytes.len() {
+            self.remaining()?;
+            match stdin.write(&bytes[written..]) {
+                Ok(0) => return Err("PM_RUNTIME_PIPE_CLOSED".into()),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err("PM_RUNTIME_PIPE_WRITE_FAILED".into()),
+            }
+        }
+        Ok(())
+    }
+    fn request(
+        &self,
+        connection: &CodexConnection,
+        method: &str,
+        params: Value,
+        limit: Duration,
+    ) -> Result<Value, String> {
+        let id = connection.alloc_id();
+        if method == "turn/start" {
+            require(
+                self.view()["send"]["requestId"] == id,
+                "PM_RUNTIME_SEND_IDENTITY_MISMATCH",
+            )?;
+        }
+        let (tx, rx) = channel();
+        connection.pending.insert(id, tx);
+        let result = (|| {
+            self.write_frame(connection, json!({"method":method,"id":id,"params":params}))?;
+            // The gate and stdin lock have both been released before response wait.
+            rx.recv_timeout(self.remaining()?.min(limit))
+                .map_err(|_| "PM_RUNTIME_RESPONSE_UNKNOWN".to_string())?
+        })();
+        if result.is_err() {
+            let _ = connection.pending.take(id);
+        }
+        result
     }
     fn update(&self, edit: impl FnOnce(&mut Value)) -> Result<(), String> {
         let mut record = self
@@ -686,7 +757,7 @@ fn kill_owned(connection: &CodexConnection, identity: &Value) {
     }
 }
 fn finish(pm: &PmState, connection: &CodexConnection, action: &str) -> Value {
-    pm.stop_requested.store(true, Ordering::Release);
+    pm.accept_stop();
     let _stop = pm.stop_lock.lock().expect("PM stop lock");
     if pm.view()["exit"]["confirmedDead"] == true {
         return pm.view();
@@ -898,7 +969,7 @@ impl CodexAppServerState {
         let Some(pm) = owner.runtime.as_ref().and_then(|r| r.pm.as_ref()) else {
             return json!({"ok":false,"error":"PM_RUNTIME_NOT_OWNED"});
         };
-        pm.stop_requested.store(true, Ordering::Release);
+        pm.accept_stop();
         let connection = owner
             .connection_slot()
             .lock()
@@ -1081,6 +1152,16 @@ impl CodexAppServerState {
         auth: Option<File>,
     ) -> Result<(), String> {
         pm.remaining()?;
+        #[cfg(test)]
+        if let Some((arrived, proceed)) = pm.before_launch.lock().unwrap().take() {
+            arrived.wait();
+            proceed.wait();
+        }
+        let gate = pm
+            .effect_gate
+            .lock()
+            .map_err(|_| "PM_RUNTIME_LOCK_UNAVAILABLE")?;
+        pm.remaining()?;
         pm.update(|r| r["launchAttempted"] = json!(true))?;
         let mut child = command.spawn().map_err(|_| "PM_RUNTIME_SPAWN_FAILED")?;
         drop(auth);
@@ -1094,6 +1175,16 @@ impl CodexAppServerState {
             }
         };
         let stdin = child.stdin.take().ok_or("PM_RUNTIME_PIPE_MISSING")?;
+        use std::os::fd::AsRawFd;
+        let flags = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                == -1
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("PM_RUNTIME_NONBLOCKING_PIPE_UNAVAILABLE".into());
+        }
         let stdout = child.stdout.take().ok_or("PM_RUNTIME_PIPE_MISSING")?;
         let stderr = child.stderr.take().ok_or("PM_RUNTIME_PIPE_MISSING")?;
         let pending = Arc::new(PendingTable::default());
@@ -1111,6 +1202,7 @@ impl CodexAppServerState {
         });
         *self.connection_slot().lock().expect("PM connection lock") = Some(connection.clone());
         pm.update(|r| r["process"] = identity)?;
+        drop(gate);
         self.start_pm_readers(app, id, pm, connection.clone(), stdout, stderr);
         let watch_pm = pm.clone();
         let watch_connection = Arc::downgrade(&connection);
@@ -1130,19 +1222,13 @@ impl CodexAppServerState {
             std::thread::sleep(wait);
         });
         let request = |method: &str, params: Value| {
-            connection.request_logged(
-                app,
-                id,
-                method,
-                params,
-                pm.remaining()?.min(Duration::from_secs(20)),
-            )
+            pm.request(&connection, method, params, Duration::from_secs(20))
         };
         request(
             "initialize",
             json!({"clientInfo":{"name":"better_agent_terminal_pm","version":app.version()},"capabilities":{"experimentalApi":true}}),
         )?;
-        connection.notify("initialized", json!({}))?;
+        pm.write_frame(&connection, json!({"method":"initialized","params":{}}))?;
         let cwd = pm.directory.join("workspace");
         let config = request("config/read", json!({"cwd":cwd,"includeLayers":true}))?;
         validate_config(&config["config"])?;
@@ -1196,7 +1282,13 @@ impl CodexAppServerState {
             "claude:status",
             id,
             "meta",
-            self.get_session_meta(id).unwrap(),
+            self.inner
+                .sessions
+                .lock()
+                .expect("PM sessions")
+                .get(id)
+                .unwrap()
+                .metadata(),
         );
         Ok(())
     }
@@ -1293,8 +1385,8 @@ impl CodexAppServerState {
                     session.is_running = false;
                 }
             }
-            if let Some(meta) = state.get_session_meta(&id) {
-                emit(&app, "claude:status", &id, "meta", meta);
+            if let Some(session) = state.inner.sessions.lock().expect("PM sessions").get(&id) {
+                emit(&app, "claude:status", &id, "meta", session.metadata());
             }
         });
     }
@@ -1376,12 +1468,11 @@ impl CodexAppServerState {
             }
             // Slot and exact request ID are fsynced before the sole write. No
             // ensure/reconnect/thread-resume/retry is reachable on this path.
-            let response = connection.request_logged(
-                app,
-                id,
+            let response = pm.request(
+                &connection,
                 "turn/start",
                 native_params,
-                pm.remaining()?.min(Duration::from_secs(60)),
+                Duration::from_secs(60),
             );
             match response {
                 Ok(response) => {
@@ -1503,6 +1594,20 @@ mod tests {
     }
     impl Rig {
         fn new(mode: &str, timeout: u64) -> Self {
+            let (rig, command) = Self::unstarted(mode, timeout);
+            let owner = rig.state.for_session("pm-session");
+            let result =
+                owner.run_pm_command(&rig.app, "pm-session", "test-model", &rig.pm, command, None);
+            if mode == "bad-config" {
+                assert_eq!(result.unwrap_err(), "PM_RUNTIME_CONFIG_UNVERIFIED");
+                rig.state
+                    .stop_pm_session("pm-session", "test_failed_preflight");
+            } else {
+                result.unwrap();
+            }
+            rig
+        }
+        fn unstarted(mode: &str, timeout: u64) -> (Self, Command) {
             let root =
                 std::env::temp_dir().join(format!("bat-pm-test-{:032x}", rand::random::<u128>()));
             private_dir(&root).unwrap();
@@ -1551,21 +1656,16 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let owner = state.for_session("pm-session");
-            let result = owner.run_pm_command(&app, "pm-session", "test-model", &pm, command, None);
-            if mode == "bad-config" {
-                assert_eq!(result.unwrap_err(), "PM_RUNTIME_CONFIG_UNVERIFIED");
-                state.stop_pm_session("pm-session", "test_failed_preflight");
-            } else {
-                result.unwrap();
-            }
-            Self {
-                app,
-                state,
-                pm,
-                root,
-                events,
-            }
+            (
+                Self {
+                    app,
+                    state,
+                    pm,
+                    root,
+                    events,
+                },
+                command,
+            )
         }
         fn send(&self) -> Result<Value, BridgeError> {
             self.state.send_pm_message(
@@ -1638,7 +1738,126 @@ for line in sys.stdin:
   event('turn/completed',{'threadId':'thread-original','turn':{'id':'turn-original','status':'completed','itemsView':'summary','items':[agent]}})
   time.sleep(10);continue
  send({'id':q['id'],'result':result})
+ if mode=='blocked-pipe' and method=='mcpServerStatus/list': time.sleep(10)
 "#;
+    fn wait_for(rig: &Rig, predicate: impl Fn(&Value) -> bool) {
+        let until = Instant::now() + Duration::from_secs(2);
+        while !predicate(&rig.pm.view()) {
+            assert!(
+                Instant::now() < until,
+                "timed out waiting for runtime state"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    #[test]
+    fn pm_stop_before_spawn_gate_prevents_later_launch() {
+        let (rig, command) = Rig::unstarted("happy", 5000);
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let proceed = Arc::new(std::sync::Barrier::new(2));
+        *rig.pm.before_launch.lock().unwrap() = Some((arrived.clone(), proceed.clone()));
+        std::thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                rig.state.for_session("pm-session").run_pm_command(
+                    &rig.app,
+                    "pm-session",
+                    "test-model",
+                    &rig.pm,
+                    command,
+                    None,
+                )
+            });
+            arrived.wait();
+            let stopped = rig
+                .state
+                .stop_pm_session("pm-session", "test_stop_before_spawn");
+            assert!(rig.pm.stop_requested.load(Ordering::Acquire));
+            assert_eq!(stopped["pmRuntime"]["launchAttempted"], false);
+            assert!(stopped["pmRuntime"]["process"].is_null());
+            proceed.wait();
+            assert_eq!(running.join().unwrap().unwrap_err(), "PM_RUNTIME_STOPPED");
+        });
+        assert_eq!(rig.pm.view()["launchAttempted"], false);
+        assert!(rig.calls().is_empty());
+    }
+    #[test]
+    fn pm_stop_while_send_waits_for_stdin_prevents_the_original_frame() {
+        let rig = Rig::new("happy", 5000);
+        let connection = rig
+            .state
+            .for_session("pm-session")
+            .live_connection()
+            .unwrap();
+        let stdin = connection.stdin.lock().unwrap();
+        std::thread::scope(|scope| {
+            let sending = scope.spawn(|| rig.send());
+            wait_for(&rig, |r| r["send"]["attempted"] == true);
+            let stopped = rig
+                .state
+                .stop_pm_session("pm-session", "test_stop_before_frame");
+            assert_eq!(stopped["pmRuntime"]["exit"]["confirmedDead"], true);
+            drop(stdin);
+            assert!(sending.join().unwrap().is_err());
+        });
+        assert!(!rig.calls().iter().any(|q| q["method"] == "turn/start"));
+        assert!(rig.send().is_err());
+        let retained = CodexAppServerState::default()
+            .get_pm_runtime(&rig.app, "pm-session")
+            .unwrap();
+        assert_eq!(retained["pmRuntime"]["send"]["attempted"], true);
+        assert!(retained["pmRuntime"]["terminal"].is_null());
+    }
+    #[test]
+    fn pm_stop_interrupts_partial_nonblocking_frame_without_releasing_send_slot() {
+        let rig = Rig::new("blocked-pipe", 5000);
+        let connection = rig
+            .state
+            .for_session("pm-session")
+            .live_connection()
+            .unwrap();
+        std::thread::scope(|scope| {
+            let sending = scope.spawn(|| rig.state.send_pm_message(&rig.app, "pm-session", &"x".repeat(LINE_LIMIT/2), &[],
+                &json!({"clientMessageId":"original-client-1","pmRuntimeId":rig.pm.view()["runtimeId"],"pmContextDigest":"a".repeat(64)})));
+            wait_for(&rig, |r| r["send"]["attempted"] == true);
+            // Once the pipe is full there is an actual partial, unread frame;
+            // wait until its writer owns the gate instead of relying on a sleep.
+            let until = Instant::now() + Duration::from_secs(2);
+            loop {
+                // The writer owns stdin, so inspect the actual pipe through
+                // /proc rather than acquiring that mutex or guessing timing.
+                let fd_path = format!("/proc/{}/fd/0", connection.pid);
+                let pipe = File::open(fd_path).unwrap();
+                use std::os::fd::AsRawFd;
+                let mut unread: libc::c_int = 0;
+                assert_eq!(
+                    unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut unread) },
+                    0
+                );
+                if unread > 0 && rig.pm.effect_gate.try_lock().is_err() {
+                    break;
+                }
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            let started = Instant::now();
+            let stopped = rig.state.stop_pm_session("pm-session", "test_blocked_pipe");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(stopped["pmRuntime"]["exit"]["confirmedDead"], true);
+            assert!(sending.join().unwrap().is_err());
+        });
+        assert_eq!(
+            connection.next_id.load(Ordering::Acquire),
+            rig.pm.view()["send"]["requestId"].as_u64().unwrap()
+        );
+        assert!(!rig.calls().iter().any(|q| q["method"] == "turn/start"));
+        assert!(rig.send().is_err());
+        let retained = CodexAppServerState::default()
+            .get_pm_runtime(&rig.app, "pm-session")
+            .unwrap();
+        assert_eq!(retained["pmRuntime"]["send"]["attempted"], true);
+        assert!(retained["pmRuntime"]["send"]["acknowledged"] == false);
+        assert!(retained["pmRuntime"]["terminal"].is_null());
+    }
     #[test]
     fn pm_options_require_explicit_profile_and_frozen_carriers() {
         let mut value = options();
@@ -1723,6 +1942,10 @@ for line in sys.stdin:
             1
         );
         let events = rig.events.lock().unwrap();
+        assert!(events
+            .iter()
+            .filter(|(name, _)| name == "claude:status")
+            .all(|(_, p)| p["payload"].get("pmRuntime").is_none()));
         assert!(events.iter().any(
             |(name, p)| name == "claude:turn-end" && p["payload"]["turnId"] == "turn-original"
         ));

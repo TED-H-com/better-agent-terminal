@@ -88,10 +88,30 @@ fn is_windows_msvc_target() -> bool {
 }
 
 fn export_source_revision() {
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/refs/heads");
-    let revision = std::process::Command::new("git").args(["rev-parse", "HEAD"])
-        .current_dir(manifest_dir()).output().ok().filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok()).unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=BAT_SOURCE_REVISION={}", revision.trim());
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(manifest_dir())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|out| out.trim().to_owned())
+    };
+    // A linked worktree has a .git file, not a .git directory. Track the actual
+    // worktree HEAD and shared branch ref so source identity updates after commit.
+    let mut refs = vec!["HEAD".to_string(), "packed-refs".to_string()];
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        refs.push(branch);
+    }
+    for name in refs {
+        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
+            let path = manifest_dir().join(path);
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    println!(
+        "cargo:rustc-env=BAT_SOURCE_REVISION={}",
+        git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
+    );
 }
