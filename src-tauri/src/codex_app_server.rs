@@ -5388,12 +5388,13 @@ impl CodexAppServerState {
         context_markdown: String,
     ) -> Result<Value, BridgeError> {
         self.reject_pm_session(app, &session_id)?;
-        let _input = self.begin_native_input(&session_id)?;
+        let input_entry = self.begin_native_input(&session_id)?;
         let item = codex_context_transfer_item(&context_markdown).map_err(bridge_error)?;
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let _turn_operation_guard = turn_operation_lock
             .lock()
             .map_err(|_| bridge_error("Codex turn operation lock poisoned"))?;
+        self.require_current_native_input(&session_id, &input_entry)?;
         let thread_id = {
             let sessions = self.inner.sessions.lock().expect("codex sessions lock");
             let session = sessions
@@ -5660,9 +5661,20 @@ impl CodexAppServerState {
     }
 
     fn begin_native_input(&self, session_id: &str) -> Result<NativeInputGuard, BridgeError> {
-        let input = self.inner.sessions.lock().expect("codex sessions lock")
-            .get(session_id).ok_or_else(|| bridge_error("Codex session not started"))?.input_state.clone();
-        Ok(input.begin())
+        let sessions = self.inner.sessions.lock().expect("codex sessions lock");
+        let session = sessions.get(session_id).ok_or_else(|| bridge_error("Codex session not started"))?;
+        // Count under the session lock so reset cannot replace the epoch between
+        // choosing its identity and publishing this pending entry.
+        Ok(session.input_state.begin())
+    }
+
+    fn require_current_native_input(&self, session_id: &str, entry: &NativeInputGuard) -> Result<(), BridgeError> {
+        let sessions = self.inner.sessions.lock().expect("codex sessions lock");
+        let session = sessions.get(session_id).ok_or_else(|| bridge_error("Codex session not started"))?;
+        if !Arc::ptr_eq(&session.input_state.0, &entry.0.0) {
+            return Err(bridge_error("Agent restarted; queued input belongs to the previous runtime"));
+        }
+        Ok(())
     }
 
     pub fn send_message(
@@ -5673,7 +5685,7 @@ impl CodexAppServerState {
         images: Vec<String>,
     ) -> Result<Value, BridgeError> {
         if self.pm_state(&session_id).is_some() { return Err(bridge_error("PM_RUNTIME_SEND_IDENTITY_REQUIRED")); }
-        let _input = self.begin_native_input(&session_id)?;
+        let input_entry = self.begin_native_input(&session_id)?;
         let owner = self.for_session(&session_id);
         if self.inner.reloading_sessions.lock().expect("codex reload lock").contains(&session_id) {
             return Err(bridge_error("Session is reloading; wait before sending a message"));
@@ -5701,6 +5713,7 @@ impl CodexAppServerState {
         let _turn_operation_guard = turn_operation_lock
             .lock()
             .map_err(|_| bridge_error("Codex turn operation lock poisoned"))?;
+        self.require_current_native_input(&session_id, &input_entry)?;
         if !owner.owns_session_runtime(&session_id)
             || self.inner.reloading_sessions.lock().expect("codex reload lock").contains(&session_id) {
             return Ok(json!({ "ok": false, "cancelled": true, "error": "Agent restarted; queued message cancelled" }));
@@ -10328,6 +10341,66 @@ invalid json
         });
         assert_eq!(identity.view()["pending"], 0);
         assert_eq!(identity.view()["received"], 1);
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    fn stale_queued_input_cannot_enter_replacement_runtime(inject: bool) {
+        let (app, _) = session_sync_test_host();
+        let state = CodexAppServerState::default();
+        let mut session = test_codex_session();
+        session.is_running = false;
+        let original = session.input_state.clone();
+        state.inner.sessions.lock().unwrap().insert("session-1".into(), session);
+        let turn = state.turn_operation_lock("session-1");
+        let held = turn.lock().unwrap();
+        std::thread::scope(|scope| {
+            let sending = scope.spawn(|| {
+                if inject {
+                    state.inject_context(&app, "session-1".into(), format!("{BAT_CONTEXT_TRANSFER_MARKER}\nqueued context"))
+                } else {
+                    state.send_message(&app, "session-1".into(), "queued input".into(), vec![])
+                }
+            });
+            let until = Instant::now() + Duration::from_secs(2);
+            while original.view()["received"] == 0 {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            assert_eq!(original.view()["pending"], 1);
+            // Model reset/reload winning the turn lock before the queued entry:
+            // the replacement owns a different input epoch and native thread.
+            let replacement = NativeInputState::default();
+            {
+                let mut sessions = state.inner.sessions.lock().unwrap();
+                let current = sessions.get_mut("session-1").unwrap();
+                current.input_state = replacement.clone();
+                current.thread_id = Some("replacement-native-thread".into());
+            }
+            let new_entry = replacement.begin();
+            drop(held);
+            let result = sending.join().unwrap();
+            assert!(result.is_err(), "stale entry unexpectedly entered the new runtime");
+            assert_eq!(original.view()["pending"], 0);
+            assert_eq!(original.view()["received"], 1);
+            assert_eq!(replacement.view()["pending"], 1, "old guard altered the new epoch");
+            assert_eq!(replacement.view()["received"], 1);
+            assert!(state.inner.connection.lock().unwrap().is_none());
+            assert_eq!(state.get_session_meta("session-1").unwrap()["sdkSessionId"], "replacement-native-thread");
+            drop(new_entry);
+            assert_eq!(replacement.view()["pending"], 0);
+        });
+    }
+
+    #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn native_input_identity_rejects_stale_send_after_reset() {
+        stale_queued_input_cannot_enter_replacement_runtime(false);
+    }
+
+    #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn native_input_identity_rejects_stale_context_injection_after_reset() {
+        stale_queued_input_cannot_enter_replacement_runtime(true);
     }
 
 }

@@ -10,6 +10,13 @@ count; settled work decreases pending once. Duplicate Claude client-message IDs
 retain the original entry. A replaced/reloaded runtime changes epoch, and losing
 Codex native-thread ownership invalidates the old session's epoch.
 
+Rust registers each entry while holding the session identity lock, then verifies
+that same counter identity after taking the turn-operation lock. Reset/reload
+cannot move an old queued send or context injection into the replacement runtime.
+Dropping an old entry decrements only its original epoch. Claude's queued callback
+likewise checks its captured runtime generation before reaching the SDK; reload
+invalidates old callbacks and their finalizers retain the old counter object.
+
 The Rust Codex producer counts ordinary send and context injection. Its pending
 count covers each local request; existing `isStreaming` continues to cover the
 native turn after ACK. Claude retains pending across the complete queued native
