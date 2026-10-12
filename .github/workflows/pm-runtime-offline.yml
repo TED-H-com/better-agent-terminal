@@ -1,0 +1,147 @@
+name: PM runtime offline verification
+
+on:
+  push:
+    branches:
+      - feat/pm-v12-native-input-identity-final
+  pull_request:
+
+permissions:
+  contents: read
+
+# A push and its PR update share this group; a new head replaces stale checks.
+concurrency:
+  group: pm-runtime-offline-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Offline verification (${{ matrix.source }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: upstream-baseline
+            repository: tony1223/better-agent-terminal
+            ref: b7419892fbc9946799b64cca24c2ec8c7fa15c42
+          - source: feature
+            repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+            ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    env:
+      CI: "true"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TERM_COLOR: never
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+
+      - name: Record source and prepare disk scratch
+        env:
+          EXPECTED_SOURCE: ${{ matrix.ref }}
+          SOURCE_LABEL: ${{ matrix.source }}
+          TMPDIR: ${{ runner.temp }}/bat-pm-tests
+          CARGO_TARGET_DIR: ${{ runner.temp }}/bat-pm-target
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          mkdir -p "$TMPDIR" "$CARGO_TARGET_DIR"
+          for path in "$TMPDIR" "$CARGO_TARGET_DIR"; do
+            filesystem=$(stat -f -c %T "$path")
+            case "$filesystem" in tmpfs|ramfs) exit 1 ;; esac
+          done
+          printf 'TMPDIR=%s\nCARGO_TARGET_DIR=%s\n' \
+            "$TMPDIR" "$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+          git show -s --format='%H %s'
+          printf '%s: `%s`\n' "$SOURCE_LABEL" "$EXPECTED_SOURCE" >> "$GITHUB_STEP_SUMMARY"
+          uname -a
+          df -h "$TMPDIR"
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.21.0"
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: "10.33.2"
+          run_install: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: "1.98.1"
+
+      - name: Install headless test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            bubblewrap build-essential pkg-config python3 git ca-certificates
+          pnpm install --frozen-lockfile
+          pnpm --dir node-sidecar install --frozen-lockfile
+          node --version
+          pnpm --version
+          rustc --version
+          cargo --version
+          bwrap --version
+
+      - name: Check TypeScript
+        run: pnpm exec tsc --noEmit --pretty false
+
+      - name: Build renderer
+        run: pnpm run compile
+
+      - name: Run full sidecar suite
+        run: pnpm run test:sidecar
+
+      - name: Require real host capabilities
+        run: |
+          set -euo pipefail
+          ulimit -n
+          for path in \
+            /proc/sys/fs/inotify/max_user_instances \
+            /proc/sys/fs/inotify/max_user_watches \
+            /proc/sys/user/max_user_namespaces \
+            /proc/sys/kernel/unprivileged_userns_clone \
+            /proc/sys/kernel/apparmor_restrict_unprivileged_userns; do
+            if test -r "$path"; then
+              printf '%s=' "$path"
+              cat "$path"
+            fi
+          done
+          python3 - <<'PY'
+          import ctypes
+          import os
+
+          libc = ctypes.CDLL(None, use_errno=True)
+          descriptor = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+          if descriptor < 0:
+              error = ctypes.get_errno()
+              raise OSError(error, os.strerror(error))
+          os.close(descriptor)
+          print("Real inotify initialization passed")
+          PY
+          timeout 10s bwrap --ro-bind / / --unshare-pid --unshare-net \
+            --die-with-parent /bin/true
+
+      - name: Check full headless Rust workspace
+        run: pnpm run check:tauri-rust --locked --no-default-features --features headless
+
+      - name: Test full headless Rust workspace
+        run: >-
+          pnpm run test:tauri-rust --locked --no-default-features
+          --features headless --no-fail-fast -- --test-threads=1
+
+      - name: Require unchanged tracked source
+        run: git diff --exit-code HEAD
