@@ -50,8 +50,21 @@ to include the Linux PM tests. Temporary data and Cargo outputs use separate dis
 directories under `RUNNER_TEMP`; tmpfs/ramfs is rejected, and HOME is unchanged.
 The checked-out source SHA and tool versions are recorded in the job output.
 
+Ubuntu 24.04's enabled AppArmor user-namespace restriction needs a per-program
+exception for bubblewrap's namespace setup. The job copies the distro binary to
+the fresh, root-owned `/opt/bat-pm-ci/bin/bwrap`, checks its exact bytes, SHA256,
+owner, mode and absolute path, and loads one named AppArmor profile attached only
+to that path. The profile follows Ubuntu's per-application `userns` allowance;
+`flags=(unconfined)` applies to that profile, not to AppArmor globally. Both the
+global restriction (asserted as `1` before and after loading) and the system
+`/usr/bin/bwrap` policy remain unchanged. Only this job's PATH receives the copy.
+The profile is loaded into the disposable VM's kernel, with no persistent system
+profile file or host-wide sysctl update. Ubuntu's approach is documented in
+[restricted unprivileged user namespaces](https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces).
+
 Before Rust checks, a real `inotify_init1` probe and a bounded bubblewrap PID/network
-namespace probe must succeed. The feature's full Rust suite then runs the actual
+namespace probe must succeed using that exact copy; profile loading alone is not
+acceptance. The feature's full Rust suite then runs the actual
 read-only selected-checkout/receipt and owned-directory canary. Missing bubblewrap,
 exhausted inotify resources, or AppArmor/user-namespace denial fails the job; there
 is no skip, global policy relaxation, or root-run substitute. Any required runner
@@ -65,6 +78,15 @@ initialization on that shared host returned `EMFILE`. At `c397fd7`, the focused
 102 native tests passed, but that did not close the whole-workspace evidence gap.
 A successful fresh feature job supplies new whole-workspace evidence for its
 recorded SHA; the old failure remains part of the review history.
+
+The first GitHub run at `ab69c2c`,
+[38187107006](https://github.com/teddashh/better-agent-terminal/actions/runs/38187107006),
+passed TypeScript, renderer build, sidecar and real inotify checks in both jobs.
+Both then failed bubblewrap's loopback address setup with
+`Failed RTM_NEWADDR: Operation not permitted` while the AppArmor restriction was
+enabled. The per-binary CI provisioning addresses namespace capabilities needed
+for that setup; only a subsequent passing real probe/canary can confirm it. Those
+failed jobs did not run Rust, and remain failed evidence rather than being relabeled.
 
 The existing environment-sensitive
 `commands::claude::tests::supported_commands_native_reads_project_commands`

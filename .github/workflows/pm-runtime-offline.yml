@@ -105,9 +105,36 @@ jobs:
       - name: Run full sidecar suite
         run: pnpm run test:sidecar
 
+      - name: Allow namespaces for the job-owned bubblewrap copy
+        run: |
+          set -euo pipefail
+          test -x /usr/sbin/apparmor_parser
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          test ! -e /opt/bat-pm-ci
+          sudo install -d -m 0755 /opt/bat-pm-ci/bin
+          sudo install -m 0755 /usr/bin/bwrap /opt/bat-pm-ci/bin/bwrap
+          test "$(readlink -f /opt/bat-pm-ci/bin/bwrap)" = /opt/bat-pm-ci/bin/bwrap
+          test "$(stat -c '%u:%a' /opt/bat-pm-ci/bin/bwrap)" = 0:755
+          cmp /usr/bin/bwrap /opt/bat-pm-ci/bin/bwrap
+          sha256sum /usr/bin/bwrap /opt/bat-pm-ci/bin/bwrap
+          profile="$RUNNER_TEMP/bat-pm-ci.apparmor"
+          cat > "$profile" <<'APPARMOR'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile bat_pm_ci_bwrap /opt/bat-pm-ci/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          APPARMOR
+          cat "$profile"
+          sudo /usr/sbin/apparmor_parser --add --skip-cache --verbose "$profile"
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          printf '%s\n' /opt/bat-pm-ci/bin >> "$GITHUB_PATH"
+
       - name: Require real host capabilities
         run: |
           set -euo pipefail
+          test "$(command -v bwrap)" = /opt/bat-pm-ci/bin/bwrap
+          cmp /usr/bin/bwrap /opt/bat-pm-ci/bin/bwrap
           ulimit -n
           for path in \
             /proc/sys/fs/inotify/max_user_instances \
