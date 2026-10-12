@@ -1,5 +1,8 @@
 //! Connection-owned profile routing. The wire contract never exposes target credentials.
 use crate::commands::profile::{profile_entry_for_context, ProfileEntry};
+use crate::commands::remote_tunnel::{
+    ensure_context_tunnel, normalize_ssh_target, RemoteTunnelEndpoint, RemoteTunnelSpec,
+};
 use crate::host_context::HostContext;
 use crate::remote_client::{RemoteEventSink, RustRemoteClientState};
 use crate::remote_core::{
@@ -21,6 +24,7 @@ pub type ContextSink = Arc<dyn Fn(Value) + Send + Sync>;
 #[derive(Default)]
 struct Interests {
     sessions: HashSet<String>,
+    sync_sessions: HashSet<String>,
     ptys: HashSet<String>,
 }
 
@@ -49,6 +53,30 @@ fn same_target(a: &ProfileEntry, b: &ProfileEntry) -> bool {
         && a.remote_token == b.remote_token
         && a.remote_fingerprint == b.remote_fingerprint
         && a.remote_profile_id == b.remote_profile_id
+        && a.ssh_target == b.ssh_target
+}
+
+fn dial_endpoint(
+    profile: &ProfileEntry,
+    tunnel: impl FnOnce() -> RemoteTunnelEndpoint,
+) -> Result<(String, u16), String> {
+    if profile
+        .ssh_target
+        .as_deref()
+        .and_then(normalize_ssh_target)
+        .is_some()
+    {
+        let endpoint = tunnel();
+        if !endpoint.ready || !endpoint.tunneled || endpoint.port == 0 {
+            // SSH diagnostics stay on the host, not in the client wire contract.
+            return Err(TARGET_UNAVAILABLE.into());
+        }
+        return Ok((endpoint.host, endpoint.port));
+    }
+    Ok((
+        profile.remote_host.clone().ok_or(TARGET_UNAVAILABLE)?,
+        u16::try_from(profile.remote_port.unwrap_or(9876)).map_err(|_| TARGET_UNAVAILABLE)?,
+    ))
 }
 
 fn scoped_event(
@@ -106,7 +134,7 @@ fn scoped_event(
             params
                 .get("sessionId")
                 .and_then(Value::as_str)
-                .is_some_and(|id| interests.sessions.contains(id))
+                .is_some_and(|id| if channel == "claude:sync-event" { interests.sync_sessions.contains(id) } else { interests.sessions.contains(id) })
         } else {
             params
                 .get("id")
@@ -207,11 +235,26 @@ impl ProfileContext {
             return Ok(());
         }
         let p = &self.profile;
+        let (host, port) = dial_endpoint(p, || {
+            ensure_context_tunnel(
+                ctx,
+                &self.id,
+                &self.closed,
+                &RemoteTunnelSpec {
+                    profile_id: Some(p.id.clone()),
+                    ssh_target: None,
+                    remote_host: None,
+                    remote_port: None,
+                },
+            )
+        })?;
+        // Tunnel setup can block; do not dial after a close or profile edit.
+        self.validate(ctx)?;
         let result = client
             .connect(
                 ctx.clone(),
-                p.remote_host.clone().ok_or(TARGET_UNAVAILABLE)?,
-                u16::try_from(p.remote_port.unwrap_or(9876)).map_err(|_| TARGET_UNAVAILABLE)?,
+                host,
+                port,
                 p.remote_token.clone().ok_or(TARGET_UNAVAILABLE)?,
                 p.remote_fingerprint.clone().ok_or(TARGET_UNAVAILABLE)?,
                 Some("BAT Profile".into()),
@@ -247,7 +290,7 @@ impl ProfileContext {
                 .map(|c| c.status(BINDING)["connected"] == true)
                 .unwrap_or(true);
         // Stable opaque identity lets a client reject caches after alias retargeting.
-        let key = format!(
+        let mut key = format!(
             "{}|{}|{}|{}|{}",
             self.profile.id,
             self.profile
@@ -258,6 +301,11 @@ impl ProfileContext {
             self.profile.remote_port.unwrap_or(9876),
             self.target_profile
         );
+        // Keep existing direct-profile cache identities; distinguish SSH hosts
+        // that share the same remote loopback address and target profile.
+        if let Some(target) = &self.profile.ssh_target {
+            key.push_str(&format!("|ssh:{target}"));
+        }
         let binding_key = format!("{:x}", Sha256::digest(key.as_bytes()));
         json!({"contextId":self.id, "profileId":self.profile.id, "name":self.profile.name,
             "bindingKey":binding_key, "status":if ready { "ready" } else { "unavailable" }})
@@ -285,12 +333,24 @@ impl ProfileContext {
             params["profileId"] = json!(self.target_profile);
             params.as_object_mut().unwrap().remove("windowId");
         }
+        if matches!(channel, "claude:start-session" | "claude:resume-session" | "claude:client-resume") {
+            if !params.get("options").is_some_and(Value::is_object) {
+                params["options"] = json!({});
+            }
+            // This profile comes from the authenticated context, not client
+            // workspace caches. Carry it to the host's session owner registry.
+            params["options"]["profileId"] = json!(self.target_profile);
+        }
         let mut interests = self
             .interests
             .lock()
             .map_err(|_| "Profile subscription unavailable")?;
         if let Some(id) = params.get("sessionId").and_then(Value::as_str) {
             interests.sessions.insert(id.into());
+            if channel == "claude:sync-session" {
+                if !interests.sync_sessions.contains(id) && interests.sync_sessions.len() >= 512 { return Err("Too many sync subscriptions".into()); }
+                interests.sync_sessions.insert(id.into());
+            }
         }
         if channel.starts_with("pty:") {
             if let Some(id) = params
@@ -359,6 +419,7 @@ impl ProfileContext {
 
 #[derive(Default)]
 pub struct ProfileContexts {
+    root_sync_sessions: Mutex<HashSet<String>>,
     contexts: Mutex<HashMap<String, Arc<ProfileContext>>>,
     closed: AtomicBool,
 }
@@ -370,6 +431,19 @@ impl std::fmt::Debug for ProfileContexts {
 }
 
 impl ProfileContexts {
+    pub fn subscribe_root_sync(&self, session_id: &str) -> Result<(), String> {
+        let mut sessions = self.root_sync_sessions.lock().map_err(|_| "Sync subscriptions unavailable")?;
+        if !sessions.contains(session_id) && sessions.len() >= 512 { return Err("Too many sync subscriptions".into()); }
+        sessions.insert(session_id.into());
+        Ok(())
+    }
+
+    pub fn accepts_root_sync(&self, params: &Value) -> bool {
+        params.get("sessionId").and_then(Value::as_str).is_some_and(|id| {
+            self.root_sync_sessions.lock().map(|sessions| sessions.contains(id)).unwrap_or(false)
+        })
+    }
+
     pub fn has_contexts(&self) -> bool {
         self.contexts
             .lock()
@@ -457,6 +531,76 @@ impl Drop for ConnectionContextGuard {
 mod tests {
     use super::*;
 
+    fn remote_profile() -> ProfileEntry {
+        serde_json::from_value(json!({
+            "id":"ap01", "name":"ap01", "type":"remote",
+            "remoteHost":"127.0.0.1", "remotePort":9876,
+            "remoteToken":"test-only-secret", "remoteFingerprint":"test-fingerprint",
+            "remoteProfileId":"default", "sshTarget":"user@ap01",
+            "createdAt":0, "updatedAt":0
+        }))
+        .unwrap()
+    }
+
+    fn tunnel_endpoint(ready: bool) -> RemoteTunnelEndpoint {
+        RemoteTunnelEndpoint {
+            ready,
+            tunneled: true,
+            host: "127.0.0.1".into(),
+            port: 58276,
+            spawned: false,
+            error: None,
+            output: None,
+        }
+    }
+
+    #[test]
+    fn ssh_profile_dials_forwarded_port_not_remote_loopback() {
+        let profile = remote_profile();
+        assert_eq!(
+            dial_endpoint(&profile, || tunnel_endpoint(true)).unwrap(),
+            ("127.0.0.1".into(), 58276)
+        );
+        assert_eq!(profile.remote_port, Some(9876));
+        assert_eq!(
+            profile.remote_fingerprint.as_deref(),
+            Some("test-fingerprint")
+        );
+    }
+
+    #[test]
+    fn failed_tunnel_never_falls_back_to_entry_host_loopback() {
+        let error = dial_endpoint(&remote_profile(), || {
+            let mut endpoint = tunnel_endpoint(false);
+            endpoint.output = Some("private SSH diagnostics".into());
+            endpoint
+        })
+        .unwrap_err();
+        assert_eq!(error, TARGET_UNAVAILABLE);
+    }
+
+    #[test]
+    fn direct_profile_does_not_require_a_tunnel_manager() {
+        let mut profile = remote_profile();
+        profile.ssh_target = None;
+        assert_eq!(
+            dial_endpoint(&profile, || panic!("must not spawn SSH")).unwrap(),
+            ("127.0.0.1".into(), 9876)
+        );
+    }
+
+    #[test]
+    fn ssh_edits_invalidate_context_and_mobile_cache_identity() {
+        let profile = remote_profile();
+        let mut changed = profile.clone();
+        changed.ssh_target = Some("user@another-host".into());
+        assert!(!same_target(&profile, &changed));
+        let original = ProfileContext::new(profile, Arc::new(|_| {}));
+        let updated = ProfileContext::new(changed, Arc::new(|_| {}));
+        assert_ne!(original.info()["bindingKey"], updated.info()["bindingKey"]);
+        assert!(!original.info().to_string().contains("test-only-secret"));
+    }
+
     #[test]
     fn context_ids_are_connection_owned() {
         assert!(ProfileContexts::default()
@@ -512,6 +656,22 @@ mod tests {
             json!({"sessionId":"session-a"})
         )
         .is_some());
+    }
+
+    #[test]
+    fn replay_frames_are_opt_in_and_isolated_from_legacy_clients() {
+        let mut interests = Interests::default();
+        interests.sessions.insert("s".into());
+        let interests = Mutex::new(interests);
+        let params = json!({"sessionId":"s","epoch":"e","events":[]});
+        assert!(scoped_event("ctx", "a", "b", &interests, "claude:sync-event", params.clone()).is_none());
+        interests.lock().unwrap().sync_sessions.insert("s".into());
+        assert!(scoped_event("ctx", "a", "b", &interests, "claude:sync-event", params.clone()).is_some());
+        let root = ProfileContexts::default();
+        assert!(!root.accepts_root_sync(&params));
+        root.subscribe_root_sync("s").unwrap();
+        assert!(root.accepts_root_sync(&params));
+        assert!(!root.accepts_root_sync(&json!({"sessionId":"other"})));
     }
 
     #[test]

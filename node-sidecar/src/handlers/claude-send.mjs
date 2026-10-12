@@ -30,6 +30,7 @@
 // the renderer reads to retry after a runtime restart).
 
 import { registerHandler, sendEvent } from '../lib/protocol.mjs'
+import { effectiveFastMode, refreshFastMode, applyFastModeStatus } from '../lib/fast-mode.mjs'
 import {
   sessions,
   ensureSession,
@@ -529,6 +530,9 @@ function processMessage(s, sessionId, msg) {
     s.sdkSessionId = msg.session_id
   }
   const t = msg?.type
+  if (t === 'system' && applyFastModeStatus(s, msg) && msg.subtype !== 'init') {
+    sendEvent('claude:status', { sessionId, meta: buildSessionMeta(s) })
+  }
   if (t === 'system' && msg.subtype === 'init') {
     if (typeof msg.session_id === 'string') s.sdkSessionId = msg.session_id
     if (typeof msg.model === 'string') s.model = msg.model
@@ -982,6 +986,9 @@ async function buildQueryOptions(s, sessionId, prompt) {
   if (isUltracodeMode(s.effort) || s.ultracode === true) {
     queryOptions.settings = { ultracode: true, enableWorkflows: true }
   }
+  // Explicit false overrides user/project CLI defaults. BAT requires its own
+  // global opt-in and an explicit opt-in for this conversation.
+  queryOptions.settings = { ...queryOptions.settings, fastMode: effectiveFastMode(s) }
   if (sdkModel) queryOptions.model = sdkModel
   if (claudeCodePath) queryOptions.pathToClaudeCodeExecutable = claudeCodePath
   // Capture the claude subprocess stderr so an opaque non-zero exit can be
@@ -1023,11 +1030,26 @@ function buildUserMessage(prompt, images) {
   return { type: 'user', message: { role: 'user', content: text } }
 }
 
-async function ensureLiveQuery(s, sessionId, sdk, prompt) {
+async function ensureLiveQuery(s, sessionId, sdk, prompt, isCurrent) {
+  refreshFastMode(s)
+  const fastMode = effectiveFastMode(s)
+  if (s.liveQuery && !s.liveQuery.isClosed && s.liveQueryFastMode !== fastMode) closeLiveQuery(s)
   if (s.liveQuery && !s.liveQuery.isClosed) return s.liveQuery
   const queryOptions = await buildQueryOptions(s, sessionId, prompt)
+  if (isCurrent && !isCurrent()) throw new Error('Session changed during reload')
   s.abortController = new AbortController()
   queryOptions.abortController = s.abortController
+  let live
+  const controller = s.abortController
+  const generation = s.runtimeGeneration || 0
+  const canUseTool = queryOptions.canUseTool
+  queryOptions.canUseTool = (...args) => {
+    if (controller.signal.aborted || s.abortController !== controller
+      || (s.runtimeGeneration || 0) !== generation || sessions.get(sessionId) !== s) {
+      return { behavior: 'deny', message: 'Agent has stopped or been replaced' }
+    }
+    return canUseTool(...args)
+  }
   debugLog('live-query-create', sessionId, {
     cwd: queryOptions.cwd || null,
     resume: typeof queryOptions.resume === 'string' ? shortSessionId(queryOptions.resume) : null,
@@ -1041,10 +1063,11 @@ async function ensureLiveQuery(s, sessionId, sdk, prompt) {
     hasClaudePath: typeof queryOptions.pathToClaudeCodeExecutable === 'string',
     pluginCount: Array.isArray(queryOptions.plugins) ? queryOptions.plugins.length : 0,
   })
-  const live = new LiveQuery({
+  live = new LiveQuery({
     sdk,
     queryOptions,
     onMessage: (msg) => {
+      if (sessions.get(sessionId) !== s || s.liveQuery !== live) return
       try {
         debugSdkFrame(sessionId, msg)
         processMessage(s, sessionId, msg)
@@ -1058,6 +1081,7 @@ async function ensureLiveQuery(s, sessionId, sdk, prompt) {
     },
   })
   s.liveQuery = live
+  s.liveQueryFastMode = queryOptions.settings.fastMode
   s.currentQuery = live.generator
   debugLog('live-query-ready', sessionId, {})
   return live
@@ -1085,6 +1109,101 @@ export function closeLiveQuery(s) {
   if (s.activeTasks) s.activeTasks.clear()
 }
 
+// Rebuild the SDK subprocess without sending a user prompt or replacing the
+// host-owned transcript. Initialization/control requests do not start a turn.
+export async function reloadClaudeSession(sessionId) {
+  const s = sessions.get(sessionId)
+  if (!s) throw new Error('Session not started')
+  if (s.reloading) throw new Error('Session is already reloading')
+  s.reloading = true
+  s.runtimeGeneration = (s.runtimeGeneration || 0) + 1
+  const previousQueue = s.sendQueue
+  // A stuck old RPC must not keep future sends chained behind a dead agent.
+  // Generation checks still cancel every detached queued request.
+  s.sendQueue = null
+  const hadWork = s.streaming || previousQueue || s.activeTasks?.size || s.pendingPermissions?.size || s.pendingAskUser?.size
+  const token = Symbol('session-reload')
+  s.reloadToken = token
+  bumpCommandsEpoch(s)
+  invalidateSessionCommandCache(sessionId)
+  const isCurrent = () => sessions.get(sessionId) === s && s.reloadToken === token && s.reloading
+  setRuntimeStatus(s, sessionId, 'reloading', 'Stopping the current agent and restarting with fresh MCP configuration.')
+  sendEvent('claude:resume-loading', { sessionId, loading: true })
+  let timer
+  try {
+    s.abortController?.abort()
+    closeLiveQuery(s)
+    for (const [toolUseId, pending] of s.pendingPermissions || []) {
+      try { pending.resolve({ behavior: 'deny', message: 'Agent restarted by the user' }) } catch { /* cancelled callback */ }
+      sendEvent('claude:permission-resolved', { sessionId, toolUseId })
+    }
+    s.pendingPermissions?.clear()
+    for (const [toolUseId, pending] of s.pendingAskUser || []) {
+      try { pending.resolve({ behavior: 'deny', message: 'Agent restarted by the user' }) } catch { /* cancelled callback */ }
+      sendEvent('claude:ask-user-resolved', { sessionId, toolUseId })
+    }
+    s.pendingAskUser?.clear()
+    for (const item of s.messages || []) {
+      if (item.toolName && item.status === 'running') {
+        const result = { id: item.id, status: 'error', result: 'Interrupted by session restart' }
+        updateSessionToolResult(s, item.id, result)
+        sendEvent('claude:tool-result', { sessionId, result })
+      }
+    }
+    if (s.streamingText || s.streamingThinking) {
+      const message = {
+        id: `assistant-reload-${Date.now()}`, sessionId, role: 'assistant',
+        content: s.streamingText || '', thinking: s.streamingThinking || '', timestamp: Date.now(),
+      }
+      appendSessionMessage(s, message)
+      sendEvent('claude:message', { sessionId, message })
+    }
+    clearSessionStream(s)
+    s.streaming = false
+    if (hadWork) sendEvent('claude:turn-end', { sessionId, payload: { reason: 'aborted', sdkSessionId: s.sdkSessionId } })
+    const initialize = (async () => {
+      // Let the old turn's catch/finally finish before installing the new
+      // controller. Every queued send from the previous generation cancels.
+      await previousQueue?.catch(() => {})
+      const sdk = await loadAnthropicSdk()
+      if (!isCurrent()) throw new Error('Session changed during reload')
+      const live = await ensureLiveQuery(s, sessionId, sdk, undefined, isCurrent)
+      if (typeof live.generator.initializationResult !== 'function') throw new Error('SDK does not support session initialization')
+      await live.generator.initializationResult()
+      if (!isCurrent() || s.liveQuery !== live || live.isClosed) {
+        throw new Error('Session changed during reload')
+      }
+      if (typeof live.generator.mcpServerStatus === 'function') await live.generator.mcpServerStatus()
+      if (!isCurrent() || s.liveQuery !== live || live.isClosed) throw new Error('Session changed during reload')
+      if (typeof live.generator.supportedCommands === 'function') {
+        const commands = await live.generator.supportedCommands()
+        if (!isCurrent() || s.liveQuery !== live || live.isClosed) throw new Error('Session changed during reload')
+        if (Array.isArray(commands)) sendEvent('claude:commands', { sessionId, commands })
+      }
+      return live
+    })()
+    await Promise.race([initialize, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Session reload timed out; retry reload or send a message to reconnect')), 30_000)
+    })])
+    if (sessions.get(sessionId) !== s) throw new Error('Session changed during reload')
+    s.isResting = false
+    clearRuntimeStatus(s, sessionId)
+    return { ok: true, sessionId, sdkSessionId: s.sdkSessionId, deferred: false, meta: buildSessionMeta(s) }
+  } catch (err) {
+    closeLiveQuery(s)
+    throw err
+  } finally {
+    clearTimeout(timer)
+    s.reloading = false
+    s.reloadToken = null
+    if (sessions.get(sessionId) === s) {
+      clearRuntimeStatus(s, sessionId)
+      sendEvent('claude:status', { sessionId, meta: buildSessionMeta(s) })
+      sendEvent('claude:resume-loading', { sessionId, loading: false })
+    }
+  }
+}
+
 // `onAccepted` is called once the prompt has been handed to the SDK, which is
 // what answers the sendMessage RPC. Everything after that point — success,
 // error, interrupt — reaches the renderer as claude:* events instead.
@@ -1099,6 +1218,8 @@ async function performSendMessage(params, onAccepted) {
   const prompt = typeof params?.prompt === 'string' ? params.prompt : ''
   const images = Array.isArray(params?.images) ? params.images : null
   const s = ensureSession(sessionId)
+  const generation = s.runtimeGeneration || 0
+  const isCurrent = () => sessions.get(sessionId) === s && !s.reloading && (s.runtimeGeneration || 0) === generation
   if (isCodexAgentPreset(s.agentPreset)) {
     throw new Error(`claude.sendMessage(${shortSessionId(sessionId)}): codex session not initialized; restart the Codex agent`)
   }
@@ -1107,6 +1228,7 @@ async function performSendMessage(params, onAccepted) {
   setRuntimeStatus(s, sessionId, 'starting', 'Preparing Claude request.')
 
   const sdk = await loadAnthropicSdk()
+  if (!isCurrent()) return { ok: false, cancelled: true }
   if (!sdk || typeof sdk.query !== 'function') {
     logWarn(`claude.sendMessage: SDK unavailable, returning stub for session ${sessionId}`)
     clearRuntimeStatus(s, sessionId)
@@ -1126,8 +1248,9 @@ async function performSendMessage(params, onAccepted) {
   const userMessage = buildUserMessage(prompt, images)
   let live
   try {
-    live = await ensureLiveQuery(s, sessionId, sdk, prompt)
+    live = await ensureLiveQuery(s, sessionId, sdk, prompt, isCurrent)
   } catch (err) {
+    if (!isCurrent()) return { ok: false, cancelled: true }
     const rawMsg = err instanceof Error ? err.message : String(err)
     const errMsg = downgradeEffortOnRejection(s, sessionId, enrichExitErrorMessage(rawMsg, s))
     logWarn(`claude.sendMessage(${sid}): ensureLiveQuery failed: ${errMsg}`)
@@ -1167,6 +1290,7 @@ async function performSendMessage(params, onAccepted) {
     // Give SDK builds that end the generator immediately after a result a
     // chance to flip LiveQuery.isClosed before the next queued send starts.
     await new Promise(resolve => setImmediate(resolve))
+    if (!isCurrent()) return { ok: false, cancelled: true }
     const elapsedMs = Date.now() - startedAt
     if (live.isClosed && s.liveQuery === live) {
       s.liveQuery = null
@@ -1195,6 +1319,7 @@ async function performSendMessage(params, onAccepted) {
     clearRuntimeStatus(s, sessionId)
     return { ok: false, error: errMsg }
   } catch (err) {
+    if (!isCurrent()) return { ok: false, cancelled: true }
     const errMsg = err instanceof Error ? err.message : String(err)
     if (s.interruptRequested) {
       // Turn-only interrupt surfaced as a throw (no result message): emit
@@ -1217,14 +1342,14 @@ async function performSendMessage(params, onAccepted) {
       logInfo(`claude.sendMessage(${sid}): aborted`)
     }
     sendEvent('claude:turn-end', { sessionId, payload: { reason: aborted ? 'aborted' : 'error' } })
-    if (live.isClosed) {
+    if (live.isClosed && s.liveQuery === live) {
       s.liveQuery = null
       s.currentQuery = null
     }
     clearRuntimeStatus(s, sessionId)
     return { ok: !aborted, error: aborted ? undefined : enriched }
   } finally {
-    s.streaming = false
+    if (isCurrent()) s.streaming = false
   }
 }
 
@@ -1243,6 +1368,7 @@ registerHandler('claude.sendMessage', async (params) => {
     sessions.delete(sessionId)
     throw new Error(missingSessionCwdError(sessionId))
   }
+  if (s.reloading) throw new Error('Session is reloading; wait before sending a message')
   const sid = shortSessionId(sessionId)
   const prompt = typeof params?.prompt === 'string' ? params.prompt : ''
   const images = Array.isArray(params?.images) ? params.images : null
@@ -1282,6 +1408,7 @@ registerHandler('claude.sendMessage', async (params) => {
   // later sendMessage overwriting s.pendingSendCancel with its own fresh
   // token can't affect an already-queued one.
   const cancelToken = { cancelled: false }
+  const generation = s.runtimeGeneration || 0
   s.pendingSendCancel = cancelToken
   // Two settle points, deliberately: `accepted` answers the RPC as soon as the
   // prompt is in the SDK's hands, while `queued` stays the turn-long promise
@@ -1301,7 +1428,7 @@ registerHandler('claude.sendMessage', async (params) => {
     if (sessions.get(sessionId) !== s) {
       return { ok: false, error: 'session stopped' }
     }
-    if (cancelToken.cancelled) {
+    if (cancelToken.cancelled || s.reloading || (s.runtimeGeneration || 0) !== generation) {
       logInfo(`claude.sendMessage(${sid}): cancelled before it became the active turn`)
       return { ok: false, cancelled: true }
     }

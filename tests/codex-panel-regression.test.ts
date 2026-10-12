@@ -10,6 +10,7 @@ import {
   normalizeClaudeModelSelection,
   sdkModelForClaudeSelection,
 } from '../renderer/src/utils/claude-model-presets'
+import { clampToolOutputText, TOOL_OUTPUT_RENDER_LIMIT } from '../renderer/src/components/CodexAgentPanel.helpers'
 
 async function main() {
   const source = await readFile('renderer/src/components/CodexAgentPanel.tsx', 'utf8')
@@ -43,6 +44,12 @@ async function main() {
   assert.equal(displayNameForClaudeSelection('claude-opus-5:1m'), 'Opus 5 · 1M')
   for (const panelSource of [source, claudeSource]) {
     assert.match(panelSource, /'opus-5':\s+P\(5, 25\)/, 'Opus 5 pricing should be $5/$25 per MTok')
+    assert.ok(panelSource.includes("'opus-5-5': { ...P(4, 20), cacheRead: 0.20 }"),
+      'Opus 5.5 should use $4/$20 per MTok and $0.20 cache reads')
+    const opus55Match = panelSource.indexOf("if (model.includes('opus-5-5'))")
+    const opus5Match = panelSource.indexOf("if (model.includes('opus-5'))")
+    assert.ok(opus55Match >= 0 && opus55Match < opus5Match,
+      'Opus 5.5 must match before the overlapping Opus 5 prefix')
   }
 
   assert.equal(
@@ -460,7 +467,7 @@ async function main() {
     const panelSource = await readFile(`renderer/src/components/${panel}.tsx`, 'utf8')
     assert.match(
       panelSource,
-      /messages\.slice\(0, excess\)\.filter\(m => !archivedIdsRef\.current\.has\(m\.id\)\)/,
+      /snapshots\.filter\(m => !archivedIdsRef\.current\.has\(m\.id\)\)/,
       `${panel} must not re-archive rows it has already flushed`,
     )
     assert.match(
@@ -524,6 +531,23 @@ async function main() {
       `${panel} should no longer coerce an absent isStreaming to false`,
     )
   }
+
+  // A runaway tool output must never reach content-block parsing and link
+  // detection at full size: both panels clamp the raw result before the
+  // per-(id, result) render cache computes anything from it.
+  for (const panelSource of [source, claudeSource]) {
+    assert.ok(panelSource.includes('const raw = clampToolOutputText(stringifyToolResult(item.result))'),
+      'tool render cache must clamp the raw result before parsing it')
+  }
+  assert.equal(clampToolOutputText('short'), 'short')
+  const exact = 'x'.repeat(TOOL_OUTPUT_RENDER_LIMIT)
+  assert.equal(clampToolOutputText(exact), exact, 'at the limit stays verbatim')
+  const huge = 'H'.repeat(1000) + 'M'.repeat(5_000_000) + 'T'.repeat(1000)
+  const clamped = clampToolOutputText(huge)
+  assert.ok(clamped.length <= TOOL_OUTPUT_RENDER_LIMIT + 80, 'clamped output is bounded')
+  assert.ok(clamped.startsWith('H'.repeat(1000)), 'head kept')
+  assert.ok(clamped.endsWith('T'.repeat(1000)), 'tail kept')
+  assert.match(clamped, /\[\.\.\. \d+ characters omitted by BAT \.\.\.\]/)
 
   console.log('Codex panel regression: passed')
 }

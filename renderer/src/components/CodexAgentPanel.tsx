@@ -1,3 +1,4 @@
+import { persistTranscriptArchive, readArchivePage, releaseArchivedSnapshots, resolveTranscriptPrompt, transcriptArchivePrefix, type ArchivePage } from '../utils/transcript-window'
 import { host, isTauri } from '../host-api'
 import { useState, useEffect, useRef, useCallback, useMemo, Fragment, cloneElement, isValidElement, memo } from 'react'
 import { describePendingAction } from '../utils/attention'
@@ -31,13 +32,24 @@ import { CODEX_MODELS, DEFAULT_CODEX_MODEL, codexModelValueForRow, groupCodexMod
 import { shouldNavigateInputHistoryFromTextarea } from '../utils/input-history-navigation'
 import { buildSnippetContextPrompt, parseSnippetSlashCommand, type SnippetForContext } from '../utils/snippet-command'
 import { createToolRenderCache, getOrComputeToolRender, pruneToolRenderCache } from '../utils/tool-result-cache'
+import { useBatchedSubagentStreams } from '../utils/use-batched-subagent-streams'
+import { AgentFastModeCheckbox } from './AgentFastModeCheckbox'
 import { useRafBatchedString } from '../utils/use-raf-batched-string'
 import { translateRuntimeMessage } from '../utils/runtime-status-message'
 import { agentSendResultError, isMissingSessionCwdError } from '../utils/agent-send-recovery'
 import { dispatchWorkerCommand, parseWorkerSlashCommand } from '../utils/worker-command'
+import { BAT_FAST_SLASH_COMMAND, executeBatFastCommand, parseBatFastCommand } from '../utils/fast-mode-command'
+import { BAT_RELOAD_SLASH_COMMAND } from '../utils/session-reload'
+import { useSessionReload } from '../hooks/useSessionReload'
 import { buildAskUserQnA, normalizePendingAskUser, wrapPreviewHtml } from './AskUserQuestion.helpers'
 import { AgentAskUserQnA } from './AgentAskUserQnA'
-import { autoContinueTurnEndKey, buildCollapsedOutputPreview, formatContentSize, formatElapsed, formatFullTimestamp, formatTimestamp, parseContentBlocks, parseShellInvocation, shouldAutoContinueForTrigger, shouldShowTimeDivider, splitSystemReminders, stringifyToolResult, summarizeToolSearchResult, toolDescription, toolInputContent, toolInputSummary, truncateMiddle } from './CodexAgentPanel.helpers'
+import { autoContinueTurnEndKey, buildCollapsedOutputPreview, clampToolOutputText, formatContentSize, formatElapsed, formatFullTimestamp, formatTimestamp, parseContentBlocks, parseShellInvocation, shouldAutoContinueForTrigger, shouldShowTimeDivider, splitSystemReminders, stringifyToolResult, summarizeToolSearchResult, toolDescription, toolInputContent, toolInputSummary, truncateMiddle } from './CodexAgentPanel.helpers'
+import { AgentFilePreview } from './AgentFilePreview'
+import { AgentToolInput } from './AgentToolInput'
+import { codexChangeDiffText, codexDiffLineClass, isCodexDiffChangeLine } from './CodexFileDiff.helpers'
+import { prepareSpecialToolResult } from './CodexAgentPanel.helpers'
+import { countTextLines } from '../utils/text-lines'
+import { SubagentTranscriptCache } from '../utils/subagent-transcript-cache'
 import { formatToolElapsed, toolRowLayout } from './CodexAgentPanel.helpers'
 import type { AutoContinueTrigger } from './CodexAgentPanel.helpers'
 import { AgentToolRow } from './AgentToolRow'
@@ -337,29 +349,6 @@ function codexChangesSummary(changes: CodexFileChange[], fallbackPath: string): 
   return `${changes.length} files${firstPath ? `, first: ${firstPath}` : ''}`
 }
 
-function codexChangeDiffText(changes: CodexFileChange[]): string {
-  const diffKeys = ['diff', 'patch', 'unified_diff', 'unifiedDiff']
-  return changes
-    .map(change => firstStringValue(change, diffKeys))
-    .filter(Boolean)
-    .join('\n')
-}
-
-function codexDiffLineClass(line: string): string {
-  if (line.startsWith('+') && !line.startsWith('+++')) return 'claude-diff-line claude-diff-add'
-  if (line.startsWith('-') && !line.startsWith('---')) return 'claude-diff-line claude-diff-del'
-  if (line.startsWith('@@')) return 'claude-diff-line claude-diff-hunk'
-  if (line.startsWith('diff ') || line.startsWith('index ') || line.startsWith('---') || line.startsWith('+++')) {
-    return 'claude-diff-line claude-diff-file'
-  }
-  return 'claude-diff-line'
-}
-
-function isCodexDiffChangeLine(line: string): boolean {
-  return (line.startsWith('+') && !line.startsWith('+++'))
-    || (line.startsWith('-') && !line.startsWith('---'))
-}
-
 type CodexAgentPanelContentProps = Omit<CodexAgentPanelProps, 'isActive'> & {
   activation: PanelActivation
 }
@@ -382,11 +371,17 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
   // change / message clear so it never holds stale entries.
   const toolRenderCacheRef = useRef(createToolRenderCache<{
     outText: string
+    outLineCount: number
     isLongOutput: boolean
     outPreviewLines: string[]
     reminders: string[]
     errors: string[]
   }>())
+  const specialToolRenderCacheRef = useRef(createToolRenderCache<ReturnType<typeof prepareSpecialToolResult>>())
+  const getSpecialResult = (item: ClaudeToolCall) => getOrComputeToolRender(
+    specialToolRenderCacheRef.current, item.id, item.result,
+    () => prepareSpecialToolResult(item.result, item.toolName),
+  )
   const inputValueRef = useRef('')
   const [isStreaming, setIsStreaming] = useState(false)
   const [runtimeWaitNow, setRuntimeWaitNow] = useState(() => Date.now())
@@ -465,6 +460,18 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     if (typeof globalDefault === 'string' && CODEX_EFFORT_LEVELS.includes(globalDefault as CodexEffortLevel)) return globalDefault
     return 'high'
   })
+  const adoptHostSessionMeta = useCallback((meta: SessionMeta) => {
+    workspaceStore.applyTerminalSessionMeta(sessionId, meta)
+    if (Object.prototype.hasOwnProperty.call(meta, 'sdkSessionId')) setHasSdkSession(!!meta.sdkSessionId)
+    const sandbox = meta.codexSandboxMode
+    if (sandbox === 'read-only' || sandbox === 'workspace-write' || sandbox === 'danger-full-access') {
+      setCodexSandboxMode(sandbox)
+    }
+    const approval = meta.codexApprovalPolicy
+    if (approval === 'untrusted' || approval === 'on-request' || approval === 'never') {
+      setCodexApprovalPolicy(approval)
+    }
+  }, [sessionId])
   const [claudeUsage, setClaudeUsage] = useState(workspaceStore.claudeUsage)
   const [usageAccount, setUsageAccount] = useState(workspaceStore.usageAccount)
   const [rateLimits, setRateLimits] = useState<Record<string, { resetsAt: number; utilization: number | null; isUsingOverage: boolean }>>({})
@@ -530,11 +537,15 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
   const [contentModal, setContentModal] = useState<{ title: string; content: string; markdown?: boolean } | null>(null)
   const [imageModal, setImageModal] = useState<{ dataUrl: string; prompt: string; filename: string } | null>(null)
   // Subagent message storage (keyed by parent Task tool_use_id)
-  const subagentMessagesRef = useRef<Map<string, MessageItem[]>>(new Map())
-  const [subagentStreamingText, setSubagentStreamingText] = useState<Map<string, string>>(new Map())
-  const [subagentStreamingThinking, setSubagentStreamingThinking] = useState<Map<string, string>>(new Map())
+  const subagentMessagesRef = useRef(new SubagentTranscriptCache<MessageItem>())
+  const { text: subagentStreamingText, thinking: subagentStreamingThinking, controller: subagentStreams } = useBatchedSubagentStreams(activation)
   const [taskModal, setTaskModal] = useState<{ taskId: string; label: string; subagentType?: string } | null>(null)
   const [taskModalTick, setTaskModalTick] = useState(0)
+  const resetSubagentState = useCallback(() => {
+    subagentMessagesRef.current.clear()
+    subagentStreams.clear()
+    setTaskModal(null)
+  }, [subagentStreams])
   const [showPromptHistory, setShowPromptHistory] = useState(false)
   const [worktreeInfo, setWorktreeInfo] = useState<{ branchName: string; worktreePath: string; sourceBranch: string; gitRoot?: string } | null>(() => {
     // Restore from persisted terminal state
@@ -591,6 +602,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
   const [cacheEntryModal, setCacheEntryModal] = useState<number | null>(null)
   const [cacheCountdown, setCacheCountdown] = useState<{ m5: number; h1: number } | null>(null)
   const cacheAlarmEnabled = useSettings(s => s.cacheAlarmTimer === true)
+  const allowFastMode = useSettings(s => s.allowFastMode === true)
+  const fastModeCommandPendingRef = useRef(false)
   const statuslineConfig = useSettings(() => settingsStore.getStatuslineItems(), shallowEqual)
   const [contextUsagePopup, setContextUsagePopup] = useState<{
     categories: { name: string; tokens: number; color: string; isDeferred?: boolean }[]
@@ -678,8 +691,41 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
   // a redundant append, never a lost row.
   const archivedIdsRef = useRef<Set<string>>(new Set())
   const archivingRef = useRef(false)
-  const VISIBLE_LIMIT = 120
-  const ARCHIVE_TRIGGER = 160 // archive when exceeding this
+  const archiveRevisionRef = useRef(0)
+  const archiveRequestRef = useRef<symbol | null>(null)
+  const archiveWindowRef = useRef({ start: 0, end: 0, total: 0 })
+  const [hasNewerArchived, setHasNewerArchived] = useState(false)
+  const archiveWriteQueueRef = useRef<Promise<unknown>>(Promise.resolve())
+  const serializeArchiveWrite = useCallback((operation: () => Promise<boolean>) => {
+    const revision = archiveRevisionRef.current
+    const pending = archiveWriteQueueRef.current.catch(() => {}).then(() =>
+      revision === archiveRevisionRef.current ? operation() : false)
+    archiveWriteQueueRef.current = pending
+    return pending
+  }, [])
+  const resetArchivePage = useCallback(() => {
+    archiveRevisionRef.current++
+    archiveRequestRef.current = null
+    archiveWindowRef.current = { start: 0, end: 0, total: 0 }
+    archivingRef.current = false
+    setHasNewerArchived(false)
+    setIsLoadingMore(false)
+  }, [])
+  const applyArchivePage = useCallback((page: ArchivePage<MessageItem>) => {
+    const total = Math.max(page.total, archivedCountRef.current)
+    archiveWindowRef.current = { start: page.start, end: page.end, total }
+    archivedCountRef.current = total
+    loadedFromArchiveRef.current = page.end > 0 ? total - page.start : 0
+    for (const item of page.items) archivedIdsRef.current.add(item.id)
+    setLoadedArchive(page.items)
+    setHasMoreArchived(page.start > 0 || (page.end === 0 && total > 0))
+    setHasNewerArchived(page.end > 0 && page.end < total)
+  }, [])
+
+  useEffect(() => () => {
+    archiveRevisionRef.current++
+    archiveRequestRef.current = null
+  }, [])
   const INITIAL_ARCHIVE_LOAD = 120
   const LOAD_BATCH = 40
   const historyLoadedRef = useRef(false)
@@ -1049,37 +1095,28 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     if (initialArchiveLoadInFlightRef.current) return undefined
     initialArchiveLoadInFlightRef.current = true
     let cancelled = false
+    const revision = archiveRevisionRef.current
+    const token = Symbol('initial-archive-page')
+    archiveRequestRef.current = token
     archiveDlog(
       `[Codex:${sessionId.slice(0, 8)}] ${reason} archived start limit=${INITIAL_ARCHIVE_LOAD}`
     )
     setIsLoadingMore(true)
-    host.claude.loadArchived(sessionId, 0, INITIAL_ARCHIVE_LOAD)
-      .then((result: { messages: unknown[]; total: number; hasMore: boolean }) => {
-        if (cancelled) return
-        const rawMessages = result.messages || []
-        const archived = normalizeMessageItems(rawMessages)
-        archiveDlog(
-          `[Codex:${sessionId.slice(0, 8)}] ${reason} archived result messages=${archived.length}/${rawMessages.length} total=${result.total || 0} hasMore=${result.hasMore}`
-        )
-        archivedCountRef.current = result.total || archived.length
-        loadedFromArchiveRef.current = rawMessages.length
-        // Anything read back is on disk by definition. A fresh mount starts
-        // with no record of what it archived in a previous life, and this is
-        // the cheapest way to recover part of it — enough that re-hydrating
-        // does not re-flush the tail the panel just read.
-        for (const m of archived) archivedIdsRef.current.add(m.id)
-        setLoadedArchive(archived)
-        setHasMoreArchived(result.hasMore)
+    readArchivePage((offset, limit) => host.claude.loadArchived(sessionId, offset, limit), normalizeMessageItems,
+      { total: archivedCountRef.current, limit: INITIAL_ARCHIVE_LOAD })
+      .then(page => {
+        if (cancelled || revision !== archiveRevisionRef.current || archiveRequestRef.current !== token) return
+        applyArchivePage(page)
       })
       .catch((err) => {
         archiveDlog(
           `[Codex:${sessionId.slice(0, 8)}] ${reason} archived failed: ${err instanceof Error ? err.message : String(err)}`
         )
-        if (!cancelled) setHasMoreArchived(false)
+        if (!cancelled && revision === archiveRevisionRef.current) setHasMoreArchived(false)
       })
       .finally(() => {
         initialArchiveLoadInFlightRef.current = false
-        if (!cancelled) setIsLoadingMore(false)
+        if (archiveRequestRef.current === token) { archiveRequestRef.current = null; setIsLoadingMore(false) }
       })
     return () => {
       cancelled = true
@@ -1184,78 +1221,77 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }, [])
 
-  // Archive excess messages to disk when threshold is exceeded.
-  // Trim in-memory immediately to release memory; the archive IPC writes
-  // the snapshot to disk in parallel. If the archive write fails, we keep
-  // the count (best-effort) — losing the ability to load-back those
-  // messages is preferable to letting memory grow unbounded.
+  // Persist finalized rows before releasing their in-memory snapshots.
   useEffect(() => {
-    if (archivingRef.current || messages.length <= ARCHIVE_TRIGGER) return
+    if (archivingRef.current) return
+    const snapshots = transcriptArchivePrefix(messages)
+    if (snapshots.length === 0) return
+    const revision = archiveRevisionRef.current
     archivingRef.current = true
-    const excess = messages.length - VISIBLE_LIMIT
-    // This effect assumed `messages` only ever grows by new rows. It does not:
-    // hydrating (on mount, and again on every remote reconnect — isRemoteConnected
-    // is a dep of the hydrate effect) replaces it with the host's last 300, whose
-    // head is already archived. Flushing that window unfiltered appended a second
-    // copy per hydrate, permanently, and the duplicates then rendered as repeated
-    // replies. Archive only what has not been archived before.
-    const toArchive = messages.slice(0, excess).filter(m => !archivedIdsRef.current.has(m.id))
-    setMessages(prev => prev.slice(excess))
-    // Counts rows in the archive file, which is what the "load older" label
-    // reports — so it advances by what is actually written, not by what was
-    // dropped from the visible window.
-    archivedCountRef.current += toArchive.length
-    setHasMoreArchived(true)
-    if (toArchive.length === 0) {
-      archivingRef.current = false
-      return
-    }
-    for (const m of toArchive) archivedIdsRef.current.add(m.id)
-    host.claude.archiveMessages(sessionId, toArchive)
-      .catch((err) => {
-        host.debug.log?.('[CodexAgentPanel] archiveMessages failed:', String(err))
+    const toArchive = snapshots.filter(m => !archivedIdsRef.current.has(m.id))
+    serializeArchiveWrite(() => persistTranscriptArchive(toArchive, batch => revision === archiveRevisionRef.current
+      ? host.claude.archiveMessages(sessionId, batch) : Promise.resolve(false)))
+      .then(ok => {
+        if (revision !== archiveRevisionRef.current) return
+        archivingRef.current = false
+        if (!ok) { host.debug.log('[CodexAgentPanel] archive write failed; keeping messages in memory'); return }
+        for (const item of toArchive) archivedIdsRef.current.add(item.id)
+        archivedCountRef.current += toArchive.length
+        setHasMoreArchived(archiveWindowRef.current.start > 0 || archiveWindowRef.current.end === 0)
+        setHasNewerArchived(archiveWindowRef.current.end > 0 && archiveWindowRef.current.end < archivedCountRef.current)
+        setMessages(prev => releaseArchivedSnapshots(prev, snapshots))
       })
-      .finally(() => { archivingRef.current = false })
-  }, [messages.length, sessionId])
+      .catch(err => {
+        if (revision !== archiveRevisionRef.current) return
+        archivingRef.current = false
+        host.debug.log('[CodexAgentPanel] archiveMessages failed:', String(err))
+      })
+  }, [messages, sessionId, serializeArchiveWrite])
 
-  // Drop tool-render cache entries whose tool ids are no longer in messages.
+  // Loaded archive rows are still rendered; keep their computed output until
+  // they leave the combined transcript, rather than reparsing every new row.
   useEffect(() => {
     const liveIds = new Set<string>()
-    for (const m of messages) {
+    for (const m of allMessages) {
       if ('toolName' in m) liveIds.add(m.id)
     }
     pruneToolRenderCache(toolRenderCacheRef.current, liveIds)
-  }, [messages])
+    pruneToolRenderCache(specialToolRenderCacheRef.current, liveIds)
+  }, [allMessages])
 
   // Load more archived messages when scrolling to top
-  const loadMoreArchived = useCallback(async () => {
-    if (isLoadingMore || !hasMoreArchived) return
+  const navigateArchive = useCallback(async (direction: 'older' | 'newer' | 'latest') => {
+    if (archiveRequestRef.current) return
+    const token = Symbol('archive-page')
+    archiveRequestRef.current = token
+    const revision = archiveRevisionRef.current
+    const current = archiveWindowRef.current
     setIsLoadingMore(true)
-    const container = messagesContainerRef.current
-    const prevScrollHeight = container?.scrollHeight ?? 0
+    followOutputRef.current = direction === 'latest'
     try {
-      const result = await host.claude.loadArchived(sessionId, loadedFromArchiveRef.current, LOAD_BATCH)
-      if (result.messages.length > 0) {
-        const archived = normalizeMessageItems(result.messages)
-        loadedFromArchiveRef.current += result.messages.length
-        for (const m of archived) archivedIdsRef.current.add(m.id)
-        setLoadedArchive(prev => [...archived, ...prev])
-        setHasMoreArchived(result.hasMore)
-        // Preserve scroll position after prepending
-        requestAnimationFrame(() => {
-          if (container) {
-            const newScrollHeight = container.scrollHeight
-            container.scrollTop += newScrollHeight - prevScrollHeight
-          }
-        })
-      } else {
-        setHasMoreArchived(false)
-      }
-    } catch {
-      setHasMoreArchived(false)
+      const page = await readArchivePage((offset, limit) => host.claude.loadArchived(sessionId, offset, limit), normalizeMessageItems, {
+        total: archivedCountRef.current,
+        limit: LOAD_BATCH,
+        ...(direction === 'older' && current.end > 0 ? { end: current.start } : {}),
+        ...(direction === 'newer' ? { start: current.end } : {}),
+      })
+      if (revision !== archiveRevisionRef.current || archiveRequestRef.current !== token) return
+      applyArchivePage(page)
+      if (direction === 'latest') scrollToBottomAfterRender()
+      else requestAnimationFrame(() => {
+        if (revision !== archiveRevisionRef.current) return
+        const container = messagesContainerRef.current
+        if (container) container.scrollTop = 0
+      })
+    } catch (err) {
+      if (revision === archiveRevisionRef.current) host.debug.log('[CodexAgentPanel] archive page failed:', String(err))
+    } finally {
+      if (archiveRequestRef.current === token) { archiveRequestRef.current = null; setIsLoadingMore(false) }
     }
-    setIsLoadingMore(false)
-  }, [sessionId, isLoadingMore, hasMoreArchived])
+  }, [sessionId, applyArchivePage, scrollToBottomAfterRender])
+  const loadMoreArchived = useCallback(() => navigateArchive('older'), [navigateArchive])
+  const loadNewerArchived = useCallback(() => navigateArchive('newer'), [navigateArchive])
+  const loadLatestArchived = useCallback(() => navigateArchive('latest'), [navigateArchive])
 
   // Sync pending action state to workspace store for breathing light indicator
   useEffect(() => {
@@ -1303,12 +1339,13 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           if (!historyLoadedRef.current) {
             setMessages([message])
             // Clear archive on fresh session start
+            resetArchivePage()
             setLoadedArchive([])
             archivedCountRef.current = 0
             loadedFromArchiveRef.current = 0
             archivedIdsRef.current = new Set()
             setHasMoreArchived(false)
-            host.claude.clearArchive(sessionId).catch(() => {})
+            serializeArchiveWrite(() => host.claude.clearArchive(sessionId)).catch(() => {})
           }
           setStreamingText('')
           setStreamingThinking('')
@@ -1338,8 +1375,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
             subagentMessagesRef.current.set(message.parentToolUseId, bucket)
             if (taskModal?.taskId === message.parentToolUseId) setTaskModalTick(t => t + 1)
           }
-          setSubagentStreamingText(prev => { const n = new Map(prev); n.delete(message.parentToolUseId!); return n })
-          setSubagentStreamingThinking(prev => { const n = new Map(prev); n.delete(message.parentToolUseId!); return n })
+          subagentStreams.delete(message.parentToolUseId)
           return
         }
         // Deduplicate by id; for user messages also dedup by content+timestamp proximity
@@ -1496,9 +1532,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         const doResultUpdate = () => setMessages(prev => prev.map(m => {
           if ('toolName' in m && m.id === id) {
             // When a Task tool completes, clear its subagent streaming state
-            if (m.toolName === 'Task') {
-              setSubagentStreamingText(p => { const n = new Map(p); n.delete(id); return n })
-              setSubagentStreamingThinking(p => { const n = new Map(p); n.delete(id); return n })
+            if (m.toolName === 'Task' || m.toolName === 'Agent') {
+              subagentStreams.delete(id)
             }
             return { ...m, ...updates } as ClaudeToolCall
           }
@@ -1631,21 +1666,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         workspaceStore.updateTerminalActivity(sessionId)
         setSessionMeta(prev => clearRuntimeStatusMeta(prev))
         if (d.parentToolUseId) {
-          // Route to per-subagent streaming state
-          if (d.text) {
-            setSubagentStreamingText(prev => {
-              const n = new Map(prev)
-              n.set(d.parentToolUseId!, (prev.get(d.parentToolUseId!) || '') + d.text)
-              return n
-            })
-          }
-          if (d.thinking) {
-            setSubagentStreamingThinking(prev => {
-              const n = new Map(prev)
-              n.set(d.parentToolUseId!, (prev.get(d.parentToolUseId!) || '') + d.thinking)
-              return n
-            })
-          }
+          subagentStreams.append(d.parentToolUseId, d)
         } else {
           if (d.text) streamingTextStore.append(d.text)
           if (d.thinking) streamingThinkingStore.append(d.thinking)
@@ -1659,6 +1680,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           host.debug.log(`${tag} onStatus sdkSessionId=${((meta as unknown as SessionMeta).sdkSessionId || '').slice(0, 8)}`)
         }
         const m = meta as unknown as SessionMeta
+        if (m.runtimeStatus === 'reloading') clearPendingAutoContinue()
         if (typeof m.isStreaming === 'boolean') {
           setIsStreaming(m.isStreaming)
         } else if (m.runtimeStatus) {
@@ -1667,6 +1689,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           setIsStreaming(true)
         }
         setSessionMeta(m)
+        adoptHostSessionMeta(m)
         // Track cache efficiency history (only push when values change)
         if (m.inputTokens > 0 && m.cacheReadTokens !== undefined) {
           const hist = cacheHistoryRef.current
@@ -1758,7 +1781,15 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       api.onSessionReset((sid: string) => {
         if (sid !== sessionId) return
         historyItemsReceivedRef.current = false
+        resetSubagentState()
         setMessages([])
+        resetArchivePage()
+        setLoadedArchive([])
+        autoLoadedArchiveSessionRef.current = null
+        archivedCountRef.current = 0
+        loadedFromArchiveRef.current = 0
+        archivedIdsRef.current = new Set()
+        setHasMoreArchived(false)
         setStreamingText('')
         setStreamingThinking('')
         setPendingPermission(null)
@@ -1798,7 +1829,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
             mainItems.push(item)
           }
         }
-        subagentMessagesRef.current = subagentBuckets
+        subagentMessagesRef.current.replace(subagentBuckets)
         // Restore activePlanFile from history: only show bar if last plan tool is
         // ExitPlanMode and it fired within the 10-minute badge window.
         for (let i = mainItems.length - 1; i >= 0; i--) {
@@ -1816,47 +1847,43 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           }
         }
         const historyItems = mainItems
-        const archiveHistoryItems = historyItems.length > ARCHIVE_TRIGGER
-          ? historyItems.slice(0, -VISIBLE_LIMIT)
-          : []
-        const liveHistoryItems = archiveHistoryItems.length > 0
-          ? historyItems.slice(-VISIBLE_LIMIT)
-          : historyItems
-        archiveDlog(
-          `${tag} onHistory reset archive items=${historyItems.length} live=${liveHistoryItems.length} archive=${archiveHistoryItems.length} loadedArchive=${loadedArchive.length} archivedCount=${archivedCountRef.current} loadedFromArchive=${loadedFromArchiveRef.current}`
-        )
+        const archiveHistoryItems = transcriptArchivePrefix(historyItems)
+        const liveHistoryItems = historyItems.slice(archiveHistoryItems.length)
         if (historyItems.length > 0 || loadedFromArchiveRef.current === 0) {
+          resetArchivePage()
+          const revision = archiveRevisionRef.current
           setLoadedArchive([])
-          archivedCountRef.current = archiveHistoryItems.length
+          archivedCountRef.current = 0
           loadedFromArchiveRef.current = 0
           setHasMoreArchived(false)
-          // The archive is about to be replaced wholesale, so what this panel
-          // believes it has written is void either way.
           archivedIdsRef.current = new Set()
-          window.setTimeout(() => {
-            const resetArchive = host.claude.clearArchive(sessionId)
-            if (archiveHistoryItems.length === 0) {
-              resetArchive.catch(() => {})
-              return
-            }
-            resetArchive
-              .then(() => host.claude.archiveMessages(sessionId, archiveHistoryItems))
-              .then((ok) => {
-                if (ok) {
-                  for (const m of archiveHistoryItems) archivedIdsRef.current.add(m.id)
-                  setHasMoreArchived(true)
-                } else {
-                  archivedCountRef.current = 0
-                  archiveDlog(`${tag} onHistory archive history failed`)
-                }
-              })
-              .catch((err) => {
-                archivedCountRef.current = 0
-                host.debug.log?.('[CodexAgentPanel] archive history failed:', String(err))
-              })
-          }, 0)
-        } else {
-          archiveDlog(`${tag} onHistory empty; keeping auto-loaded archive`)
+          archivingRef.current = true
+          serializeArchiveWrite(async () => {
+            if (!await host.claude.clearArchive(sessionId)) return false
+            if (revision !== archiveRevisionRef.current) return false
+            return persistTranscriptArchive(archiveHistoryItems, batch => revision === archiveRevisionRef.current
+              ? host.claude.archiveMessages(sessionId, batch) : Promise.resolve(false))
+          })
+            .then(ok => {
+              if (revision !== archiveRevisionRef.current) return
+              archivingRef.current = false
+              if (ok) {
+                for (const item of archiveHistoryItems) archivedIdsRef.current.add(item.id)
+                archivedCountRef.current = archiveHistoryItems.length
+                setHasMoreArchived(archiveHistoryItems.length > 0)
+                setMessages(prev => [...prev])
+              } else {
+                // Keep the only available copies if persistence was rejected.
+                setMessages(prev => dedupeMessagesById([...archiveHistoryItems, ...prev]))
+                host.debug.log('[CodexAgentPanel] history archive failed; restored messages in memory')
+              }
+            })
+            .catch(err => {
+              if (revision !== archiveRevisionRef.current) return
+              archivingRef.current = false
+              setMessages(prev => dedupeMessagesById([...archiveHistoryItems, ...prev]))
+              host.debug.log('[CodexAgentPanel] history archive failed:', String(err))
+            })
         }
         setStreamingText('')
         setStreamingThinking('')
@@ -1914,7 +1941,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       host.debug.log(`${tag} unsubscribing IPC events`)
       unsubs.forEach(unsub => unsub())
     }
-  }, [sessionId, isCodexSession, archiveDlog])
+  }, [sessionId, isCodexSession, archiveDlog, resetSubagentState])
 
   // Stable per session so a retry replaces the notice rather than stacking one.
   const remoteDisconnectNoticeId = `sys-remote-disconnected-${sessionId}`
@@ -1976,7 +2003,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       try {
         await ensureSessionStarted()
         if (cancelled) return
-        const existingState = await host.claude.getSessionState(sessionId).catch(() => null)
+        const existingState = await host.claude.getSessionState(sessionId)
         if (cancelled || !existingState) return
         const existingMessages = normalizeMessageItems(existingState.messages)
         historyLoadedRef.current = true
@@ -2027,6 +2054,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         const meta = await host.claude.getSessionMeta(sessionId).catch(() => null)
         if (cancelled || !meta) return
         setSessionMeta(meta as unknown as SessionMeta)
+        adoptHostSessionMeta(meta as unknown as SessionMeta)
         if ((meta as unknown as SessionMeta).model) {
           const nextModel = (meta as unknown as SessionMeta).model!
           setCurrentModel(prev => isCodexSession ? nextModel : (prev || nextModel))
@@ -2066,6 +2094,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       if (meta) {
         const nextMeta = meta as unknown as SessionMeta
         setSessionMeta(previous => JSON.stringify(previous) === JSON.stringify(nextMeta) ? previous : nextMeta)
+        adoptHostSessionMeta(nextMeta)
         if (nextMeta.model) {
           const nextModel = nextMeta.model
           setCurrentModel(prev => isCodexSession ? nextModel : (prev || nextModel))
@@ -2106,7 +2135,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         : (effortLevelForClaudeMode(effectiveEffortMode) || 'high')
       const effectiveUltracode = !isCodexSession && isUltracodeEffortMode(effectiveEffortMode)
 
-      const existingState = await host.claude.getSessionState(sessionId).catch(() => null)
+      const existingState = await host.claude.getSessionState(sessionId)
       if (existingState) {
         dlog(`${stag} ensureSessionStarted: existing session`)
         return
@@ -2311,9 +2340,10 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     if (existing && existing.length > 0) return // already have streamed messages
     const parentTask = allMessages.find(m => isToolCall(m) && m.id === taskModal.taskId) as ClaudeToolCall | undefined
     if (parentTask?.status === 'running') return // still streaming, don't fetch
-    host.claude.fetchSubagentMessages(sessionId, taskModal.taskId).then((msgs: unknown[]) => {
+    subagentMessagesRef.current.load(taskModal.taskId,
+      async () => await host.claude.fetchSubagentMessages(sessionId, taskModal.taskId) as MessageItem[],
+    ).then(msgs => {
       if (msgs && msgs.length > 0) {
-        subagentMessagesRef.current.set(taskModal.taskId, msgs as MessageItem[])
         setTaskModalTick(t => t + 1)
       }
     }).catch(() => {})
@@ -2419,7 +2449,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     workspaceStore.updateTerminalModel(sessionId, modelValue)
   }, [sessionId, isCodexSession, isV2Session, currentModel, t])
 
-  const handleResumeSelect = useCallback(async (sdkSessionId: string) => {
+  const handleResumeSelect = useCallback(async (sdkSessionId: string, knownSession = false) => {
     host.debug.log(`[Codex:${sessionId.slice(0, 8)}] handleResumeSelect sdkSessionId=${sdkSessionId.slice(0, 8)}`)
     const owner = workspaceStore.findSdkSessionOwner(sdkSessionId, terminal?.agentPreset, sessionId)
     if (owner) {
@@ -2430,27 +2460,31 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       window.alert(`This Codex session is already open in "${owner.alias || owner.title}". Switched to that session instead.`)
       return
     }
-    setResumeLoading(true)
-    try {
-      const latest = await host.claude.listSessions(cwd, 'codex') || []
-      if (!latest.some(s => s.sdkSessionId === sdkSessionId)) {
-        setResumeSessions(latest)
+    if (!knownSession) {
+      setResumeLoading(true)
+      try {
+        const latest = await host.claude.listSessions(cwd, 'codex') || []
+        if (!latest.some(s => s.sdkSessionId === sdkSessionId)) {
+          setResumeSessions(latest)
+          setShowResumeList(true)
+          return
+        }
+      } catch {
+        setResumeSessions([])
         setShowResumeList(true)
         return
+      } finally {
+        setResumeLoading(false)
       }
-    } catch {
-      setResumeSessions([])
-      setShowResumeList(true)
-      return
-    } finally {
-      setResumeLoading(false)
     }
     setShowResumeList(false)
     setResumeSessions([])
     // Clear UI immediately so user sees the switch
+    resetSubagentState()
     historyItemsReceivedRef.current = false
     autoLoadedArchiveSessionRef.current = null
     setMessages([])
+    resetArchivePage()
     setLoadedArchive([])
     archivedCountRef.current = 0
     loadedFromArchiveRef.current = 0
@@ -2485,7 +2519,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       !isCodexSession && isUltracodeEffortMode(effortLevel) ? true : undefined,
     )
     workspaceStore.setTerminalSdkSessionId(sessionId, sdkSessionId)
-  }, [sessionId, cwd, isV2Session, terminal?.agentPreset, terminal?.worktreePath, terminal?.worktreeBranch, currentModel, codexSandboxMode, codexApprovalPolicy, permissionMode, effortLevel])
+  }, [sessionId, cwd, isV2Session, terminal?.agentPreset, terminal?.worktreePath, terminal?.worktreeBranch, currentModel, codexSandboxMode, codexApprovalPolicy, permissionMode, effortLevel, resetSubagentState])
 
   const handleForkSession = useCallback(async () => {
     const dlog = (...args: unknown[]) => host.debug.log(...args)
@@ -2534,14 +2568,25 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     dlog(`${tag} stored terminal: sdkSessionId=${stored?.sdkSessionId?.slice(0, 8)} pendingPrompt="${stored?.pendingPrompt}" pendingImages=${stored?.pendingImages?.length ?? 0}`)
   }, [sessionId, workspaceId, hasSdkSession, currentModel, attachedImages])
 
-  const handleRewindToPrompt = useCallback(async (promptIndex: number, promptCount: number) => {
-    const removed = promptCount - promptIndex
-    const confirmMsg = `Rewind to before prompt #${promptIndex + 1}?\n\nThis will remove the last ${removed} prompt(s) and their responses from conversation history. The original session history is preserved on disk.`
+  const handleRewindToPrompt = useCallback(async (promptIndex: number, _promptCount: number) => {
+    const target = allMessages.filter(item => !isToolCall(item) && item.role === 'user')[promptIndex]
+    if (!target) return
+    let prompt: { index: number; count: number }
+    try {
+      await archiveWriteQueueRef.current
+      prompt = await resolveTranscriptPrompt(target.id, messages,
+        (offset, limit) => host.claude.loadArchived(sessionId, offset, limit), normalizeMessageItems)
+    } catch (err) {
+      alert('Rewind failed: ' + String(err))
+      return
+    }
+    const removed = prompt.count - prompt.index
+    const confirmMsg = `Rewind to before prompt #${prompt.index + 1}?\n\nThis will remove the last ${removed} prompt(s) and their responses from conversation history. The original session history is preserved on disk.`
     if (!window.confirm(confirmMsg)) return
 
     let result: { newSdkSessionId: string; removedPromptCount: number } | { error: string }
     try {
-      result = await host.claude.rewindToPrompt(sessionId, promptIndex)
+      result = await host.claude.rewindToPrompt(sessionId, prompt.index)
     } catch (e) {
       alert('Rewind failed: ' + (e instanceof Error ? e.message : String(e)))
       return
@@ -2551,29 +2596,11 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       return
     }
 
-    // Trim local message state: keep messages BEFORE the Nth user prompt.
-    // Splice allMessages (loadedArchive + messages) at the cutoff and redistribute.
-    const combined = dedupeMessagesById([...loadedArchive, ...messages])
-    let userPromptCount = 0
-    let cutoffIdx = combined.length
-    for (let i = 0; i < combined.length; i++) {
-      const m = combined[i]
-      if (!isToolCall(m) && (m as ClaudeMessage).role === 'user') {
-        if (userPromptCount === promptIndex) {
-          cutoffIdx = i
-          break
-        }
-        userPromptCount++
-      }
-    }
-    const kept = combined.slice(0, cutoffIdx)
-    // Put everything into loadedArchive so later streaming appends to messages cleanly
-    setLoadedArchive(kept)
-    setMessages([])
-
     workspaceStore.setTerminalSdkSessionId(sessionId, result.newSdkSessionId)
     setShowPromptHistory(false)
-  }, [sessionId, loadedArchive, messages])
+    await host.claude.resetSession(sessionId)
+    await handleResumeSelect(result.newSdkSessionId, true)
+  }, [sessionId, allMessages, messages, handleResumeSelect])
 
   const clearInput = useCallback(() => {
     inputValueRef.current = ''
@@ -2604,6 +2631,18 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     return () => window.removeEventListener('claude-insert-command', handler)
   }, [setInputValue])
   usePanelActiveEffect(activation, bindActiveSkillInsertion)
+
+  const reloadFeedback = useCallback((content: string) => {
+    setMessages(prev => [...prev, {
+      id: `sys-reload-${Date.now()}`, sessionId, role: 'system' as const,
+      content, timestamp: Date.now(),
+    }])
+  }, [sessionId])
+  const { reload: reloadSession, pending: reloadPending } = useSessionReload({
+    sessionId, available: isCodexSession || !isV2Session,
+    busy: sessionMeta?.runtimeStatus === 'reloading',
+    ensureSessionStarted: async () => { clearPendingAutoContinue(); await ensureSessionStarted() }, onFeedback: reloadFeedback,
+  })
 
   const handleSend = useCallback(async () => {
     const sendStart = performance.now()
@@ -2665,6 +2704,32 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       }
       setMessages(prev => [...prev, {
         id: `sys-ac-${Date.now()}`, sessionId, role: 'system' as const,
+        content, timestamp: Date.now(),
+      }])
+      return
+    }
+
+    if (trimmed === '/bat-reload' || trimmed === '/reload') {
+      clearInput()
+      setShowSlashMenu(false)
+      await reloadSession()
+      return
+    }
+    if (reloadPending) return
+
+    const fastCommand = parseBatFastCommand(trimmed)
+    if (fastCommand !== null) {
+      clearInput()
+      setShowSlashMenu(false)
+      const content = await executeBatFastCommand(fastCommand, {
+        sessionId,
+        available: isCodexSession || !isV2Session,
+        busy: isStreaming,
+        pending: fastModeCommandPendingRef,
+        ensureSessionStarted,
+      })
+      setMessages(prev => [...prev, {
+        id: `sys-fast-${Date.now()}`, sessionId, role: 'system' as const,
         content, timestamp: Date.now(),
       }])
       return
@@ -2760,12 +2825,14 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     // Intercept /new or /clear command — reset session (clear conversation, fresh start)
     if (!isStreaming && (trimmed === '/new' || trimmed === '/clear')) {
       clearInput()
+      resetSubagentState()
       clearPendingAutoContinue()
       autoContinueHandledTurnKeysRef.current.clear()
       autoContinueRef.current = { ...autoContinueRef.current, enabled: false, used: 0 }
       historyItemsReceivedRef.current = false
       autoLoadedArchiveSessionRef.current = null
       setMessages([])
+      resetArchivePage()
       setLoadedArchive([])
       archivedCountRef.current = 0
       loadedFromArchiveRef.current = 0
@@ -3091,7 +3158,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         }])
       }
     }
-  }, [isRemoteConnected, isStreaming, isInterrupted, sessionId, attachedImages, attachedFiles, clearInput, setInputValue, clearPendingAutoContinue, sendClaudeMessage, onRequestLogin])
+  }, [isRemoteConnected, isStreaming, isInterrupted, sessionId, attachedImages, attachedFiles, clearInput, setInputValue, clearPendingAutoContinue, sendClaudeMessage, onRequestLogin, resetSubagentState, ensureSessionStarted, isCodexSession, isV2Session, reloadSession, reloadPending])
 
   const handleInterrupt = useCallback(() => {
     if (!isStreaming) return
@@ -3244,9 +3311,13 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           { name: 'whoami', description: 'Show current account info', argumentHint: '' },
           { name: 'switch', description: 'Switch between registered accounts', argumentHint: '<number|email>' },
         ]
+    if (isCodexSession || !isV2Session) builtIn.push(BAT_RELOAD_SLASH_COMMAND)
+    if (allowFastMode && host.debug.isDebugMode === true && (isCodexSession || !isV2Session)) {
+      builtIn.push(BAT_FAST_SLASH_COMMAND)
+    }
     const all = [...builtIn, ...slashCommands]
     return q ? all.filter(c => c.name.toLowerCase().includes(q)) : all
-  }, [showSlashMenu, slashFilter, slashCommands, isCodexSession])
+  }, [showSlashMenu, slashFilter, slashCommands, isCodexSession, isV2Session, allowFastMode])
 
   // Auto-resize textarea to fit content
   const autoResizeTextarea = useCallback(() => {
@@ -3271,7 +3342,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
   }, [])
 
   const handleSlashSelect = useCallback((cmd: SlashCommandInfo) => {
-    setInputValue('/' + cmd.name)
+    setInputValue('/' + cmd.name + (cmd.name === 'bat-fast' ? ' ' : ''))
     setShowSlashMenu(false)
     textareaRef.current?.focus()
   }, [setInputValue])
@@ -3952,8 +4023,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       // part of the conversation, not tool plumbing, so it should not have to be
       // reconstructed from a JSON input next to the SDK's acknowledgement.
       if (item.toolName === 'AskUserQuestion') {
-        const resultRaw = item.result ? stringifyToolResult(item.result) : ''
-        const { content: resultText, errors: resultErrors } = splitSystemReminders(parseContentBlocks(resultRaw))
+        const { content: resultText, errors: resultErrors } = getSpecialResult(item)
         const qna = buildAskUserQnA(item.input, resultText)
         const rowExpanded = expandedTools.has(item.id)
         // A payload we cannot read falls through to the generic row, which at
@@ -4032,7 +4102,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
                     <div className="claude-tool-label">{t('claude.fullInput')}</div>
-                    <pre>{JSON.stringify(item.input, null, 2)}</pre>
+                    <AgentToolInput input={item.input} />
                   </div>
                 </div>
               )}
@@ -4043,8 +4113,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
 
       // ExitPlanMode / EnterPlanMode: show plan content in readable view
       if (item.toolName === 'ExitPlanMode' || item.toolName === 'EnterPlanMode') {
-        const resultRaw = item.result ? (stringifyToolResult(item.result)) : ''
-        const { content: resultText, errors: resultErrors } = splitSystemReminders(resultRaw)
+        const { content: resultText, errors: resultErrors } = getSpecialResult(item)
         const planPath = item.input.planFilePath ? String(item.input.planFilePath) : ''
         return (
           <div key={item.id || index} className="tl-item">
@@ -4083,7 +4152,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
                     <div className="claude-tool-label">{t('claude.fullInput')}</div>
-                    <pre>{JSON.stringify(item.input, null, 2)}</pre>
+                    <AgentToolInput input={item.input} />
                   </div>
                 </div>
               )}
@@ -4105,11 +4174,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         const model = item.input.model ? String(item.input.model) : null
         const maxTurns = item.input.max_turns ? String(item.input.max_turns) : null
         const runBg = item.input.run_in_background ? true : false
-        const resultRaw = item.result ? (stringifyToolResult(item.result)) : ''
-        const { content: resultTextRaw, reminders: resultReminders, errors: resultErrors } = splitSystemReminders(resultRaw)
-        const resultText = parseContentBlocks(resultTextRaw)
-        const resultLines = resultText.split('\n')
-        const isLongResult = resultLines.length > 6 || resultText.length > 400
+        const { content: resultText, reminders: resultReminders, errors: resultErrors, lineCount: resultLineCount } = getSpecialResult(item)
+        const isLongResult = resultLineCount > 6 || resultText.length > 400
         const progressDesc = item.description || ''
         const isStalled = progressDesc.startsWith('[stalled]')
         const isStopped = progressDesc.startsWith('[stopped')
@@ -4184,7 +4250,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                   )}
                   {!isResultExpanded && isLongResult && (
                     <div className="claude-plan-open-btn" onClick={() => setContentModal({ title: 'Task Result', content: resultText, markdown: true })}>
-                      View result ({resultLines.length} lines)
+                      View result ({resultLineCount} lines)
                     </div>
                   )}
                 </div>
@@ -4204,7 +4270,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
                     <div className="claude-tool-label">{t('claude.fullInput')}</div>
-                    <pre>{JSON.stringify(item.input, null, 2)}</pre>
+                    <AgentToolInput input={item.input} />
                   </div>
                 </div>
               )}
@@ -4214,71 +4280,43 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       }
 
       // Edit tool: show diff/change view
-      const editChanges = item.toolName === 'Edit' ? codexFileChanges(item.input) : []
-      if (item.toolName === 'Edit' && (item.input.old_string !== undefined || editChanges.length > 0)) {
+      const isPatch = item.toolName === 'apply_patch' || item.toolName === 'fileChange'
+      const editChanges = item.toolName === 'Edit' || isPatch ? codexFileChanges(item.input) : []
+      if ((item.toolName === 'Edit' && (item.input.old_string !== undefined || editChanges.length > 0)) || isPatch) {
         const filePath = String(item.input.file_path || '')
-        const oldStr = String(item.input.old_string || '')
-        const newStr = String(item.input.new_string || '')
         const hasOldNewDiff = item.input.old_string !== undefined
-        const unifiedDiff = codexChangeDiffText(editChanges)
         const isDiffExpanded = expandedTools.has(`diff-${item.id}`)
-        const oldLines = oldStr.split('\n')
-        const newLines = newStr.split('\n')
-        const unifiedDiffLines = unifiedDiff.split(/\r?\n/)
         const changeSummaryLines = editChanges.map(codexChangeSummaryLine)
-        const totalLines = hasOldNewDiff ? oldLines.length + newLines.length : unifiedDiffLines.length
-        const isLongDiff = totalLines > 12
-        const resultRaw = item.result ? (stringifyToolResult(item.result)) : ''
-        const { content: resultText, errors: resultErrors } = splitSystemReminders(resultRaw)
+        const { content: resultText, errors: resultErrors } = getSpecialResult(item)
         return (
           <div key={item.id || index} className="tl-item">
             <div className={`tl-dot ${dotClass}`} />
             <div className="tl-content">
               <div className="claude-tool-header" onClick={() => toggleTool(item.id)}>
-                <span className="claude-tool-name">Edit</span>
-                <span className="claude-tool-desc"><LinkedText text={codexChangesSummary(editChanges, filePath)} /></span>
+                <span className="claude-tool-name">{isPatch ? 'apply_patch' : 'Edit'}</span>
+                <span className="claude-tool-desc"><LinkedText text={codexChangesSummary(editChanges, filePath) || 'Patch details unavailable'} /></span>
                 {item.timestamp > 0 && <span className="claude-tool-time" title={formatFullTimestamp(item.timestamp)}>{formatTimestamp(item.timestamp)}</span>}
               </div>
-              {hasOldNewDiff ? (
-                <div className="claude-diff-block">
-                  {(isDiffExpanded || !isLongDiff ? oldLines : oldLines.slice(0, 3)).map((line, i) => (
-                    <div key={`o${i}`} className="claude-diff-line claude-diff-del">
-                      <span className="claude-diff-sign">-</span>
-                      <span className="claude-diff-text">{line}</span>
-                    </div>
-                  ))}
-                  {(isDiffExpanded || !isLongDiff ? newLines : newLines.slice(0, 3)).map((line, i) => (
-                    <div key={`n${i}`} className="claude-diff-line claude-diff-add">
-                      <span className="claude-diff-sign">+</span>
-                      <span className="claude-diff-text">{line}</span>
-                    </div>
-                  ))}
-                  {isLongDiff && (
-                    <div className="claude-diff-toggle" onClick={() => toggleTool(`diff-${item.id}`)}>
-                      {isDiffExpanded ? 'Collapse' : `Show all ${totalLines} lines...`}
-                    </div>
-                  )}
-                </div>
-              ) : unifiedDiff ? (
-                <div className="claude-diff-block">
-                  {(isDiffExpanded || !isLongDiff ? unifiedDiffLines : unifiedDiffLines.slice(0, 12)).map((line, i) => (
-                    <div key={i} className={codexDiffLineClass(line)}>
-                      <span className="claude-diff-sign">{isCodexDiffChangeLine(line) ? line[0] : ' '}</span>
-                      <span className="claude-diff-text">{isCodexDiffChangeLine(line) ? line.slice(1) : line}</span>
-                    </div>
-                  ))}
-                  {isLongDiff && (
-                    <div className="claude-diff-toggle" onClick={() => toggleTool(`diff-${item.id}`)}>
-                      {isDiffExpanded ? 'Collapse' : `Show all ${totalLines} lines...`}
-                    </div>
-                  )}
-                </div>
+              {editChanges.length > 1 && (
+                <div className="claude-tool-blocks"><div className="claude-tool-row">
+                  <span className="claude-tool-row-label">FILES</span>
+                  <span className="claude-tool-row-content"><LinkedText text={changeSummaryLines.join('\n')} /></span>
+                </div></div>
+              )}
+              {hasOldNewDiff || editChanges.length > 0 ? (
+                <AgentFilePreview
+                  input={item.input}
+                  variant="edit"
+                  expanded={isDiffExpanded}
+                  toggleId={`diff-${item.id}`}
+                  onToggle={toggleTool}
+                />
               ) : (
                 <div className="claude-tool-blocks">
                   <div className="claude-tool-row">
                     <span className="claude-tool-row-label">EDIT</span>
                     <span className="claude-tool-row-content">
-                      {changeSummaryLines.length > 0 ? <LinkedText text={changeSummaryLines.join('\n')} /> : <LinkedText text={filePath} />}
+                      {changeSummaryLines.length > 0 ? <LinkedText text={changeSummaryLines.join('\n')} /> : <LinkedText text={filePath || 'Patch details unavailable'} />}
                     </span>
                   </div>
                 </div>
@@ -4301,7 +4339,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
                     <div className="claude-tool-label">{t('claude.fullInput')}</div>
-                    <pre>{JSON.stringify(item.input, null, 2)}</pre>
+                    <AgentToolInput input={item.input} />
                   </div>
                 </div>
               )}
@@ -4313,12 +4351,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       // Write tool: show content preview
       if (item.toolName === 'Write' && item.input.content !== undefined) {
         const filePath = String(item.input.file_path || '')
-        const content = String(item.input.content || '')
         const isContentExpanded = expandedTools.has(`write-${item.id}`)
-        const contentLines = content.split('\n')
-        const isLong = contentLines.length > 8
-        const resultRaw = item.result ? (stringifyToolResult(item.result)) : ''
-        const { content: resultText, errors: resultErrors } = splitSystemReminders(resultRaw)
+        const { content: resultText, errors: resultErrors } = getSpecialResult(item)
         return (
           <div key={item.id || index} className="tl-item">
             <div className={`tl-dot ${dotClass}`} />
@@ -4328,19 +4362,13 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 <span className="claude-tool-desc"><LinkedText text={filePath} /></span>
                 {item.timestamp > 0 && <span className="claude-tool-time" title={formatFullTimestamp(item.timestamp)}>{formatTimestamp(item.timestamp)}</span>}
               </div>
-              <div className="claude-diff-block">
-                {(isContentExpanded || !isLong ? contentLines : contentLines.slice(0, 8)).map((line, i) => (
-                  <div key={i} className="claude-diff-line claude-diff-add">
-                    <span className="claude-diff-sign">+</span>
-                    <span className="claude-diff-text">{line}</span>
-                  </div>
-                ))}
-                {isLong && (
-                  <div className="claude-diff-toggle" onClick={() => toggleTool(`write-${item.id}`)}>
-                    {isContentExpanded ? 'Collapse' : `Show all ${contentLines.length} lines...`}
-                  </div>
-                )}
-              </div>
+              <AgentFilePreview
+                input={item.input}
+                variant="write"
+                expanded={isContentExpanded}
+                toggleId={`write-${item.id}`}
+                onToggle={toggleTool}
+              />
               {resultErrors.length > 0 && resultErrors.map((err, i) => (
                 <div key={`err${i}`} className="claude-tool-blocks"><div className="claude-tool-row claude-tool-error-row">
                   <span className="claude-tool-row-label claude-error-label">{t('claude.err')}</span>
@@ -4359,7 +4387,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
                     <div className="claude-tool-label">{t('claude.fullInput')}</div>
-                    <pre>{JSON.stringify(item.input, null, 2)}</pre>
+                    <AgentToolInput input={item.input} />
                   </div>
                 </div>
               )}
@@ -4374,11 +4402,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         const parentTask = taskId
           ? allMessages.find(m => isToolCall(m) && m.toolName === 'Task' && m.id === taskId) as ClaudeToolCall | undefined
           : null
-        const resultRaw = item.result ? (stringifyToolResult(item.result)) : ''
-        const { content: resultTextRaw, errors: resultErrors } = splitSystemReminders(resultRaw)
-        const resultText = parseContentBlocks(resultTextRaw)
-        const resultLines = resultText.split('\n')
-        const isLongResult = resultLines.length > 6 || resultText.length > 400
+        const { content: resultText, errors: resultErrors, lineCount: resultLineCount } = getSpecialResult(item)
+        const isLongResult = resultLineCount > 6 || resultText.length > 400
         const isResultExpanded = expandedTools.has(`taskout-result-${item.id}`)
         return (
           <div key={item.id || index} className="tl-item" data-tool-id={item.id}>
@@ -4420,7 +4445,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                   )}
                   {!isResultExpanded && isLongResult && (
                     <div className="claude-plan-open-btn" onClick={() => setContentModal({ title: 'TaskOutput Result', content: resultText, markdown: true })}>
-                      View result ({resultLines.length} lines)
+                      View result ({resultLineCount} lines)
                     </div>
                   )}
                 </div>
@@ -4429,7 +4454,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
                     <div className="claude-tool-label">{t('claude.fullInput')}</div>
-                    <pre>{JSON.stringify(item.input, null, 2)}</pre>
+                    <AgentToolInput input={item.input} />
                   </div>
                 </div>
               )}
@@ -4469,12 +4494,14 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
             item.id,
             item.result,
             () => {
-              const raw = stringifyToolResult(item.result)
+              const raw = clampToolOutputText(stringifyToolResult(item.result))
               const normalizedRaw = parseContentBlocks(raw)
               const split = splitSystemReminders(normalizedRaw)
+              const outLineCount = countTextLines(split.content)
               return {
                 outText: split.content,
-                isLongOutput: split.content.split(/\r?\n/).length > 8 || split.content.length > 900,
+                outLineCount,
+                isLongOutput: outLineCount > 8 || split.content.length > 900,
                 outPreviewLines: buildCollapsedOutputPreview(split.content),
                 reminders: split.reminders,
                 errors: split.errors,
@@ -4510,7 +4537,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
               summary={headerSummary}
               timestamp={item.timestamp}
               outSize={layout.outSize}
-              outSizeTitle={displayOutText ? formatContentSize(displayOutText) : null}
+              outSizeTitle={displayOutText ? formatContentSize(displayOutText, toolSearchSummary === null ? toolRender?.outLineCount : undefined) : null}
               elapsed={elapsed}
               failed={toolFailed}
               expanded={rowExpanded}
@@ -4571,7 +4598,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                             ? <LinkedText text={outText} />
                             : (
                               <span className="claude-tool-collapsed-hint">
-                                <span className="claude-tool-collapsed-meta">{formatContentSize(outText)}</span>
+                                <span className="claude-tool-collapsed-meta">{formatContentSize(outText, toolRender.outLineCount)}</span>
                                 {outPreviewLines.length > 0 && (
                                   <span className="claude-tool-collapsed-preview-lines">
                                     {outPreviewLines.map((line, i) => (
@@ -4637,7 +4664,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
               <div className="claude-tool-body">
                 <div className="claude-tool-input">
                   <div className="claude-tool-label">Full Input</div>
-                  <pre>{JSON.stringify(item.input, null, 2)}</pre>
+                  <AgentToolInput input={item.input} />
                 </div>
               </div>
             )}
@@ -4862,10 +4889,16 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
               </button>
             </div>
           )}
+          {hasNewerArchived && (
+            <div className="claude-load-more">
+              <button className="claude-load-more-btn" onClick={loadNewerArchived} disabled={isLoadingMore}>{t('claude.loadNewerMessages')}</button>
+              <button className="claude-load-more-btn" onClick={loadLatestArchived} disabled={isLoadingMore}>{t('claude.backToLatestMessages')}</button>
+            </div>
+          )}
           {isResumingHistory && (
             <div className="claude-resume-skeleton">
               <span className="claude-resume-skeleton-spinner" />
-              <span>{t('claude.resumingHistory')}</span>
+              <span>{sessionMeta?.runtimeStatus === 'reloading' ? 'Reloading session…' : t('claude.resumingHistory')}</span>
             </div>
           )}
           {buildMessageStream(
@@ -4882,7 +4915,13 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                   <span>{t('claude.unseenDivider')}</span>
                 </div>
               ) : null
-              return <Fragment key={item.id || `msg-${i}`}>{divider}{unseen}{renderMessage(item, i)}</Fragment>
+              const archiveGap = hasNewerArchived && item.id === messages[0]?.id ? (
+                <div className="claude-load-more">
+                  <span>{t('claude.archivedGap', { count: Math.max(0, archivedCountRef.current - archiveWindowRef.current.end) })}</span>
+                  <button className="claude-load-more-btn" onClick={loadNewerArchived} disabled={isLoadingMore}>{t('claude.loadNewerMessages')}</button>
+                </div>
+              ) : null
+              return <Fragment key={item.id || `msg-${i}`}>{archiveGap}{divider}{unseen}{renderMessage(item, i)}</Fragment>
             },
           )}
           {isStreaming && !streamingText && (!streamingThinking || !showThinkingMsg) && (
@@ -4958,6 +4997,9 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       {/* Permission Request Card — vertical list */}
       {pendingPermission && (() => {
         const planContent = planFileContent
+        const approvalDiff = pendingPermission.toolName === 'Edit'
+          ? codexChangeDiffText(codexFileChanges(pendingPermission.input)) : ''
+        const approvalDiffLines = approvalDiff.split(/\r?\n/)
         return (
         <div
           ref={permissionCardRef}
@@ -4972,6 +5014,21 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           <div className="claude-permission-command">
             {toolInputSummary(pendingPermission.toolName, pendingPermission.input)}
           </div>
+          {approvalDiff && (
+            <div className="claude-diff-block">
+              {approvalDiffLines.slice(0, 16).map((line, i) => (
+                <div key={i} className={codexDiffLineClass(line)}>
+                  <span className="claude-diff-sign">{isCodexDiffChangeLine(line) ? line[0] : ' '}</span>
+                  <span className="claude-diff-text">{isCodexDiffChangeLine(line) ? line.slice(1) : line}</span>
+                </div>
+              ))}
+              {approvalDiffLines.length > 16 && (
+                <div className="claude-diff-toggle" onClick={() => setContentModal({ title: 'Proposed file changes', content: approvalDiff })}>
+                  Show all {approvalDiffLines.length} lines...
+                </div>
+              )}
+            </div>
+          )}
           {planContent && (
             <div className="claude-plan-block">
               <pre className="claude-plan-content">{planContent.split('\n').slice(0, 3).join('\n')}{planContent.split('\n').length > 3 ? '\n...' : ''}</pre>
@@ -5523,6 +5580,14 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         )}
         <div className="claude-input-footer">
           <div className="claude-input-controls">
+            {(isCodexSession || !isV2Session) && (
+              <button type="button" className="claude-status-btn claude-session-reload"
+                disabled={reloadPending || sessionMeta?.runtimeStatus === 'reloading'}
+                title="Stop the current agent and restart with fresh MCP settings; preserve the conversation (/bat-reload)"
+                onClick={() => void reloadSession()}>
+                {reloadPending || sessionMeta?.runtimeStatus === 'reloading' ? 'Reloading…' : '↻ Reload'}
+              </button>
+            )}
             {isCodexSession && (
               <>
                 <select
@@ -5566,6 +5631,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 {'</>'} {currentModelLabel || currentModel || '(default)'}{currentModelContextSuffix}
               </span>
             )}
+            {(isCodexSession || !isV2Session) && <AgentFastModeCheckbox sessionId={sessionId}
+              disabled={isStreaming} ensureSessionStarted={ensureSessionStarted} />}
             {(isCodexSession || !isV2Session) && (
               <select
                 className="claude-effort-select"
@@ -5744,6 +5811,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         // Ref: https://platform.claude.com/docs/en/about-claude/pricing
         const P = (input: number, output: number) => ({ input, output, cacheRead: input * 0.1, cacheWrite5m: input * 1.25, cacheWrite1h: input * 2 })
         const MODEL_PRICING: Record<string, ReturnType<typeof P>> = {
+          'opus-5-5': { ...P(4, 20), cacheRead: 0.20 },
           'opus-5':    P(5, 25),    'opus-4-8':  P(5, 25),    'opus-4-7':  P(5, 25),    'opus-4-6':  P(5, 25),    'opus-4-5':  P(5, 25),
           'opus-4-1':  P(15, 75),   'opus-4':    P(15, 75),   'opus-3': P(15, 75),
           'sonnet-4-6': P(3, 15),   'sonnet-4-5': P(3, 15),   'sonnet-4': P(3, 15),
@@ -5751,6 +5819,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           'haiku-4-5': P(1, 5),     'haiku-3-5': P(0.80, 4),  'haiku-3': P(0.25, 1.25),
         }
         const getModelPricing = (model: string) => {
+          if (model.includes('opus-5-5')) return MODEL_PRICING['opus-5-5']
           if (model.includes('opus-5')) return MODEL_PRICING['opus-5']
           if (model.includes('opus-4-8')) return MODEL_PRICING['opus-4-8']
           if (model.includes('opus-4-7')) return MODEL_PRICING['opus-4-7']

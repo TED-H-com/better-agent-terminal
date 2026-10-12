@@ -2,6 +2,7 @@ import i18next from 'i18next'
 import type { TFunction } from 'i18next'
 import type { MessageItem } from './CodexAgentPanel.types'
 import { summarizeAskUserInput } from './AskUserQuestion.helpers'
+import { countTextLines } from '../utils/text-lines'
 
 // ToolSearch returns a JSON array of { tool_name, type } references. Render a
 // readable one-line summary instead of dumping the raw JSON; return null (fall
@@ -166,8 +167,8 @@ export function summarizeShellCommand(command: string): string | null {
   return summaries.length > 2 ? `${visible} + ${summaries.length - 2} more` : visible
 }
 
-export function formatContentSize(text: string): string {
-  const lines = text ? text.split(/\r?\n/).length : 0
+export function formatContentSize(text: string, lineCount?: number): string {
+  const lines = lineCount ?? (text ? countTextLines(text) : 0)
   const chars = text.length
   if (lines <= 1) return `${chars.toLocaleString()} ${i18next.t('claude.chars')}`
   return `${lines.toLocaleString()} ${i18next.t('claude.lines')} · ${chars.toLocaleString()} ${i18next.t('claude.chars')}`
@@ -308,6 +309,22 @@ export function parseContentBlocks(text: string): string {
   }
 }
 
+/**
+ * Upper bound on tool output the timeline will parse and lay out. The host
+ * already bounds Codex command output; this is the renderer's own guard so a
+ * multi-megabyte result from any backend cannot stall the main thread in
+ * content-block parsing, reminder splitting and link detection every render.
+ */
+export const TOOL_OUTPUT_RENDER_LIMIT = 256 * 1024
+
+export function clampToolOutputText(text: string, limit = TOOL_OUTPUT_RENDER_LIMIT): string {
+  if (text.length <= limit) return text
+  const head = Math.floor(limit / 4)
+  const tail = limit - head
+  const omitted = text.length - head - tail
+  return `${text.slice(0, head)}\n[... ${omitted} characters omitted by BAT ...]\n${text.slice(text.length - tail)}`
+}
+
 export function stringifyToolResult(result: unknown): string {
   if (typeof result === 'string') return result
   if (result == null) return ''
@@ -316,6 +333,18 @@ export function stringifyToolResult(result: unknown): string {
   } catch {
     return String(result)
   }
+}
+
+// Special tool rows keep their full result available in the existing detail
+// view. Cache this preparation per result, including its line count, rather
+// than repeatedly parsing JSON and allocating a full line array while streaming.
+export function prepareSpecialToolResult(result: unknown, toolName: string) {
+  const raw = result ? stringifyToolResult(result) : ''
+  const split = splitSystemReminders(toolName === 'AskUserQuestion' ? parseContentBlocks(raw) : raw)
+  const content = toolName === 'Task' || toolName === 'Agent' || toolName === 'TaskOutput'
+    ? parseContentBlocks(split.content)
+    : split.content
+  return { ...split, content, lineCount: countTextLines(content) }
 }
 
 export function formatTimestamp(ts: number): string {

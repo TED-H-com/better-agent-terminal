@@ -1,10 +1,9 @@
 // Codex Agent sidecar manager.
 //
-// Renderer panels already consume the Claude-shaped event contract
-// (claude:message/tool-use/stream/status/result/turn-end). Electron routes
-// codex-agent sessions through a CodexAgentManager behind that same surface.
-// This module mirrors that split for Tauri: claude.* handlers delegate here
-// when agentPreset is codex-agent / codex-agent-worktree.
+// Node-owned Codex sessions emit the established Claude-shaped events
+// (claude:message/tool-use/stream/status/result/turn-end). Sidecar claude.*
+// handlers delegate here for codex-agent / codex-agent-worktree presets.
+// Runtime ownership stays below the renderer contract.
 
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises'
@@ -12,16 +11,26 @@ import { tmpdir, homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { sendEvent } from '../lib/protocol.mjs'
+import { sessions as hostSessions } from '../lib/state.mjs'
 import { info as logInfo, warn as logWarn, error as logError } from '../lib/logger.mjs'
 import { activeWorktrees, worktreeCreate, worktreeRehydrate, worktreeGetBranch, worktreeStatus, worktreeRemove } from './worktree.mjs'
 
 const CODEX_MODELS = [
+  { value: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', description: 'Latest workhorse - coding and everyday work' },
+  { value: 'gpt-6.1-sol:272k', displayName: 'GPT-6.1 Sol (272K)', description: 'GPT-6.1 Sol - 272K context window' },
+  { value: 'gpt-6.1-sol:872k', displayName: 'GPT-6.1 Sol (872K)', description: 'GPT-6.1 Sol - 872K context window' },
   { value: 'gpt-6-astra', displayName: 'GPT-6 Astra', description: 'Most capable - complex, demanding work' },
   { value: 'gpt-6-astra:272k', displayName: 'GPT-6 Astra (272K)', description: 'GPT-6 Astra - 272K context window' },
   { value: 'gpt-6-astra:872k', displayName: 'GPT-6 Astra (872K)', description: 'GPT-6 Astra - 872K context window' },
-  { value: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol', description: 'Flagship - complex, open-ended work' },
-  { value: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra', description: 'Balanced - everyday workhorse' },
-  { value: 'gpt-5.6-luna', displayName: 'GPT-5.6 Luna', description: 'Fast - clear, repeatable work' },
+  { value: 'gpt-6-sol', displayName: 'GPT-6 Sol', description: 'Workhorse - near-Astra quality at lower cost' },
+  { value: 'gpt-6-sol:272k', displayName: 'GPT-6 Sol (272K)', description: 'GPT-6 Sol - 272K context window' },
+  { value: 'gpt-6-sol:872k', displayName: 'GPT-6 Sol (872K)', description: 'GPT-6 Sol - 872K context window' },
+  { value: 'gpt-6-luna', displayName: 'GPT-6 Luna', description: 'Fast and affordable - focused, high-volume tasks' },
+  { value: 'gpt-6-luna:272k', displayName: 'GPT-6 Luna (272K)', description: 'GPT-6 Luna - 272K context window' },
+  { value: 'gpt-6-luna:872k', displayName: 'GPT-6 Luna (872K)', description: 'GPT-6 Luna - 872K context window' },
+  { value: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol', description: 'Older generation - upgrade path is GPT-6 Sol' },
+  { value: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra', description: 'Older generation - balanced workhorse' },
+  { value: 'gpt-5.6-luna', displayName: 'GPT-5.6 Luna', description: 'Older generation - fast, repeatable work' },
   { value: 'gpt-5.3-codex-spark', displayName: 'GPT-5.3 Codex Spark', description: 'Research preview - near-instant coding' },
   { value: 'gpt-5.5', displayName: 'GPT-5.5', description: 'Previous frontier GPT-5.5' },
   { value: 'gpt-5.4', displayName: 'GPT-5.4', description: 'Legacy - API-key authentication only' },
@@ -32,7 +41,7 @@ const CODEX_MODELS = [
   { value: 'o3', displayName: 'o3', description: 'OpenAI o3 - reasoning model' },
   { value: 'gpt-4.1', displayName: 'GPT-4.1', description: 'OpenAI GPT-4.1' },
 ]
-const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol'
+const DEFAULT_CODEX_MODEL = 'gpt-6-sol'
 
 // `<model>:<N>k` is a Better Agent Terminal preset (same shape as the Claude
 // picker). The Tauri host translates it into the app-server's per-thread
@@ -187,7 +196,7 @@ function stringifyCodexError(error, fallback = 'Unknown error') {
     }
   }
   if (/The model `[^`]+` does not exist or you do not have access to it/i.test(message)) {
-    return `${message}\n\nHint: try upgrading codex CLI (npm i -g @openai/codex) - new models like gpt-5.6-sol need a recent CLI.`
+    return `${message}\n\nHint: try upgrading codex CLI (npm i -g @openai/codex) - new models like gpt-6.1-sol need a recent CLI.`
   }
   return message
 }
@@ -598,6 +607,7 @@ export async function sendCodexMessage(params) {
   if (typeof sessionId !== 'string' || !sessionId) throw new Error('codex.sendMessage: missing sessionId')
   const session = sessions.get(sessionId)
   if (!session?.thread) return { ok: false, error: 'Codex session not started' }
+  if (session.reloading) throw new Error('Session is reloading; wait before sending a message')
   let prompt = typeof params?.prompt === 'string' ? params.prompt.trim() : ''
   const images = Array.isArray(params?.images) ? params.images : []
   if (!prompt && images.length > 0) prompt = 'Please analyze the attached image.'
@@ -636,6 +646,7 @@ export async function sendCodexMessage(params) {
     const input = tempImages.length > 0
       ? [...tempImages.map(path => ({ type: 'local_image', path })), { type: 'text', text: prompt }]
       : prompt
+    if (ctrl.signal.aborted || session.abortController !== ctrl) return { ok: true, aborted: true }
     const startedAt = Date.now()
     const state = { prefix: `turn-${startedAt.toString(36)}`, assistantText: '', thinkingText: '' }
     const { events } = await session.thread.runStreamed(input, { signal: ctrl.signal })
@@ -696,7 +707,7 @@ export async function sendCodexMessage(params) {
         send('claude:error', sessionId, 'error', stringifyCodexError(event.message ?? event.error))
       }
     }
-    if (!completed && !ctrl.signal.aborted) {
+    if (!completed && !ctrl.signal.aborted && session.abortController === ctrl) {
       send('claude:error', sessionId, 'error', 'Codex turn ended unexpectedly.')
       send('claude:turn-end', sessionId, 'payload', { reason: 'error', turnId: session.currentTurnId, sdkSessionId: session.threadId })
       session.currentTurnId = null
@@ -704,6 +715,7 @@ export async function sendCodexMessage(params) {
     logInfo(`[codex:${sessionId.slice(0, 8)}] send end completed=${completed}`)
     return { ok: true }
   } catch (err) {
+    if (session.abortController !== ctrl) return { ok: true, aborted: true }
     if (!ctrl.signal.aborted) {
       if (!params?._retriedAfterThreadResume && isCodexThreadNotFoundError(err) && recoverCodexThread(sessionId, session)) {
         logWarn(`[codex:${sessionId.slice(0, 8)}] thread not found; resumed ${session.threadId} and retrying turn`)
@@ -773,6 +785,52 @@ export function resetCodexSession(params) {
   sendEvent('claude:session-reset', { sessionId })
   send('claude:status', sessionId, 'meta', { ...session.metadata })
   return true
+}
+
+export async function reloadCodexSession(params) {
+  const sessionId = params?.sessionId
+  const session = sessions.get(sessionId)
+  if (!session) throw new Error('Session not started')
+  if (session.reloading) throw new Error('Session is already reloading')
+  session.reloading = true
+  const host = hostSessions.get(sessionId)
+  if (host) {
+    host.runtimeGeneration = (host.runtimeGeneration || 0) + 1
+    host.reloading = true
+    host.sendQueue = null
+  }
+  const hadWork = session.isRunning || session.state.isStreaming
+  session.abortController.abort()
+  // Old turn cleanup must never emit an event or clear the new turn's state.
+  session.abortController = new AbortController()
+  session.messageQueue = []
+  session.isRunning = false
+  session.state.isStreaming = false
+  if (session.state.streamingText || session.state.streamingThinking) addMessage(sessionId, {
+    id: `assistant-reload-${Date.now()}`, sessionId, role: 'assistant',
+    content: session.state.streamingText || '', thinking: session.state.streamingThinking || '', timestamp: Date.now(),
+  })
+  session.state.streamingText = ''
+  session.state.streamingThinking = ''
+  if (hadWork) send('claude:turn-end', sessionId, 'payload', { reason: 'aborted', turnId: session.currentTurnId, sdkSessionId: session.threadId })
+  session.currentTurnId = null
+  setRuntimeStatus(session, sessionId, 'reloading', 'Stopping the current agent and restarting with fresh MCP configuration.')
+  send('claude:resume-loading', sessionId, 'loading', true)
+  try {
+    const instance = await createCodexInstance()
+    if (sessions.get(sessionId) !== session) throw new Error('Session changed during reload')
+    session.codexInstance = instance
+    rebuildThread(session)
+    return { ok: true, sessionId, sdkSessionId: session.threadId ?? null, deferred: true }
+  } finally {
+    session.reloading = false
+    if (host) host.reloading = false
+    if (sessions.get(sessionId) === session) {
+      clearRuntimeStatus(session)
+      send('claude:status', sessionId, 'meta', { ...session.metadata })
+      send('claude:resume-loading', sessionId, 'loading', false)
+    }
+  }
 }
 
 export function getCodexSessionState(params) {

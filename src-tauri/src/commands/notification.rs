@@ -1,13 +1,9 @@
 // notification:* — in-memory notification center.
 //
-// The Electron host pumps notifications in from the agent managers
-// (claude/codex). Tauri keeps the same renderer-facing API and
-// records agent sessions at the command boundary; when the Rust event
+// Rust records agent sessions at the command boundary; when the runtime event
 // hub sees a completed `claude:turn-end`, it inserts an entry here.
 //
-// State is process-local on purpose: the Electron impl
-// (electron/notification-center.ts) does the same thing — entries
-// are not persisted across launches.
+// State is process-local: entries are not persisted across launches.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -118,6 +114,100 @@ struct AgentSessionOwner {
 pub struct AgentNotificationState {
     inner: Arc<Mutex<HashMap<String, AgentNotificationSession>>>,
     owners: Arc<Mutex<HashMap<String, AgentSessionOwner>>>,
+    activity: Arc<Mutex<HashMap<String, AgentActivity>>>,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+struct AgentActivity {
+    last_data_at: Option<i64>,
+    is_streaming: Option<bool>,
+}
+
+impl AgentActivity {
+    fn observe(&mut self, topic: &str, payload: &Value, now: i64) {
+        let data = payload.get("data").unwrap_or(payload);
+        let has_output = match topic {
+            "claude:stream" => ["text", "thinking"].iter().any(|key| {
+                data.get(*key).and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+            }),
+            "claude:message" => payload.get("message")
+                .and_then(|message| message.get("role")).and_then(Value::as_str) == Some("assistant"),
+            "claude:tool-use" | "claude:tool-result" | "claude:result" |
+            "claude:turn-end" | "claude:error" | "claude:permission-request" | "claude:ask-user" => true,
+            _ => false,
+        };
+        if has_output { self.last_data_at = Some(self.last_data_at.unwrap_or(0).max(now)); }
+        match topic {
+            "claude:stream" if has_output => self.is_streaming = Some(true),
+            "claude:tool-use" | "claude:permission-request" | "claude:ask-user" => self.is_streaming = Some(true),
+            "claude:result" | "claude:turn-end" | "claude:error" => self.is_streaming = Some(false),
+            "claude:status" => {
+                if let Some(meta) = payload.get("meta") {
+                    if meta.get("runtimeStatus").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+                        self.is_streaming = Some(true);
+                    } else if let Some(active) = meta.get("isStreaming").and_then(Value::as_bool) {
+                        self.is_streaming = Some(active);
+                    }
+                }
+            }
+            "claude:history" => {
+                // History replay supplies original timestamps, not replay time.
+                if let Some(items) = payload.get("items").or_else(|| payload.get("messages")).and_then(Value::as_array) {
+                    for item in items {
+                        if item.get("toolName").is_some() || item.get("role").and_then(Value::as_str) == Some("assistant") {
+                            if let Some(time) = item.get("timestamp").and_then(Value::as_i64).filter(|time| *time > 0) {
+                                self.last_data_at = Some(self.last_data_at.unwrap_or(0).max(time));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn enrich(&self, mut meta: Value) -> Value {
+        if let Some(map) = meta.as_object_mut() {
+            map.insert("lastDataAt".into(), json!(self.last_data_at));
+            if let Some(active) = self.is_streaming { map.insert("isStreaming".into(), json!(active)); }
+        }
+        meta
+    }
+
+    fn enrich_runtime(&self, meta: Value) -> Value {
+        // The Codex runtime owns its current turn state. An older observed
+        // stream/turn-end event must not override that authoritative snapshot.
+        let streaming = meta.get("isStreaming").and_then(Value::as_bool);
+        let mut enriched = self.enrich(meta);
+        if let (Some(streaming), Some(map)) = (streaming, enriched.as_object_mut()) {
+            map.insert("isStreaming".into(), json!(streaming));
+        }
+        enriched
+    }
+}
+
+pub fn update_agent_activity_from_event(app: &HostContext, topic: &str, payload: &Value) {
+    if !topic.starts_with("claude:") { return; }
+    let Some(id) = payload.get("sessionId").and_then(Value::as_str) else { return; };
+    let Some(state) = app.try_state::<AgentNotificationState>() else { return; };
+    if !state.lock().contains_key(id) { return; }
+    state.activity.lock().unwrap_or_else(|e| e.into_inner())
+        .entry(id.to_string()).or_default().observe(topic, payload, now_ms());
+}
+
+/// Additive metadata fields: querying does not advance the last-output clock.
+pub fn with_agent_activity_meta(app: &HostContext, id: &str, meta: Value) -> Value {
+    let Some(state) = app.try_state::<AgentNotificationState>() else { return meta; };
+    let activity = state.activity.lock().unwrap_or_else(|e| e.into_inner())
+        .get(id).cloned().unwrap_or_default();
+    activity.enrich(meta)
+}
+
+pub fn with_runtime_activity_meta(app: &HostContext, id: &str, meta: Value) -> Value {
+    let Some(state) = app.try_state::<AgentNotificationState>() else { return meta; };
+    let activity = state.activity.lock().unwrap_or_else(|e| e.into_inner())
+        .get(id).cloned().unwrap_or_default();
+    activity.enrich_runtime(meta)
 }
 
 impl NotificationState {
@@ -173,18 +263,27 @@ async fn remote_notification_invoke(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
-pub async fn notification_list(app: AppHandle, window: WebviewWindow) -> Vec<NotificationEntry> {
+pub async fn notification_list(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<Vec<NotificationEntry>, String> {
     let label = window.label().to_string();
     if let Some(result) = remote_notification_invoke(&app, &label, "notification:list", Vec::new()).await {
+        // A remote window's bell mounts while the link is still dialing, so
+        // this call routinely fails with "not connected". That must surface as
+        // an error: an empty Ok list would become the renderer's "already seen"
+        // baseline, and the host's first notification:update would then toast
+        // every unread entry it has kept, however old.
         return match result {
-            Ok(value) => serde_json::from_value(value).unwrap_or_default(),
+            Ok(value) => serde_json::from_value(value)
+                .map_err(|err| format!("remote notification list is malformed: {err}")),
             Err(err) => {
                 log_tauri(&HostContext::from_app(app.clone()), &format!("[notification] remote list failed: {err}"));
-                Vec::new()
+                Err(err)
             }
         };
     }
-    notification_list_core(&HostContext::from_app(app))
+    Ok(notification_list_core(&HostContext::from_app(app)))
 }
 
 #[cfg(feature = "desktop")]
@@ -366,13 +465,97 @@ pub fn register_agent_session_from_options(
     if session_id.trim().is_empty() {
         return Ok(());
     }
-    let cwd = effective_notification_cwd(options).unwrap_or_default();
     // The window->profile map is GUI-only; headless sessions carry no local
     // window, so the profile id is supplied by the remote session context.
     #[cfg(feature = "desktop")]
     let profile_id = Some(window_registry::get_entry(app.app(), window_id).profile_id);
     #[cfg(not(feature = "desktop"))]
     let profile_id: Option<String> = None;
+    register_agent_session_for_owner(
+        app,
+        session_id,
+        options,
+        AgentSessionOwner {
+            window_id: Some(window_id.to_string()),
+            profile_id,
+        },
+    )
+}
+
+/// Remote attachment shares the real profile/window owner. A synthetic remote
+/// window must not claim the default profile or reset live session metadata.
+pub fn register_remote_agent_session_from_options(
+    app: &HostContext,
+    session_id: &str,
+    options: Option<&Value>,
+) -> Result<(), String> {
+    let requested_profile = options.and_then(|value| string_option(value, "profileId"));
+    let state = app.state::<AgentNotificationState>();
+    let existing = state.lock_owners().get(session_id).cloned();
+    if let Some(existing) = &existing {
+        if existing.window_id.as_deref() != Some("remote-client") {
+            if requested_profile
+                .as_ref()
+                .is_some_and(|id| existing.profile_id.as_ref() != Some(id))
+            {
+                return Err(format!(
+                    "{AGENT_SESSION_COLLISION_PREFIX}: session belongs to another profile"
+                ));
+            }
+            if state.lock().contains_key(session_id) {
+                return Ok(());
+            }
+            return register_agent_session_for_owner(app, session_id, options, existing.clone());
+        }
+    }
+    #[cfg(feature = "desktop")]
+    let saved_owner = window_registry::session_window_owner(app.app(), session_id);
+    #[cfg(not(feature = "desktop"))]
+    let saved_owner: Option<(String, String)> = None;
+    let profile_id = requested_profile
+        .or_else(|| saved_owner.as_ref().map(|(_, id)| id.clone()))
+        .or_else(|| existing.as_ref().and_then(|owner| owner.profile_id.clone()))
+        .unwrap_or_else(|| "default".into());
+    if !crate::commands::profile::profile_entry_for_context(app, &profile_id)
+        .is_some_and(|profile| profile.kind == "local")
+    {
+        return Err("Profile not found".into());
+    }
+    if saved_owner
+        .as_ref()
+        .is_some_and(|(_, id)| id != &profile_id)
+    {
+        return Err(format!(
+            "{AGENT_SESSION_COLLISION_PREFIX}: session belongs to another profile"
+        ));
+    }
+    let owner = AgentSessionOwner {
+        window_id: saved_owner.map(|(window, _)| window),
+        profile_id: Some(profile_id),
+    };
+    // Migrate the old synthetic owner without altering its live metadata.
+    if existing.is_some() {
+        state.lock_owners().insert(session_id.into(), owner.clone());
+        let mut sessions = state.lock();
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.window_id = owner.window_id;
+            session.profile_id = owner.profile_id;
+            return Ok(());
+        }
+    }
+    register_agent_session_for_owner(app, session_id, options, owner)
+}
+
+fn register_agent_session_for_owner(
+    app: &HostContext,
+    session_id: &str,
+    options: Option<&Value>,
+    owner: AgentSessionOwner,
+) -> Result<(), String> {
+    if session_id.trim().is_empty() {
+        return Ok(());
+    }
+    let cwd = effective_notification_cwd(options).unwrap_or_default();
     let workspace_id = options.and_then(|value| string_option(value, "workspaceId"));
     let workspace_name = options.and_then(|value| string_option(value, "workspaceName"));
     let agent_kind = options.and_then(agent_kind_from_options);
@@ -404,8 +587,8 @@ pub fn register_agent_session_from_options(
         .then(|| options.and_then(|value| string_option(value, "worktreeBranch")))
         .flatten();
     let next = AgentNotificationSession {
-        window_id: Some(window_id.to_string()),
-        profile_id,
+        window_id: owner.window_id,
+        profile_id: owner.profile_id,
         workspace_id,
         workspace_name,
         cwd,
@@ -548,6 +731,7 @@ pub fn unregister_agent_session(app: &HostContext, session_id: &str) {
     if let Some(state) = app.try_state::<AgentNotificationState>() {
         state.lock().remove(session_id);
         state.lock_owners().remove(session_id);
+        state.activity.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
     }
 }
 
@@ -668,6 +852,15 @@ pub fn add_remote_client_notification(app: &HostContext, label: &str) {
 }
 
 pub fn update_agent_session_meta_from_event(app: &HostContext, topic: &str, payload: &Value) {
+    if topic == "claude:session-reset" {
+        if let (Some(state), Some(id)) = (app.try_state::<AgentNotificationState>(), payload.get("sessionId").and_then(Value::as_str)) {
+            if let Some(session) = state.lock().get_mut(id) {
+                session.sdk_session_id = None;
+                session.latest_meta = None;
+            }
+        }
+        return;
+    }
     if topic != "claude:status" {
         return;
     }
@@ -1135,6 +1328,81 @@ pub fn normalize_workspace_key(cwd: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn phone_first_owner_allows_late_desktop_attachment_and_preserves_live_meta() {
+        let root = std::env::temp_dir().join(format!(
+            "bat-phone-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profiles = root.join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        let mut profile = crate::commands::profile::default_entry();
+        profile.id = "phone-profile".into();
+        std::fs::write(
+            profiles.join("index.json"),
+            json!({ "profiles": [profile], "activeProfileIds": ["phone-profile"] }).to_string(),
+        )
+        .unwrap();
+        let state = AgentNotificationState::default();
+        let mut host =
+            crate::host_context::HeadlessHost::new(Some(root.clone()), Arc::new(|_, _| {}));
+        host.manage(state.clone());
+        let app = HostContext::from_headless(Arc::new(host));
+        let options = json!({ "profileId": "phone-profile", "cwd": "/phone", "agentPreset": "codex-agent", "codexSandboxMode": "workspace-write" });
+        register_remote_agent_session_from_options(&app, "phone-panel", Some(&options)).unwrap();
+        let owner = state.lock_owners().get("phone-panel").unwrap().clone();
+        assert_eq!(owner.window_id, None);
+        assert_eq!(owner.profile_id.as_deref(), Some("phone-profile"));
+        let desktop = AgentSessionOwner {
+            window_id: Some("main".into()),
+            profile_id: Some("phone-profile".into()),
+        };
+        assert!(agent_session_collision_message(&owner, &desktop, "phone-panel", false).is_none());
+        update_agent_session_meta_from_event(
+            &app,
+            "claude:status",
+            &json!({ "sessionId": "phone-panel", "meta": { "sdkSessionId": "phone-thread", "codexSandboxMode": "read-only", "codexApprovalPolicy": "untrusted" } }),
+        );
+        let live = get_agent_session_snapshot(&app, "phone-panel").unwrap();
+        // Reopening the phone with stale defaults must not wipe its host record.
+        register_remote_agent_session_from_options(&app, "phone-panel", Some(&options)).unwrap();
+        assert_eq!(
+            get_agent_session_snapshot(&app, "phone-panel").unwrap(),
+            live
+        );
+        assert!(register_remote_agent_session_from_options(
+            &app,
+            "phone-panel",
+            Some(&json!({ "profileId": "other", "cwd": "/other" }))
+        )
+        .is_err());
+        // Older hosts recorded this session under a synthetic default window.
+        state.lock_owners().insert(
+            "phone-panel".into(),
+            AgentSessionOwner {
+                window_id: Some("remote-client".into()),
+                profile_id: Some("default".into()),
+            },
+        );
+        register_remote_agent_session_from_options(&app, "phone-panel", Some(&options)).unwrap();
+        let migrated = get_agent_session_snapshot(&app, "phone-panel").unwrap();
+        assert_eq!(migrated.profile_id.as_deref(), Some("phone-profile"));
+        assert_eq!(migrated.sdk_session_id.as_deref(), Some("phone-thread"));
+        assert_eq!(migrated.codex_sandbox_mode.as_deref(), Some("read-only"));
+        assert_eq!(migrated.codex_approval_policy.as_deref(), Some("untrusted"));
+        update_agent_session_meta_from_event(&app, "claude:session-reset", &json!({ "sessionId": "phone-panel" }));
+        let reset = get_agent_session_snapshot(&app, "phone-panel").unwrap();
+        assert_eq!(reset.sdk_session_id, None);
+        assert_eq!(reset.latest_meta, None);
+        assert_eq!(reset.codex_sandbox_mode.as_deref(), Some("read-only"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn sample_entry(id: &str, cwd: &str, read: bool) -> NotificationEntry {
         NotificationEntry {
             id: id.into(),
@@ -1154,6 +1422,59 @@ mod tests {
             title: None,
             native_notification_handled: None,
         }
+    }
+
+    #[test]
+    fn agent_activity_tracks_output_not_polls_or_status_and_replays_original_time() {
+        let mut activity = AgentActivity::default();
+        activity.observe("claude:status", &json!({ "meta": { "runtimeStatus": "starting" } }), 100);
+        assert_eq!(activity.last_data_at, None);
+        assert_eq!(activity.is_streaming, Some(true));
+        activity.observe("claude:stream", &json!({ "data": { "thinking": "working" } }), 200);
+        assert_eq!(activity.last_data_at, Some(200));
+        assert_eq!(activity.enrich(json!({}))["lastDataAt"], 200);
+        assert_eq!(activity.enrich(json!({}))["lastDataAt"], 200);
+        activity.observe("claude:status", &json!({ "meta": { "runtimeStatus": null } }), 300);
+        assert_eq!(activity.last_data_at, Some(200));
+        assert_eq!(activity.is_streaming, Some(true));
+        activity.observe("claude:tool-result", &json!({}), 400);
+        activity.observe("claude:turn-end", &json!({}), 500);
+        assert_eq!(activity.last_data_at, Some(500));
+        assert_eq!(activity.is_streaming, Some(false));
+        activity.observe("claude:history", &json!({ "items": [{ "role": "assistant", "timestamp": 250 }] }), 900);
+        assert_eq!(activity.last_data_at, Some(500));
+        let mut replay = AgentActivity::default();
+        replay.observe("claude:history", &json!({ "items": [{ "role": "assistant", "timestamp": 250 }] }), 900);
+        assert_eq!(replay.last_data_at, Some(250));
+        assert_eq!(replay.is_streaming, None);
+    }
+
+    #[test]
+    fn agent_activity_does_not_count_session_creation_or_user_input_as_output() {
+        let mut activity = AgentActivity::default();
+        activity.observe("claude:message", &json!({ "message": { "role": "system" } }), 100);
+        activity.observe("claude:message", &json!({ "message": { "role": "user" } }), 200);
+        activity.observe("claude:stream", &json!({ "data": { "text": "" } }), 300);
+        assert_eq!(activity.last_data_at, None);
+        assert!(activity.enrich(json!({}))["lastDataAt"].is_null());
+        assert!(activity.enrich(Value::Null).is_null());
+    }
+
+    #[test]
+    fn agent_activity_never_overrides_current_runtime_with_old_events() {
+        let mut activity = AgentActivity::default();
+        activity.observe("claude:stream", &json!({"data":{"text":"old output"}}), 100);
+        let idle = activity.enrich_runtime(json!({"isStreaming":false,"runtimeStatus":null}));
+        assert_eq!(idle["isStreaming"], false);
+        assert!(idle["runtimeStatus"].is_null());
+        assert_eq!(idle["lastDataAt"], 100);
+
+        activity.observe("claude:turn-end", &json!({}), 200);
+        let running = activity.enrich_runtime(json!({"isStreaming":true,"runtimeStatus":"queued"}));
+        assert_eq!(running["isStreaming"], true);
+        assert_eq!(running["runtimeStatus"], "queued");
+        assert_eq!(running["lastDataAt"], 200);
+        assert!(activity.enrich_runtime(Value::Null).is_null());
     }
 
     #[test]

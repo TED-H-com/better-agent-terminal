@@ -1,7 +1,7 @@
 use crate::account_store;
 use crate::app_data;
 use crate::claude_usage;
-use crate::codex_app_server::{should_handle_codex, CodexAppServerState};
+use crate::codex_app_server::{is_codex_agent_preset_id, should_handle_codex, CodexAppServerState};
 #[cfg(feature = "desktop")]
 use crate::commands::update as update_cmd;
 use crate::commands::{
@@ -57,6 +57,7 @@ const RUNTIME_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_INVOKE_TIMEOUT: Duration = Duration::from_secs(300);
 const CLAUDE_REMOTE_LOGIN_TTL: Duration = Duration::from_secs(180);
 const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_SOCKET_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 const REMOTE_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -65,13 +66,6 @@ const MAX_REMOTE_CONNECTIONS: usize = 64;
 const MAX_REMOTE_INVOKES: usize = 128;
 const REMOTE_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const REMOTE_OUTBOUND_BURST: usize = 64;
-/// Owner label for sessions a remote client established. Remote clients are not
-/// host windows, so they have no registry id of their own. One shared, stable
-/// label keeps a reconnecting client from tripping the cross-window ownership
-/// guard — that guard exists to stop two local profiles sharing a runtime, and
-/// a client that reconnects is still the same owner.
-const REMOTE_AGENT_SESSION_WINDOW: &str = "remote-client";
-
 struct ClaudeRemoteLoginClaim {
     touched: Instant,
     login_id: Option<String>,
@@ -82,6 +76,7 @@ static CLAUDE_REMOTE_LOGIN_CLAIM: Mutex<Option<ClaudeRemoteLoginClaim>> = Mutex:
 fn remote_capabilities() -> Value {
     json!({
         "profileContext": 1,
+        "toolPayloadPreview": 1,
         "remoteAuth": {
             "claude": "paste-code-v1",
             "codex": "device-code-v1",
@@ -292,6 +287,7 @@ struct BufferedRemoteEvent {
 
 #[derive(Clone, Default)]
 pub struct RustRemoteServerState {
+    replay: Arc<Mutex<crate::session_replay::SessionReplay>>,
     // Arc so HostContext can hand out cheap clones (all sharing the one running
     // server); the headless backing stores states by value in a type map.
     inner: Arc<Mutex<Option<RunningServer>>>,
@@ -582,6 +578,7 @@ impl RustRemoteServerState {
 
     pub fn broadcast_event(&self, channel: &str, params: &Value) {
         let canonical = canonical_remote_channel(channel);
+        let synced = self.replay.lock().ok().and_then(|mut replay| replay.record(&canonical, params, crate::session_replay::now_ms()));
         let (clients, event_buffer) = {
             let Ok(guard) = self.inner.lock() else {
                 return;
@@ -596,6 +593,11 @@ impl RustRemoteServerState {
         };
         if !has_remote_clients(&clients) {
             return;
+        }
+        if let Some(synced) = synced {
+            // Existing events remain untouched for old clients. New mobile
+            // clients consume only this sequenced stream and can replay gaps.
+            enqueue_remote_event(&clients, &event_buffer, "claude:sync-event", &synced);
         }
         if should_buffer_remote_event(&canonical)
             && enqueue_remote_event(&clients, &event_buffer, canonical.as_str(), params)
@@ -699,7 +701,7 @@ fn has_remote_clients(clients: &Arc<Mutex<Vec<RemoteClientRecord>>>) -> bool {
 fn should_buffer_remote_event(channel: &str) -> bool {
     matches!(
         canonical_remote_channel(channel).as_str(),
-        "claude:stream" | "claude:tool-result"
+        "claude:stream" | "claude:tool-result" | "claude:sync-event"
     )
 }
 
@@ -732,7 +734,13 @@ fn enqueue_remote_event(
             return false;
         };
         if let Some(index) = buffer.indexes.get(&key).copied() {
-            if canonical == "claude:stream" {
+            if canonical == "claude:sync-event" {
+                if let Some(event) = buffer.events.get_mut(index) {
+                    if let (Some(existing), Some(incoming)) = (event.params["events"].as_array_mut(), params["events"].as_array()) {
+                        existing.extend(incoming.iter().cloned());
+                    }
+                }
+            } else if canonical == "claude:stream" {
                 if let Some(event) = buffer.events.get_mut(index) {
                     merge_buffered_stream_params(&mut event.params, params);
                 }
@@ -803,6 +811,9 @@ fn send_remote_event_to_clients(
             if client.contexts.has_contexts() && channel != "profile:changed" {
                 return !client.close.load(Ordering::Acquire);
             }
+            if canonical_remote_channel(channel) == "claude:sync-event" && !client.contexts.accepts_root_sync(params) {
+                return !client.close.load(Ordering::Acquire);
+            }
             let frame = json!({
                 "type": "event",
                 "channel": agent_channel.clone(),
@@ -835,6 +846,7 @@ fn buffered_remote_event_key(channel: &str, params: &Value) -> Option<String> {
     let canonical = canonical_remote_channel(channel);
     let session_id = remote_key_part(params.get("sessionId"))?;
     match canonical.as_str() {
+        "claude:sync-event" => Some(format!("{canonical}:{session_id}:{}", params["epoch"].as_str()?)),
         "claude:stream" => Some(format!("{canonical}:{session_id}")),
         "claude:tool-result" => {
             let tool_id = remote_key_part(params.get("result").and_then(|value| value.get("id")))?;
@@ -1180,6 +1192,58 @@ fn run_accept_loop(
     }
 }
 
+// Enforce an absolute deadline even while TLS or a fragmented WebSocket frame
+// keeps making progress. A per-read timeout alone permits indefinite slow drips.
+struct DeadlineTcpStream {
+    socket: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineTcpStream {
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn timeout(&self, normal: Duration) -> io::Result<Duration> {
+        match self.deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .map(|remaining| remaining.min(normal))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "remote login deadline expired")
+                }),
+            None => Ok(normal),
+        }
+    }
+}
+
+impl Read for DeadlineTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let timeout = if self.deadline.is_some() {
+            REMOTE_HANDSHAKE_TIMEOUT
+        } else {
+            REMOTE_SOCKET_POLL_TIMEOUT
+        };
+        self.socket
+            .set_read_timeout(Some(self.timeout(timeout)?))?;
+        self.socket.read(buf)
+    }
+}
+
+impl Write for DeadlineTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.socket
+            .set_write_timeout(Some(self.timeout(REMOTE_SOCKET_WRITE_TIMEOUT)?))?;
+        self.socket.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
 fn handle_client(
     stream: TcpStream,
     config: Arc<ServerConfig>,
@@ -1206,32 +1270,42 @@ fn handle_client(
         .map_err(|err| format!("remote stream write timeout failed: {err}"))?;
     let connection =
         ServerConnection::new(config).map_err(|err| format!("remote TLS failed: {err}"))?;
-    let tls = StreamOwned::new(connection, stream);
+    let tls = StreamOwned::new(
+        connection,
+        DeadlineTcpStream {
+            socket: stream,
+            deadline: Some(Instant::now() + REMOTE_HANDSHAKE_TIMEOUT),
+        },
+    );
     let mut ws = accept_websocket_tls(tls)
         .map_err(|err| format!("remote websocket accept failed: {err}"))?;
-    ws.get_mut()
-        .sock
-        .set_read_timeout(Some(REMOTE_SOCKET_POLL_TIMEOUT))
-        .map_err(|err| format!("remote stream polling timeout failed: {err}"))?;
+    ws.get_mut().sock.deadline = Some(Instant::now() + REMOTE_AUTH_TIMEOUT);
     remote_debug_log(&ctx, format!("websocket accepted peer={peer}"));
     let mut authenticated = false;
-    let mut client_label = String::from("Remote Client");
     let mut client_id = String::new();
     let mut client_protocol = RemoteProtocol::LegacyV1;
     let mut client_compression = RemoteCompression::None;
+    let mut mobile_tool_previews = false;
     let (out_tx, out_rx) = mpsc::sync_channel::<Value>(REMOTE_OUTBOUND_QUEUE_CAPACITY);
     let close = Arc::new(AtomicBool::new(false));
     let contexts = Arc::new(ProfileContexts::default());
     let _context_guard = ConnectionContextGuard(contexts.clone());
 
     loop {
+        if ws.get_ref().sock.expired() {
+            remote_debug_log(&ctx, format!("auth timed out peer={peer}"));
+            break;
+        }
         if close.load(Ordering::Acquire) {
             remote_debug_log(&ctx, format!("client revoked peer={peer}"));
             break;
         }
         for _ in 0..REMOTE_OUTBOUND_BURST {
             match out_rx.try_recv() {
-                Ok(frame) => send_frame(&mut ws, frame, client_compression)?,
+                Ok(mut frame) => {
+                    if mobile_tool_previews { crate::remote_tool_preview::compact(&mut frame); }
+                    send_frame(&mut ws, frame, client_compression)?;
+                }
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
@@ -1251,7 +1325,10 @@ fn handle_client(
             {
                 match decode_remote_text_frame(&text) {
                     Ok(frame) => frame,
-                    Err(_) => continue,
+                    Err(err) => {
+                        remote_debug_log(&ctx, format!("invalid frame peer={peer} error={err}"));
+                        break;
+                    }
                 }
             }
             Message::Binary(bytes)
@@ -1259,7 +1336,10 @@ fn handle_client(
             {
                 match decode_remote_binary_frame(&bytes) {
                     Ok(frame) => frame,
-                    Err(_) => continue,
+                    Err(err) => {
+                        remote_debug_log(&ctx, format!("invalid frame peer={peer} error={err}"));
+                        break;
+                    }
                 }
             }
             _ => continue,
@@ -1268,7 +1348,7 @@ fn handle_client(
         let id = frame.get("id").cloned().unwrap_or(Value::Null);
 
         if frame_type == "auth" {
-            if authenticated {
+            if authenticated || ws.get_ref().sock.expired() {
                 break;
             }
             let current_token = token.lock().map(|token| token.clone()).unwrap_or_default();
@@ -1328,6 +1408,7 @@ fn handle_client(
                 })
                 .unwrap_or_default();
             client_compression = negotiate_remote_compression(&offered_compression);
+            mobile_tool_previews = crate::remote_tool_preview::requested(&frame);
             let args = frame.get("args").and_then(Value::as_array);
             let context = args.and_then(|args| args.get(1));
             let client_info = context
@@ -1345,7 +1426,7 @@ fn handle_client(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let device_summary = format_client_device_summary(client_info.as_ref());
-            client_label = label.clone();
+            let client_label = label.clone();
             let device_id = client_info
                 .as_ref()
                 .and_then(|info| info.device_id.as_deref())
@@ -1384,6 +1465,7 @@ fn handle_client(
                 });
             }
             authenticated = true;
+            ws.get_mut().sock.deadline = None;
             remote_debug_log(&ctx,
                 format!(
                     "auth ok peer={peer} label={client_label}{device_summary} protocol={protocol_name} compression={}",
@@ -1528,11 +1610,9 @@ fn handle_client(
     let mut removed: Vec<RemoteClientInfo> = Vec::new();
     if let Ok(mut guard) = clients.lock() {
         guard.retain(|client| {
-            let keep = if client_id.is_empty() {
-                client.info.label != client_label
-            } else {
-                client.id != client_id
-            };
+            // An unauthenticated socket owns no record. Its timeout must not
+            // remove a valid client that happens to have the default label.
+            let keep = client.id != client_id;
             if !keep {
                 removed.push(client.info.clone());
             }
@@ -1612,6 +1692,102 @@ mod profile_context_integration_tests {
                 .to_string_lossy()
                 .starts_with("bat-profile-context-test-"));
             let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn unauthenticated_websockets_expire_and_release_slots_despite_pings() {
+        use rustls::pki_types::ServerName;
+        use rustls::{ClientConfig, ClientConnection, RootCertStore};
+        let host = TestHost::new();
+        let cert = ensure_remote_certificate(&host.dir).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(cert.cert_der)).unwrap();
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let port = host.info["port"].as_u64().unwrap() as u16;
+        let connect = || {
+            let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            tcp.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            let tls = StreamOwned::new(
+                ClientConnection::new(config.clone(), ServerName::try_from("localhost").unwrap())
+                    .unwrap(),
+                tcp,
+            );
+            tungstenite::client(format!("wss://localhost:{port}/"), tls)
+                .unwrap()
+                .0
+        };
+        let mut valid = connect();
+        valid
+            .send(Message::Text(
+                json!({"type":"auth", "id":"a", "token":host.info["token"]})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        let auth = valid.read().unwrap().into_text().unwrap();
+        assert_eq!(decode_remote_text_frame(&auth).unwrap()["result"], true);
+        let mut silent = connect();
+        let mut pinging = connect();
+        let (active, clients) = {
+            let guard = host.server.inner.lock().unwrap();
+            let server = guard.as_ref().unwrap();
+            (server.active_connections.clone(), server.clients.clone())
+        };
+        let deadline = Instant::now() + REMOTE_AUTH_TIMEOUT + Duration::from_secs(3);
+        while active.load(Ordering::Acquire) > 1 && Instant::now() < deadline {
+            if pinging.send(Message::Ping(Vec::new().into())).is_err() {
+                break;
+            }
+            if pinging.read().is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert!(
+            silent.read().is_err(),
+            "silent unauthenticated socket must be closed"
+        );
+        while active.load(Ordering::Acquire) > 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            1,
+            "expired clients must release capacity"
+        );
+        assert_eq!(
+            clients.lock().unwrap().len(),
+            1,
+            "timeouts must not remove the authenticated default-label client"
+        );
+        valid
+            .send(Message::Text(
+                json!({"type":"ping", "id":"still-alive"})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        let reply_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                Instant::now() < reply_deadline,
+                "authenticated client must still respond"
+            );
+            let reply = valid.read().unwrap().into_text().unwrap();
+            let reply = decode_remote_text_frame(&reply).unwrap();
+            // Startup/profile notifications may already be queued before pong.
+            if reply["type"] == "event" {
+                continue;
+            }
+            assert_eq!(reply["type"], "pong");
+            assert_eq!(reply["id"], "still-alive");
+            break;
         }
     }
 
@@ -1731,6 +1907,25 @@ mod profile_context_integration_tests {
             let state: Value = serde_json::from_str(raw.as_str().unwrap()).unwrap();
             assert_eq!(state["workspaces"][0]["id"], expected);
         }
+        let local_summary = call("workspace:summary", json!({"params":{"targets":[]}})).unwrap();
+        assert_eq!(local_summary["profiles"].as_array().unwrap().len(), 1);
+        assert_eq!(local_summary["profiles"][0]["workspaces"][0]["workspaceId"], "entry-workspace");
+        assert_eq!(local_summary["profiles"][0]["workspaces"][0]["statusKnown"], false);
+        let summary = call("workspace:summary", json!({"params":{"targets":[{"profileId":"remote-alias","workspaceId":"upstream-workspace"}]}})).unwrap();
+        let remote_summary = summary["profiles"].as_array().unwrap().iter().find(|profile| profile["profileId"] == "remote-alias").unwrap();
+        assert_eq!(remote_summary["workspaces"][0]["statusKnown"], true);
+        assert!(!summary.to_string().contains(upstream.info["token"].as_str().unwrap()));
+        assert!(call("workspace:summary", json!({"contextId":local["contextId"],"params":{"targets":[]}})).is_err());
+
+        // The cursor and replay belong to the execution host, not the entry
+        // host's same-named session. No upstream version/capability probing.
+        let upstream_cursor = upstream.server.replay.lock().unwrap().cursor("session-test", crate::session_replay::now_ms());
+        upstream.server.broadcast_event("claude:stream", &json!({"sessionId":"session-test","data":{"text":"upstream-only"}}));
+        entry.server.broadcast_event("claude:stream", &json!({"sessionId":"session-test","data":{"text":"entry-only"}}));
+        let replay = call("claude:sync-session", json!({"contextId":remote["contextId"],"params":{"sessionId":"session-test","cursor":upstream_cursor}})).unwrap();
+        assert_eq!(replay["mode"], "delta");
+        assert_eq!(replay["events"][0]["params"]["data"]["text"], "upstream-only");
+        assert_eq!(replay["events"].as_array().unwrap().len(), 1);
         let data = json!({"workspaces":[{"id":"changed-upstream","name":"Changed","folderPath":"/test"}],"terminals":[]}).to_string();
         assert_eq!(
             call(
@@ -1760,6 +1955,8 @@ mod profile_context_integration_tests {
             "message":{"id":"reply","role":"assistant","content":"hello from execution host"}}),
         );
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_message = false;
+        let mut saw_sync = false;
         loop {
             let frame = rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -1770,8 +1967,13 @@ mod profile_context_integration_tests {
                     frame["params"]["message"]["content"],
                     "hello from execution host"
                 );
-                break;
+                saw_message = true;
             }
+            if frame["channel"] == "agent:sync-event" {
+                assert_eq!(frame["contextId"], remote["contextId"]);
+                saw_sync |= frame["params"]["events"].as_array().unwrap().iter().any(|event| event["params"]["message"]["content"] == "hello from execution host");
+            }
+            if saw_message && saw_sync { break; }
         }
         assert!(call("workspace:load", json!({"contextId":"foreign","params":{}})).is_err());
         contexts.close(remote["contextId"].as_str().unwrap());
@@ -1843,23 +2045,19 @@ fn remote_debug_enabled() -> bool {
 /// session), cannot raise a completion notification when the turn ends, and
 /// answers every read-only probe with "no such session".
 ///
-/// Failures are logged, not propagated: registration is bookkeeping, and a
-/// remote client that cannot start a session because of it would be strictly
-/// worse off than before.
-fn register_remote_agent_session(ctx: &HostContext, channel: &str, params: &Value) {
+/// Ownership failures stop routing so a client cannot replace another
+/// profile's live session before the desktop has a chance to attach.
+fn register_remote_agent_session(ctx: &HostContext, channel: &str, params: &Value) -> Result<(), String> {
     if !matches!(
         channel,
         "claude:start-session" | "claude:resume-session" | "claude:client-resume"
     ) {
-        return;
+        return Ok(());
     }
-    let Ok(session_id) = string_param(params, "sessionId", channel) else {
-        return;
-    };
+    let session_id = string_param(params, "sessionId", channel)?;
     let options = params.get("options").cloned().unwrap_or(Value::Null);
-    if let Err(err) = notification_cmd::register_agent_session_from_options(
+    if let Err(err) = notification_cmd::register_remote_agent_session_from_options(
         ctx,
-        REMOTE_AGENT_SESSION_WINDOW,
         &session_id,
         Some(&options),
     ) {
@@ -1867,7 +2065,9 @@ fn register_remote_agent_session(ctx: &HostContext, channel: &str, params: &Valu
             ctx,
             format!("{channel}: register agent session failed: {err}"),
         );
+        return Err(err);
     }
+    Ok(())
 }
 
 fn remote_debug_log(app: &HostContext, message: impl AsRef<str>) {
@@ -1925,12 +2125,15 @@ fn log_remote_pty_write_frame(app: &HostContext, phase: &str, channel: &str, fra
 }
 
 fn accept_websocket_tls(
-    mut tls: StreamOwned<ServerConnection, TcpStream>,
-) -> Result<WebSocket<StreamOwned<ServerConnection, TcpStream>>, String> {
+    mut tls: StreamOwned<ServerConnection, DeadlineTcpStream>,
+) -> Result<WebSocket<StreamOwned<ServerConnection, DeadlineTcpStream>>, String> {
     let mut request = Vec::with_capacity(1024);
     let mut buf = [0_u8; 1024];
     let deadline = Instant::now() + REMOTE_HANDSHAKE_TIMEOUT;
     while request.len() < 16 * 1024 {
+        if tls.sock.expired() {
+            return Err("websocket request read timed out".to_string());
+        }
         let n = match tls.read(&mut buf) {
             Ok(n) => n,
             Err(err)
@@ -2047,6 +2250,10 @@ fn invoke_with_profile_context(
         .cloned()
         .unwrap_or_else(|| legacy_v1_args_to_params(&channel, &args));
     match channel.as_str() {
+        "workspace:summary" => {
+            if frame.get("contextId").is_some() { return Err("Workspace summary requires the root connection".into()); }
+            return workspace_summary(ctx, sidecar, &params);
+        }
         "profile:open" => {
             if protocol != RemoteProtocol::V2 {
                 return Err("Profile contexts require protocol v2".into());
@@ -2096,6 +2303,9 @@ fn invoke_with_profile_context(
             context.observe_result(&channel, value);
         }
         return result;
+    }
+    if channel == "claude:sync-session" {
+        contexts.subscribe_root_sync(params.get("sessionId").and_then(Value::as_str).ok_or("Missing sessionId")?)?;
     }
     invoke_sidecar_for_remote(ctx, sidecar, protocol, &channel, frame)
 }
@@ -2148,10 +2358,30 @@ fn invoke_sidecar_for_remote(
         }
     }
     log_remote_pty_write_params(&ctx, "remote-server.decoded", channel, &params);
+    if channel == "claude:sync-session" {
+        let id = string_param(&params, "sessionId", channel)?;
+        let server = ctx.state::<RustRemoteServerState>();
+        let delta = server.replay.lock().map_err(|_| "Replay unavailable")?
+            .read(&id, &params["cursor"], crate::session_replay::now_ms());
+        if delta["mode"] == "delta" { return Ok(delta); }
+        // Reject a moving checkpoint rather than acknowledge events that were
+        // not included in the runtime snapshot. The client retains its view
+        // and falls back to the established snapshot path if this fails.
+        for _ in 0..3 {
+            let before = server.replay.lock().map_err(|_| "Replay unavailable")?.cursor(&id, crate::session_replay::now_ms());
+            let state = invoke_sidecar_for_remote(ctx, sidecar, RemoteProtocol::V2,
+                "claude:get-session-state", &json!({"params":{"sessionId":id}}))?;
+            let after = server.replay.lock().map_err(|_| "Replay unavailable")?.cursor(&id, crate::session_replay::now_ms());
+            if before == after {
+                return Ok(json!({"mode":"snapshot","sessionId":id,"cursor":after,"state":state,"reason":delta["reason"]}));
+            }
+        }
+        return Err("Session changed during snapshot; retry sync".into());
+    }
     // Ahead of the dispatch below so it covers both runtimes: Codex is served
     // natively by invoke_rust_for_remote, Claude is forwarded to the sidecar,
     // and locally both are registered by the same claude_start_session call.
-    register_remote_agent_session(ctx, channel, &params);
+    register_remote_agent_session(ctx, channel, &params)?;
     if let Some(result) = invoke_rust_for_remote(ctx, channel, &params) {
         return result;
     }
@@ -2220,6 +2450,72 @@ fn finish_remote_claude_login(
         _ => return Ok(result),
     };
     claude_cmd::finish_claude_login_stage(ctx, stage, channel, result)
+}
+
+fn workspace_summary(ctx: &HostContext, sidecar: &SidecarState, params: &Value) -> Result<Value, String> {
+    let targets = params.get("targets").and_then(Value::as_array).ok_or("Workspace summary requires targets")?;
+    if targets.len() > 64 { return Err("Too many summary workspaces".into()); }
+    if targets.iter().any(|target| target["profileId"].as_str().is_none() || target["workspaceId"].as_str().is_none()) {
+        return Err("Invalid summary target".into());
+    }
+    let requested: std::collections::HashSet<String> = targets.iter()
+        .filter_map(|target| target["profileId"].as_str().map(str::to_owned)).collect();
+    if requested.len() > 16 { return Err("Too many summary profiles".into()); }
+    let temporary = ProfileContexts::default();
+    let sink: ContextSink = Arc::new(|_| {});
+    let mut summaries = Vec::new();
+    for profile in profile_cmd::profile_list_core(ctx).profiles {
+        // Local catalogs are inexpensive. Never dial an unvisited remote just
+        // to populate the picker: only requested remote workspaces are read.
+        if profile.kind == "remote" && !requested.contains(&profile.id) { continue; }
+        let info = match temporary.open(ctx, &profile.id, sink.clone()) {
+            Ok(info) => info,
+            Err(_) => { summaries.push(json!({"profileId":profile.id,"profileName":profile.name,"status":"unavailable","workspaces":[]})); continue; }
+        };
+        let context_id = info["contextId"].as_str().unwrap_or_default();
+        let call = |channel: &str, params: Value| invoke_with_profile_context(ctx, sidecar, RemoteProtocol::V2,
+            channel, &json!({"contextId":context_id,"params":params}), &temporary, sink.clone());
+        let result = (|| -> Result<Value, String> {
+            let raw = call("workspace:load", json!({"profileId":profile.id}))?;
+            let snapshot: Value = match raw.as_str() {
+                Some(raw) => serde_json::from_str(raw).map_err(|_| "Invalid workspace snapshot")?,
+                None => return Err("Workspace unavailable".into()),
+            };
+            let terminals = snapshot["terminals"].as_array().ok_or("Invalid terminal snapshot")?;
+            let workspaces = snapshot["workspaces"].as_array().ok_or("Invalid workspace snapshot")?;
+            let mut rows = Vec::new();
+            for workspace in workspaces {
+                let id = workspace["id"].as_str().ok_or("Invalid workspace id")?;
+                let mut working = 0;
+                let mut total = 0;
+                let inspect = targets.iter().any(|target| target["profileId"] == profile.id && target["workspaceId"] == id);
+                let mut known = inspect;
+                let mut last_data: Option<i64> = None;
+                for terminal in terminals.iter().filter(|terminal| terminal["workspaceId"] == id) {
+                    total += 1;
+                    if !inspect { continue; }
+                    let preset = terminal["agentPreset"].as_str().unwrap_or_default();
+                    if !(preset.starts_with("codex-agent") || preset.starts_with("claude-code") || preset == "openai-agent") { continue; }
+                    match call("claude:get-session-meta", json!({"sessionId":terminal["id"]})) {
+                        Ok(meta) if meta.is_null() => {},
+                        Ok(meta) => {
+                            let status = meta["runtimeStatus"].as_str().unwrap_or_default();
+                            if meta["isStreaming"].as_bool().is_none() && status.is_empty() { known = false; }
+                            if meta["isStreaming"] == true || matches!(status,"starting"|"queued"|"waiting_for_api"|"compacting") { working += 1; }
+                            if let Some(time) = meta["lastDataAt"].as_i64() { last_data = Some(last_data.unwrap_or(0).max(time)); }
+                        },
+                        Err(_) => known = false,
+                    }
+                }
+                rows.push(json!({"workspaceId":id,"name":workspace["alias"].as_str().filter(|alias| !alias.is_empty()).or_else(|| workspace["name"].as_str()).unwrap_or(id),
+                    "folderPath":workspace["folderPath"],"total":total,"working":working,"statusKnown":known,"lastDataAt":last_data}));
+            }
+            Ok(json!({"profileId":profile.id,"profileName":profile.name,"bindingKey":info["bindingKey"],"status":"ready","workspaces":rows}))
+        })();
+        temporary.close(context_id);
+        summaries.push(result.unwrap_or_else(|_| json!({"profileId":profile.id,"profileName":profile.name,"status":"unavailable","workspaces":[]})));
+    }
+    Ok(json!({"profiles":summaries,"checkedAt":crate::session_replay::now_ms()}))
 }
 
 fn profile_id_from_params(channel: &str, params: &Value) -> Result<String, String> {
@@ -2348,6 +2644,27 @@ fn codex_for_remote_session(
     Some(Ok((codex, session_id)))
 }
 
+// Catalog reads (models / efforts / sandbox modes / approval policies) happen
+// before a fresh Codex tab has started its session, so ownership alone would
+// answer with the Claude catalog. The client sends the tab's agent preset and
+// that routes the read to Codex as well.
+fn codex_for_remote_catalog(
+    ctx: &HostContext,
+    channel: &str,
+    params: &Value,
+) -> Option<Result<CodexAppServerState, String>> {
+    let session_id = match string_param(params, "sessionId", channel) {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+    let codex = ctx.state::<CodexAppServerState>();
+    let preset = params.get("agentPreset").and_then(Value::as_str);
+    if !codex.is_owned(&session_id) && !is_codex_agent_preset_id(preset) {
+        return None;
+    }
+    Some(Ok(codex))
+}
+
 fn invoke_rust_for_remote(
     ctx: &HostContext,
     channel: &str,
@@ -2430,6 +2747,34 @@ fn invoke_rust_for_remote(
                 })
             })
         }
+        // Same rule as the local router's client_resume (commands/claude.rs):
+        // Codex client-resume reads the host-owned thread without restarting
+        // it or applying stale client settings. Without this arm the
+        // request fell through to the node sidecar, whose codex support is
+        // gone — it created a session record, emitted "Codex session started",
+        // then failed on createCodexInstance, and every send into that phantom
+        // answered "session has no cwd". Only remote clients (the phone) hit
+        // this: local windows go through claude_client_resume, which routes.
+        //
+        // is_owned covers the second half of the local rule: a session the
+        // runtime already holds is codex whatever the options say.
+        "claude:client-resume" => {
+            let options = params.get("options").cloned().unwrap_or(Value::Null);
+            let maybe_options = Some(options.clone());
+            let codex = ctx.state::<CodexAppServerState>();
+            let session_id = match string_param(params, "sessionId", channel) {
+                Ok(value) => value,
+                Err(err) => return Some(Err(err)),
+            };
+            if !should_handle_codex(&maybe_options) && !codex.is_owned(&session_id) {
+                return None;
+            }
+            string_param(params, "sdkSessionId", channel).and_then(|sdk_session_id| {
+                codex
+                    .client_resume(&ctx, session_id, sdk_session_id, maybe_options)
+                    .map_err(bridge_error_message)
+            })
+        }
         "claude:send-message" => {
             let Some(route) = codex_for_remote_session(ctx, channel, params) else {
                 return None;
@@ -2458,23 +2803,23 @@ fn invoke_rust_for_remote(
             };
             route.map(|(codex, session_id)| codex.stop_session(session_id))
         }
-        "claude:get-supported-models" => match codex_for_remote_session(ctx, channel, params) {
-            Some(route) => route.map(|(codex, _)| codex.supported_models()),
+        "claude:get-supported-models" => match codex_for_remote_catalog(ctx, channel, params) {
+            Some(route) => route.map(|codex| codex.supported_models()),
             None => Ok(claude_cmd::claude_builtin_models_native()),
         },
-        "claude:get-supported-efforts" => match codex_for_remote_session(ctx, channel, params) {
-            Some(route) => route.map(|(codex, _)| codex.supported_efforts()),
+        "claude:get-supported-efforts" => match codex_for_remote_catalog(ctx, channel, params) {
+            Some(route) => route.map(|codex| codex.supported_efforts()),
             None => Ok(claude_cmd::claude_supported_efforts_native()),
         },
         "claude:get-supported-codex-sandbox-modes" => {
-            match codex_for_remote_session(ctx, channel, params) {
-                Some(route) => route.map(|(codex, _)| codex.supported_sandbox_modes()),
+            match codex_for_remote_catalog(ctx, channel, params) {
+                Some(route) => route.map(|codex| codex.supported_sandbox_modes()),
                 None => Ok(claude_cmd::codex_supported_sandbox_modes_native()),
             }
         }
         "claude:get-supported-codex-approval-policies" => {
-            match codex_for_remote_session(ctx, channel, params) {
-                Some(route) => route.map(|(codex, _)| codex.supported_approval_policies()),
+            match codex_for_remote_catalog(ctx, channel, params) {
+                Some(route) => route.map(|codex| codex.supported_approval_policies()),
                 None => Ok(claude_cmd::codex_supported_approval_policies_native()),
             }
         }
@@ -2536,13 +2881,15 @@ fn invoke_rust_for_remote(
         },
         "claude:get-session-meta" => match codex_for_remote_session(ctx, channel, params) {
             Some(route) => route.map(|(codex, session_id)| {
-                codex.get_session_meta(&session_id).unwrap_or(Value::Null)
+                notification_cmd::with_runtime_activity_meta(ctx, &session_id,
+                    codex.get_session_meta(&session_id).unwrap_or(Value::Null))
             }),
             None => match string_param(params, "sessionId", channel) {
                 Ok(session_id) => {
                     match notification_cmd::get_agent_session_snapshot(&ctx, &session_id) {
                         Some(session) => {
-                            Ok(claude_cmd::session_meta_from_notification_snapshot(&session))
+                            Ok(notification_cmd::with_agent_activity_meta(ctx, &session_id,
+                                claude_cmd::session_meta_from_notification_snapshot(&session)))
                         }
                         None => return None,
                     }
@@ -2624,6 +2971,20 @@ fn invoke_rust_for_remote(
                     .set_effort(&ctx, &session_id, effort)
                     .unwrap_or_else(|| json!(false)))
             })
+        }
+        "claude:set-fast-mode" => {
+            let Some(route) = codex_for_remote_session(ctx, channel, params) else { return None; };
+            route.and_then(|(codex, session_id)| {
+                let enabled = params.get("enabled").and_then(Value::as_bool)
+                    .ok_or_else(|| format!("{channel}: enabled must be a boolean"))?;
+                codex.set_fast_mode(&ctx, &session_id, enabled)
+                    .unwrap_or_else(|| Err(crate::sidecar::BridgeError { message: "Session not started".into() }))
+                    .map_err(bridge_error_message)
+            })
+        }
+        "claude:reload-session" => {
+            let Some(route) = codex_for_remote_session(ctx, channel, params) else { return None; };
+            route.and_then(|(codex, session_id)| codex.reload_session(&ctx, &session_id).map_err(bridge_error_message))
         }
         "claude:reset-session" => {
             let Some(route) = codex_for_remote_session(ctx, channel, params) else {
@@ -2969,6 +3330,13 @@ fn invoke_rust_for_remote(
                 let saved =
                     profile_cmd::profile_save_workspace_for_remote(&ctx, &profile_id, &data);
                 if saved {
+                    // Snapshot saving overlays host-owned identity/settings.
+                    // Broadcast what was stored, rather than the stale input.
+                    #[cfg(feature = "desktop")]
+                    let data = window_id.as_deref()
+                        .and_then(|id| window_registry::workspace_json(app, id))
+                        .or_else(|| profile_cmd::profile_workspace_json_for_remote(&ctx, &profile_id))
+                        .unwrap_or(data);
                     let payload = if let Some(window_id) = window_id.as_deref() {
                         let payload =
                             json!({ "profileId": profile_id, "windowId": window_id, "data": data });
@@ -3620,6 +3988,7 @@ fn remote_invoke_timeout(channel: &str) -> Duration {
         "runtime:get-status" => RUNTIME_STATUS_TIMEOUT,
         "claude:start-session"
         | "claude:resume-session"
+        | "claude:reload-session"
         | "claude:client-resume"
         | "claude:send-message"
         | "claude:auth-login-start"
@@ -3774,6 +4143,36 @@ mod tests {
         assert_eq!(active.load(Ordering::Acquire), 2);
         drop((second, replacement));
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn login_deadline_bounds_partial_reads_and_can_be_cleared_after_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let mut stream = DeadlineTcpStream {
+            socket,
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+        };
+        let writer = thread::spawn(move || {
+            for _ in 0..12 {
+                peer.write_all(b"x").unwrap();
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut bytes = [0; 100];
+        assert_eq!(
+            stream.read_exact(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        while !stream.expired() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(stream.write(b"late").is_err());
+        stream.deadline = None;
+        assert!(!stream.expired());
+        assert!(stream.read(&mut bytes).unwrap() > 0);
+        writer.join().unwrap();
     }
 
     #[test]

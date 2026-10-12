@@ -1,18 +1,13 @@
 // workspace:save / workspace:load / workspace:move-to-window for the Tauri shell.
 //
-// Electron's workspace store is keyed by windowId because that runtime
-// supports multi-window workspaces with detach/reattach. The Tauri build now
-// keeps a small Rust window registry and snapshots per window/profile. The
-// renderer treats payloads as opaque text — same shape as settings.{load,save}
-// — which lets the host-api adapter route either runtime without changing
-// types.
+// Rust maintains the window registry and workspace snapshots per window/profile.
+// The renderer treats persistence payloads as opaque text, using the established
+// workspace host API for multi-window moves and detach/reattach.
 //
-// File location: <app-data>/workspaces.json. We keep the filename stable
-// so an Electron→Tauri migration can copy the file from the old userData
-// directory without translation. Cross-window move emits the existing
-// workspace:reload event so renderer stores can reuse the Electron reload
-// path; detach/reattach create and close Tauri webview windows while emitting
-// the existing workspace:detached/workspace:reattached events.
+// File location: <app-data>/workspaces.json. The filename and format remain
+// compatible with existing installations. Cross-window moves emit the existing
+// workspace:reload event; detach/reattach create and close Tauri webview windows
+// while emitting the existing workspace:detached/workspace:reattached events.
 
 use super::app::{log_tauri, renderer_url};
 use crate::app_data;
@@ -20,9 +15,9 @@ use crate::commands::profile as profile_cmd;
 use crate::remote_client::RustRemoteClientState;
 use crate::remote_server::RustRemoteServerState;
 use crate::window_registry;
+use bat_app_storage::window_snapshot::{read_workspace_text_at, write_workspace_text_at};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -118,14 +113,15 @@ fn workspace_load_impl(
         return Ok(Some(text));
     }
     let path = workspace_path(&app)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&path).map_err(WorkspaceError::from)?;
-    Ok(Some(text))
+    read_workspace_text_at(&path)
+        .map_err(WorkspaceError::from)
+        .map_err(CommandError::from)
 }
 
-pub(crate) fn remote_profile_target_id(app: &tauri::AppHandle, window_label: &str) -> Option<String> {
+pub(crate) fn remote_profile_target_id(
+    app: &tauri::AppHandle,
+    window_label: &str,
+) -> Option<String> {
     let profile_id = window_registry::profile_id_for_window(app, window_label)?;
     let profile = profile_cmd::profile_get(app.clone(), profile_id)?;
     if profile.kind != "remote" {
@@ -221,10 +217,7 @@ fn workspace_save_impl(
         return Ok(false);
     }
     let path = workspace_path(&app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(WorkspaceError::from)?;
-    }
-    fs::write(&path, data).map_err(WorkspaceError::from)?;
+    write_workspace_text_at(&path, &data).map_err(WorkspaceError::from)?;
     Ok(true)
 }
 

@@ -147,7 +147,7 @@ Items can be reordered, colored, and toggled on/off via a drag-and-drop template
 
 ### Codex Agent
 
-Optional alternate agent backend powered by [`@openai/codex-sdk`](https://www.npmjs.com/package/@openai/codex-sdk). Pick **Codex Agent** (or **Codex Agent (worktree)**) from the agent preset list when creating a terminal.
+Optional alternate agent backend powered by the [Codex app-server](https://developers.openai.com/codex/app-server), managed by the Rust host using the bundled `@openai/codex` runtime. Pick **Codex Agent** (or **Codex Agent (worktree)**) from the agent preset list when creating a terminal.
 
 - **GPT-5.5 / 5.4 / 5.3-codex / o4-mini / o3 / GPT-4.1** — Switch models inline; ChatGPT login or OpenAI API key
 - **Sandbox modes** — `read-only`, `workspace-write`, or `danger-full-access`
@@ -344,7 +344,7 @@ This script will detect your OS and install the application to the standard loca
 
 ### macOS Build Notes
 
-Native dependencies (`node-pty`, `better-sqlite3`) require Xcode Command Line Tools:
+Building Tauri and native dependencies such as `node-pty` requires Xcode Command Line Tools:
 
 ```bash
 xcode-select --install
@@ -391,9 +391,9 @@ better-agent-terminal/
 - **Frontend:** React 18 + TypeScript + i18next (EN / zh-TW / zh-CN)
 - **Terminal:** xterm.js + node-pty
 - **Framework:** Tauri 2, with Rust as the host/runtime layer
-- **AI:** `@anthropic-ai/claude-agent-sdk` + bundled `@anthropic-ai/claude-code` binary (Claude); `@openai/codex-sdk` (Codex Agent)
+- **AI:** `@anthropic-ai/claude-agent-sdk` + its bundled platform CLI binary (Claude); Rust-managed app-server from the bundled `@openai/codex` runtime (Codex Agent)
 - **Build:** Vite + Tauri
-- **Storage:** better-sqlite3 (snippets, session data)
+- **Storage:** Rust-managed JSON files for app state and snippets; agent runtime transcript files for sessions
 - **Remote:** Rust WebSocket server/client + QR code connection flow
 - **Syntax Highlighting:** highlight.js
 
@@ -595,18 +595,6 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - **[Overmind](https://github.com/DarthSim/overmind)** — Inspired our Worker panel and Procfile-based multi-process management integration
 - **[cx](https://github.com/ind-igo/cx)** — Semantic code navigation CLI integrated as an optional context-saver for agents
-
----
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=tony1223%2Fbetter-agent-terminal&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=tony1223/better-agent-terminal&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=tony1223/better-agent-terminal&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=tony1223/better-agent-terminal&type=date&legend=top-left" />
- </picture>
-</a>
 
 ---
 

@@ -9,6 +9,8 @@ import {
   renderChatMarkdown,
 } from '../utils/chat-markdown'
 import { RevealPathMenu, type RevealPathTarget } from './RevealPathMenu'
+import { LinkContextMenu, type LinkMenuTarget } from './LinkContextMenu'
+import { WeightedLruCache } from '../utils/weighted-lru-cache'
 
 interface ResolvedPathLink {
   rawPath: string
@@ -23,9 +25,14 @@ interface ChatMarkdownProps {
   cwd: string
   className?: string
   resolvePathLinks?: boolean
+  cache?: boolean
 }
 
-const resolvedPathCache = new Map<string, ResolvedPathLink | null>()
+const resolvedPathCache = new WeightedLruCache<string, ResolvedPathLink | null>(
+  2000,
+  1024 * 1024,
+  (key, value) => 2 * (key.length + (value?.path.length ?? 0) + (value?.rawPath.length ?? 0)),
+)
 
 function cacheKey(cwd: string, rawPath: string): string {
   return `${cwd}\0${rawPath}`
@@ -88,10 +95,10 @@ function applyResolvedPathLinks(html: string, links: Map<string, ResolvedPathLin
   return container.innerHTML
 }
 
-function ChatMarkdownComponent({ text, cwd, className = 'claude-markdown', resolvePathLinks = true }: ChatMarkdownProps) {
+function ChatMarkdownComponent({ text, cwd, className = 'claude-markdown', resolvePathLinks = true, cache = true }: ChatMarkdownProps) {
   const [resolvedLinks, setResolvedLinks] = useState<Map<string, ResolvedPathLink>>(new Map())
-  const [menu, setMenu] = useState<RevealPathTarget | null>(null)
-  const html = useMemo(() => renderChatMarkdown(text, cwd), [text, cwd])
+  const [menu, setMenu] = useState<RevealPathTarget | LinkMenuTarget | null>(null)
+  const html = useMemo(() => renderChatMarkdown(text, cwd, { cache }), [text, cwd, cache])
 
   useEffect(() => {
     let cancelled = false
@@ -159,22 +166,24 @@ function ChatMarkdownComponent({ text, cwd, className = 'claude-markdown', resol
             openChatMarkdownLink(link.href)
           }
         }}
-        // This is where the agent's own prose is rendered, so it is where a
-        // delivered file gets announced ("written to C:\...\report.xlsx"). The
-        // markup is injected as HTML, so the listener is delegated rather than
-        // attached per link. Only anchors carrying data-reveal-path qualify —
-        // an ordinary markdown link has no containing folder to open.
+        // Delegate across the rendered HTML so formatted link labels work too.
+        // Delivered files retain their containing-folder menu; other links can
+        // be copied without opening the browser or starting a download.
         onContextMenu={(e) => {
           const target = e.target as HTMLElement
-          const link = target.closest('a[data-reveal-path]') as HTMLAnchorElement | null
-          const path = link?.dataset.revealPath
-          if (!path) return
+          const link = target.closest('a[href]') as HTMLAnchorElement | null
+          if (!link?.getAttribute('href')) return
           e.preventDefault()
           e.stopPropagation()
-          setMenu({ x: e.clientX, y: e.clientY, path })
+          const path = link.dataset.revealPath
+          setMenu(path
+            ? { x: e.clientX, y: e.clientY, path }
+            : { x: e.clientX, y: e.clientY, href: link.href })
         }}
       />
-      {menu && <RevealPathMenu target={menu} onClose={() => setMenu(null)} />}
+      {menu && ('href' in menu
+        ? <LinkContextMenu target={menu} onClose={() => setMenu(null)} />
+        : <RevealPathMenu target={menu} onClose={() => setMenu(null)} />)}
     </>
   )
 }

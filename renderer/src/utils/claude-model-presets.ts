@@ -32,12 +32,14 @@ export type ClaudeModelDef = {
 
 /** Ordered newest-first — the picker renders the rows in this order. */
 export const CLAUDE_MODEL_TABLE: ClaudeModelDef[] = [
+  { id: 'claude-opus-5-5', label: 'Opus 5.5', contextWindow: 1_000_000, windows: [200_000, 300_000, null] },
   { id: 'claude-fable-5-1', label: 'Fable 5.1', contextWindow: 1_000_000, windows: [200_000, 300_000, null] },
   { id: 'claude-opus-5', label: 'Opus 5', contextWindow: 1_000_000, windows: [200_000, 300_000, null] },
   { id: 'claude-fable-5', label: 'Fable 5', contextWindow: 1_000_000, windows: [200_000, 300_000, null] },
   { id: 'claude-opus-4-8', label: 'Opus 4.8', contextWindow: 1_000_000, windows: [200_000, 300_000, null] },
   { id: 'claude-opus-4-7', label: 'Opus 4.7', contextWindow: 1_000_000, windows: [200_000, 300_000, 400_000, null] },
   { id: 'claude-opus-4-6', label: 'Opus 4.6 (1M)', contextWindow: 1_000_000, windows: [] },
+  { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5', contextWindow: 1_000_000, windows: [200_000, 300_000, null] },
   { id: 'claude-sonnet-5', label: 'Sonnet 5', contextWindow: 1_000_000, windows: [200_000, 300_000, null] },
   { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6 (1M)', contextWindow: 1_000_000, windows: [] },
   {

@@ -1,10 +1,15 @@
 {
   "common": {
+    "page": "Page",
+    "nextPage": "Next",
+    "previousPage": "Previous",
     "cancel": "Cancel",
     "save": "Save",
     "close": "Close",
     "delete": "Delete",
     "copy": "Copy",
+    "copyLink": "Copy link",
+    "copyLinkFailed": "Unable to copy the link",
     "ok": "OK",
     "apply": "Apply",
     "import": "Import",
@@ -27,6 +32,7 @@
     "loadingProfile": "Loading profile…",
     "remoteConnecting": "Connecting to remote profile…",
     "remoteConnectionFailed": "Remote connection failed: {{error}}",
+    "remoteTunnelFailed": "SSH tunnel to {{target}} failed: {{error}}",
     "remoteConnectionFailedFallback": "Remote connection failed: {{error}}\nSwitching back to local profile.",
     "remoteMissingInfo": "Remote profile is missing connection info.",
     "remoteVersionMismatch": "Connected to remote host running a different version (client {{clientVersion}} vs server {{serverVersion}}). Mismatched versions can corrupt shared workspace state (see issue #115); update the older side when convenient."
@@ -38,6 +44,8 @@
   },
 
   "settings": {
+    "allowFastMode": "Allow Fast mode",
+    "allowFastModeHint": "Fast may use more quota or incur additional charges. This only shows the checkbox beside the model; enable it separately for each conversation. Disabling this setting revokes previous selections for future turns. Remote sessions also require the host to allow Fast.",
     "title": "Settings",
     "tabGeneral": "General",
     "tabAgent": "Agent",
@@ -274,6 +282,8 @@
     "connectionUrlPlaceholder": "Paste connection URL (wss://host:port?token=…&fp=…)",
     "hostPlaceholder": "Host (e.g. 192.168.1.100)",
     "portPlaceholder": "Port",
+    "sshTargetPlaceholder": "SSH tunnel (optional): ssh target, e.g. ap01 or user@host",
+    "sshTargetHint": "When set, BAT opens \"ssh -N -L <local>:<host>:<port> <target>\" on this machine before connecting and picks a free local port itself. Host and port then describe the bat-server as seen from the SSH server (usually 127.0.0.1:9876).",
     "tokenPlaceholder": "Token",
     "remote": "REMOTE",
     "updated": "Updated {{date}}",
@@ -393,6 +403,7 @@
 
   "terminal": {
     "doubleClickToRename": "Double-click to rename",
+    "rename": "Rename",
     "hidePromptBox": "Hide prompt box",
     "showPromptBox": "Show prompt box",
     "restartTerminal": "Restart terminal",
@@ -544,6 +555,16 @@
   },
 
   "claude": {
+    "fastModeUnsupported": "This model does not support Fast mode.",
+    "fastModeBusy": "Wait for the current turn to finish before changing Fast.",
+    "fastModeCooldown": "Fast is cooling down; the runtime is temporarily using standard speed.",
+    "fastModePending": "Fast is requested for the next turn; availability depends on the account and runtime.",
+    "fastModeHint": "Request Fast for this conversation. Higher usage or additional charges may apply.",
+    "fastModeUnavailable": "This host does not support Fast controls.",
+    "fastModeCooling": "cooldown",
+    "archivedGap": "{{count}} archived messages between this page and the latest messages",
+    "backToLatestMessages": "Back to latest messages",
+    "loadNewerMessages": "Load newer messages",
     "thinking": "Thinking",
     "reasoningSummary": "Reasoning summary",
     "turnWorking": "Working",

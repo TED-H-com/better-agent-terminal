@@ -1,11 +1,21 @@
 // Tauri shell entrypoint for Better Agent Terminal.
 //
-// This file is intentionally small: the Electron preload still owns most of
-// the host surface during the migration. Each new command lands here behind
-// a strongly typed signature, and the renderer reaches it via the
-// host-api adapter (renderer/src/host-api.ts). See plans/tauri-migration-plan.md.
+// Initializes the Rust host, desktop windows, and GUI-free server, and registers
+// the Tauri commands used by renderer/src/host-api.ts. Shared services live in
+// the workspace crates; agent commands select the Rust runtime or Node SDK
+// sidecar while preserving the renderer-facing host API and event contracts.
 
-mod account_store;
+// Keep the app-facing module paths while the stable libraries compile and cache
+// independently of the Tauri shell and agent session implementations.
+use bat_accounts::{account_store, codex_account_store};
+use bat_host_support::{
+    electron_safe_storage, linux_wayland, log_file, native_keyring, network_addresses, path_guard,
+    subprocess,
+};
+pub use bat_remote_protocol::remote_core;
+use bat_remote_protocol::session_replay;
+use bat_runtime::{runtime_catalog, runtime_install};
+
 mod app_data;
 #[cfg(feature = "desktop")]
 mod app_menu;
@@ -13,32 +23,20 @@ mod async_rt;
 // Not desktop-gated: the usage poller runs on the headless bat-server too, so a
 // remote client paired with a headless host still gets 5h/7d numbers.
 mod claude_usage;
-mod codex_account_store;
 mod codex_app_server;
 mod codex_auth;
 mod commands;
-mod electron_safe_storage;
 mod event_hub;
 mod host_context;
 // Not desktop-gated: turns run on the headless bat-server too, and its samples
 // are the ones worth having — that is the machine actually calling the API.
 mod latency_store;
-mod linux_wayland;
-mod log_file;
-mod network_addresses;
 mod panic_log;
-mod path_guard;
 mod remote_client;
 mod profile_context;
-pub mod remote_core;
 mod remote_server;
-mod runtime_catalog;
-// Tauri-free managed-runtime install core, shared by the desktop installer
-// (commands/runtime.rs delegates the codex download/extract/place to it) and
-// the headless bat-server, which self-provisions codex from it on startup.
-mod runtime_install;
+mod remote_tool_preview;
 mod sidecar;
-mod subprocess;
 #[cfg(feature = "desktop")]
 mod window_registry;
 
@@ -52,7 +50,8 @@ use commands::{
     claude_cli as claude_cli_cmd, clipboard as clipboard_cmd, debug as debug_cmd,
     dialog as dialog_cmd, fs as fs_cmd, fugu as fugu_cmd, git as git_cmd, github as github_cmd,
     image as image_cmd, notification as notification_cmd, profile as profile_cmd, pty as pty_cmd,
-    remote as remote_cmd, runtime as runtime_cmd, settings, shell as shell_cmd,
+    remote as remote_cmd, remote_tunnel as remote_tunnel_cmd, runtime as runtime_cmd, settings,
+    shell as shell_cmd,
     snippet as snippet_cmd, tunnel as tunnel_cmd, update as update_cmd,
     worker_buffer as worker_buffer_cmd, workspace as workspace_cmd, worktree as worktree_cmd,
 };
@@ -162,6 +161,14 @@ pub fn run(context: tauri::Context<tauri::Wry>) {
             codex_app_server::snapshot_active_identity_on_exit(
                 &crate::host_context::HostContext::from_app(app_handle.clone()),
             );
+            // ssh children outlive the app otherwise (Windows does not kill
+            // them with the parent); no window is left to own them.
+            if let Some(state) = app_handle.try_state::<remote_tunnel_cmd::RemoteTunnelState>() {
+                remote_tunnel_cmd::stop_all_tunnels(
+                    &host_context::HostContext::from_app(app_handle.clone()),
+                    &state,
+                );
+            }
         }
     });
 }
@@ -183,6 +190,7 @@ fn app_builder(headless: bool) -> tauri::Builder<tauri::Wry> {
         .manage(fs_cmd::FsUploadState::default())
         .manage(snippet_cmd::SnippetState::default())
         .manage(worker_buffer_cmd::WorkerBufferState::default())
+        .manage(remote_tunnel_cmd::RemoteTunnelState::default())
         .manage(worktree_cmd::WorktreeState::default())
         .manage(event_hub::RuntimeEventHubState::default())
         .manage(remote_client::RustRemoteClientState::default())
@@ -194,6 +202,9 @@ fn app_builder(headless: bool) -> tauri::Builder<tauri::Wry> {
             if let Some(data_dir) = app_data::app_data_dir_opt(app.handle()) {
                 panic_log::install(data_dir);
             }
+            remote_tunnel_cmd::start_reaper(host_context::HostContext::from_app(
+                app.handle().clone(),
+            ));
             if !headless {
                 // Tier 2 is the default: recover from an interrupted swap and
                 // auto-migrate legacy multi-HOME Codex accounts into the unified
@@ -405,7 +416,9 @@ fn app_builder(headless: bool) -> tauri::Builder<tauri::Wry> {
             claude_cmd::claude_set_codex_approval_policy,
             claude_cmd::claude_set_model,
             claude_cmd::claude_set_effort,
+            claude_cmd::claude_set_fast_mode,
             claude_cmd::claude_reset_session,
+            claude_cmd::claude_reload_session,
             claude_cmd::claude_resume_session,
             claude_cmd::claude_client_resume,
             claude_cmd::claude_fork_session,
@@ -452,11 +465,15 @@ fn app_builder(headless: bool) -> tauri::Builder<tauri::Wry> {
             remote_cmd::remote_server_status,
             remote_cmd::remote_rotate_token,
             remote_cmd::remote_connect,
+            remote_cmd::remote_attach_profile,
             remote_cmd::remote_disconnect,
             remote_cmd::remote_client_status,
             remote_cmd::remote_test_connection,
             remote_cmd::remote_list_profiles,
             tunnel_cmd::tunnel_get_connection,
+            remote_tunnel_cmd::remote_tunnel_ensure,
+            remote_tunnel_cmd::remote_tunnel_stop,
+            remote_tunnel_cmd::remote_tunnel_status,
         ])
 }
 
@@ -506,9 +523,11 @@ fn run_headless_server(args: HeadlessServerArgs) -> Result<(), String> {
     host.manage(crate::commands::worktree::WorktreeState::default());
     host.manage(event_hub::RuntimeEventHubState::default());
     host.manage(remote_client::RustRemoteClientState::default());
+    host.manage(crate::commands::remote_tunnel::RemoteTunnelState::default());
     host.manage(codex_app_server::CodexAppServerState::default());
 
     let ctx = HostContext::from_headless(std::sync::Arc::new(host));
+    crate::commands::remote_tunnel::start_reaper(ctx.clone());
 
     // Usage is host-owned state, and a remote client paired with a headless host
     // expects 5h/7d numbers here exactly as it would from a desktop host. Started

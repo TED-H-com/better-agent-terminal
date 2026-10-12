@@ -14,7 +14,7 @@
 //   darwin-x86_64/bin/node
 //   linux-x86_64/bin/node
 //
-// The Rust resolver (src-tauri/src/sidecar.rs::find_bundled_node) probes
+// The Rust resolver (src-tauri/crates/bat-agent-bridge/src/lib.rs::find_bundled_node) probes
 // these locations in order. Re-running this script is idempotent — if the
 // target binary already exists it short-circuits.
 
@@ -30,7 +30,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(here, '..')
 const runtimeRoot = join(repoRoot, 'node-sidecar', 'runtime')
 
-export const DEFAULT_VERSION = 'v24.20.0'
+export const DEFAULT_VERSION = 'v24.21.0'
 
 // Map our internal triple (platform-arch, using Rust-style arch names that
 // match std::env::consts::ARCH on the Rust side) to Node.org distribution

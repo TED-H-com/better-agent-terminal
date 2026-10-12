@@ -6,6 +6,11 @@ authors = ["TonyQ CO., LTD."]
 edition = "2021"
 default-run = "better-agent-terminal"
 
+[workspace]
+members = [".", "crates/*"]
+default-members = ["."]
+resolver = "2"
+
 [lib]
 # Desktop and headless binaries link this crate as an rlib. Building cdylib and
 # staticlib here made every release also link unused ~20 MB/~250 MB library
@@ -43,10 +48,19 @@ serde_json = "1"
 # headless Linux hosts (issue #117). The headless build is being stood up
 # incrementally; until it lands, every supported build keeps `desktop` on.
 [dependencies]
+bat-accounts = { path = "crates/bat-accounts" }
+bat-agent-bridge = { path = "crates/bat-agent-bridge" }
+bat-app-storage = { path = "crates/bat-app-storage" }
+bat-filesystem = { path = "crates/bat-filesystem" }
+bat-git = { path = "crates/bat-git" }
+bat-host-support = { path = "crates/bat-host-support" }
+bat-pty = { path = "crates/bat-pty" }
+bat-remote-protocol = { path = "crates/bat-remote-protocol" }
+bat-runtime = { path = "crates/bat-runtime" }
 tauri = { version = "2", features = [], optional = true }
 # Direct tokio dep backs the headless async runtime (crate::async_rt); on desktop
 # the shim re-exports tauri's bundled runtime, so this is only load-bearing headless.
-tokio = { version = "1", features = ["rt-multi-thread", "rt", "sync", "time", "io-util", "process", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-clipboard-manager = { version = "2", optional = true }
@@ -55,42 +69,27 @@ tauri-plugin-notification = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-libc = "0.2"
 base64 = "0.22"
-aes-gcm = "0.10"
-aes = "0.8"
-cbc = "0.1"
 flate2 = "1"
-pbkdf2 = "0.12"
-sha1 = "0.10"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-keyring = "4.0.0"
+# keyring-core plus the one native store each platform actually uses. The
+# `keyring` 4.x meta-crate that used to sit here also pulled in db-keystore
+# (turso, a SQLite reimplementation, and tantivy, a full-text search engine),
+# clap, rpassword and friends -- about 200 crates we never called, only to
+# expose `use_native_store`. bat-host-support owns the platform-native stores.
 keyring-core = "1.0.0"
-notify = "8"
-get_if_addrs = "0.5"
-# Cross-platform PTY (Unix pty + Windows ConPTY). Tauri itself doesn't ship
-# this; we keep the renderer-side shape identical to the Electron preload's
-# pty.* surface and let a reader thread emit pty:output / pty:exit events.
-portable-pty = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tungstenite = "0.29.0"
 rcgen = "0.14.8"
 rand = "0.10.1"
 sha2 = "0.10"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pki-types = "1.14.1"
 
 [target.'cfg(windows)'.dependencies]
 # Direct WinRT toasts on Windows so a click can bring the BAT window back
 # (tauri-plugin-notification's desktop path has no activation callback).
 tauri-winrt-notification = "0.7"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_SystemInformation", "Wdk_System_SystemServices"] }
-
-[dev-dependencies]
-# portable-pty exposes anyhow::Result in its public mockable traits. Keep this
-# test-only direct dependency so PTY lifecycle regression fakes can implement
-# MasterPty without pulling anyhow into the production dependency surface.
-anyhow = "1"
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation", "Wdk_System_SystemServices"] }
 
 # We keep the application small for the first release: the host commands we
 # expose are read/write JSON config files in the per-user data directory and
@@ -134,6 +133,17 @@ headless = []
 # ~4 seconds thereafter. Drop the line and take the default the next time the
 # caches are being invalidated anyway — a Cargo.lock change or a toolchain bump.
 codegen-units = 256
+# Abort on panic instead of unwinding. Measured on this crate alone (release,
+# -j 4 to match a 4-vCPU CI runner, deps already built, incremental off):
+#   unwind (default)   lib 153.0s   bin+link 51.7s   total 204.7s
+#   abort              lib  95.6s   bin+link 24.6s   total 120.2s   (-41%)
+# The crate has ~230 async fns, and every await point needs a landing pad and
+# unwind table under `unwind`; `abort` drops all of that. Behavioural change:
+# a panic now terminates the process instead of only the panicking task or
+# command. Nothing here relies on catch_unwind, and the panic hook in
+# panic_log.rs still runs (hooks fire before the abort), so the crash is
+# still logged.
+panic = "abort"
 # Drop debug symbols from the shipped binary. Smaller .exe / .dmg, no
 # compile-time cost.
 strip = "symbols"

@@ -5,14 +5,10 @@
 // bridge. Keep runtime ownership decisions in ClaudeRuntimeRouter so local Tauri
 // calls and remote-server fallbacks do not grow separate compatibility rules.
 //
-// MVP commands:
-//   claude_ping            — round-trip probe used by tests.
-//   claude_auth_status     — returns null until accounts are wired through.
-//   claude_account_list    — reads Rust account_store index.
-//
-// Each one resolves the SpawnConfig from the AppHandle so the bridge can
-// find both `node` on PATH and the bundled sidecar script. Failures bubble
-// up as { message } strings to the renderer.
+// Account, authentication, session lifecycle, history, and runtime configuration
+// commands share this routing layer. Calls that need the SDK sidecar resolve
+// its Node runtime and script through the host context. Bridge failures retain
+// the renderer's existing error shape.
 
 use crate::account_store;
 use crate::app_data;
@@ -1580,6 +1576,13 @@ struct ClaudeModelDef {
 /// Ordered newest-first — the picker renders the rows in this order.
 const CLAUDE_MODEL_TABLE: &[ClaudeModelDef] = &[
     ClaudeModelDef {
+        id: "claude-opus-5-5",
+        label: "Opus 5.5",
+        context_window: 1_000_000,
+        windows: &[Some(200_000), Some(300_000), None],
+        description: None,
+    },
+    ClaudeModelDef {
         id: "claude-fable-5-1",
         label: "Fable 5.1",
         context_window: 1_000_000,
@@ -1619,6 +1622,13 @@ const CLAUDE_MODEL_TABLE: &[ClaudeModelDef] = &[
         label: "Opus 4.6 (1M)",
         context_window: 1_000_000,
         windows: &[],
+        description: None,
+    },
+    ClaudeModelDef {
+        id: "claude-sonnet-5-5",
+        label: "Sonnet 5.5",
+        context_window: 1_000_000,
+        windows: &[Some(200_000), Some(300_000), None],
         description: None,
     },
     ClaudeModelDef {
@@ -2319,6 +2329,41 @@ pub(crate) fn load_archived_from_dir(
     if session_id.is_empty() {
         return archive_empty_page();
     }
+    if limit == 0 {
+        // Ignore large tool input/result fields while reading only prompt IDs.
+        // This additive metadata query preserves the existing page contract.
+        #[derive(Deserialize)]
+        struct PromptRow {
+            id: Option<String>,
+            role: Option<String>,
+            #[serde(rename = "toolName")]
+            tool_name: Option<String>,
+        }
+        let file = match fs::File::open(archive_file_path(data_dir, session_id)) {
+            Ok(file) => file,
+            Err(_) => return json!({ "messages": [], "total": 0, "hasMore": false, "promptIds": [] }),
+        };
+        let mut prompt_ids = Vec::new();
+        let mut total = 0usize;
+        for line in BufReader::new(file).lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => return json!({ "messages": [], "total": 0, "hasMore": false, "promptIds": [] }),
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            total += 1;
+            if let Ok(row) = serde_json::from_str::<PromptRow>(&line) {
+                if row.role.as_deref() == Some("user") && row.tool_name.is_none() {
+                    if let Some(id) = row.id {
+                        prompt_ids.push(id);
+                    }
+                }
+            }
+        }
+        return json!({ "messages": [], "total": total, "hasMore": total > offset as usize, "promptIds": prompt_ids });
+    }
     let raw = match fs::read_to_string(archive_file_path(data_dir, session_id)) {
         Ok(value) => value,
         Err(_) => return archive_empty_page(),
@@ -2781,6 +2826,16 @@ impl ClaudeRuntimeRouter {
             .unwrap_or(false))
     }
 
+    async fn reload_session(&self, session_id: String) -> Result<Value, BridgeError> {
+        if self.codex.is_owned(&session_id) {
+            let codex = self.codex.clone();
+            let app = self.app.clone();
+            return crate::async_rt::spawn_blocking(move || codex.reload_session(&app, &session_id))
+                .await.map_err(|err| BridgeError { message: format!("Codex reload worker failed: {err}") })?;
+        }
+        self.sidecar_call("claude.reloadSession", json!({ "sessionId": session_id }), Duration::from_secs(45)).await
+    }
+
     async fn reset_session(&self, session_id: String) -> Result<Value, BridgeError> {
         if self.codex.is_owned(&session_id) {
             let codex = self.codex.clone();
@@ -2930,8 +2985,7 @@ impl ClaudeRuntimeRouter {
 
     // Non-destructive resume for a (re)connecting client: re-emit history
     // without disturbing a live host session when it already exists, else fall
-    // back to a normal resume. Codex history is owned by the app-server runtime,
-    // so codex sessions defer to the regular resume.
+    // back to a normal resume. Codex follows the same host-owned attach rule.
     async fn client_resume(
         &self,
         session_id: String,
@@ -2939,9 +2993,15 @@ impl ClaudeRuntimeRouter {
         options: Option<Value>,
     ) -> Result<Value, BridgeError> {
         if should_handle_codex(&options) || self.codex.is_owned(&session_id) {
-            return self
-                .resume_session(session_id, sdk_session_id, options)
-                .await;
+            let codex = self.codex.clone();
+            let app = self.app.clone();
+            return crate::async_rt::spawn_blocking(move || {
+                codex.client_resume(&app, session_id, sdk_session_id, options)
+            })
+            .await
+            .map_err(|err| BridgeError {
+                message: format!("codex app-server client resume worker failed: {err}"),
+            })?;
         }
         self.sidecar_call(
             "claude.clientResume",
@@ -2955,29 +3015,36 @@ impl ClaudeRuntimeRouter {
         .await
     }
 
-    fn supported_models(&self, session_id: &str) -> Value {
-        if self.codex.is_owned(session_id) {
+    // The picker opens before the session starts, so ownership alone can't
+    // tell a fresh Codex tab from a Claude one: the renderer sends the tab's
+    // agent preset and that decides which catalog answers.
+    fn routes_to_codex(&self, session_id: &str, agent_preset: Option<&str>) -> bool {
+        is_codex_agent_preset_id(agent_preset) || self.codex.is_owned(session_id)
+    }
+
+    fn supported_models(&self, session_id: &str, agent_preset: Option<&str>) -> Value {
+        if self.routes_to_codex(session_id, agent_preset) {
             return self.codex.supported_models();
         }
         claude_builtin_models_native()
     }
 
-    fn supported_efforts(&self, session_id: &str) -> Value {
-        if self.codex.is_owned(session_id) {
+    fn supported_efforts(&self, session_id: &str, agent_preset: Option<&str>) -> Value {
+        if self.routes_to_codex(session_id, agent_preset) {
             return self.codex.supported_efforts();
         }
         claude_supported_efforts_native()
     }
 
-    fn supported_codex_sandbox_modes(&self, session_id: &str) -> Value {
-        if self.codex.is_owned(session_id) {
+    fn supported_codex_sandbox_modes(&self, session_id: &str, agent_preset: Option<&str>) -> Value {
+        if self.routes_to_codex(session_id, agent_preset) {
             return self.codex.supported_sandbox_modes();
         }
         codex_supported_sandbox_modes_native()
     }
 
-    fn supported_codex_approval_policies(&self, session_id: &str) -> Value {
-        if self.codex.is_owned(session_id) {
+    fn supported_codex_approval_policies(&self, session_id: &str, agent_preset: Option<&str>) -> Value {
+        if self.routes_to_codex(session_id, agent_preset) {
             return self.codex.supported_approval_policies();
         }
         codex_supported_approval_policies_native()
@@ -3073,14 +3140,15 @@ impl ClaudeRuntimeRouter {
         agent_preset: Option<String>,
     ) -> Result<Value, BridgeError> {
         if let Some(value) = self.codex.get_session_meta(&session_id) {
-            return Ok(value);
+            return Ok(notification_cmd::with_runtime_activity_meta(&self.app, &session_id, value));
         }
         if is_codex_agent_preset_id(agent_preset.as_deref()) {
             return Ok(Value::Null);
         }
         if let Some(session) = notification_cmd::get_agent_session_snapshot(&self.app, &session_id)
         {
-            return Ok(session_meta_from_notification_snapshot(&session));
+            return Ok(notification_cmd::with_agent_activity_meta(&self.app, &session_id,
+                session_meta_from_notification_snapshot(&session)));
         }
         self.sidecar_call(
             "claude.getSessionMeta",
@@ -4317,13 +4385,14 @@ pub async fn claude_get_supported_models(
     state: State<'_, SidecarState>,
     codex_state: State<'_, CodexAppServerState>,
     session_id: String,
+    agent_preset: Option<String>,
 ) -> Result<Value, BridgeError> {
     if let Some(result) = remote_invoke_for_window(
         &HostContext::from_app(app.clone()),
         &state,
         &window,
         "agent:get-supported-models",
-        vec![json!(session_id.clone())],
+        vec![json!(session_id.clone()), json!(agent_preset.clone())],
         DEFAULT_TIMEOUT,
     )
     .await
@@ -4331,7 +4400,8 @@ pub async fn claude_get_supported_models(
         return result;
     }
     ensure_local_agent_session_access(&app, &window, &session_id)?;
-    Ok(ClaudeRuntimeRouter::from_states(app, &state, &codex_state).supported_models(&session_id))
+    Ok(ClaudeRuntimeRouter::from_states(app, &state, &codex_state)
+        .supported_models(&session_id, agent_preset.as_deref()))
 }
 
 #[cfg(feature = "desktop")]
@@ -4342,13 +4412,14 @@ pub async fn claude_get_supported_efforts(
     state: State<'_, SidecarState>,
     codex_state: State<'_, CodexAppServerState>,
     session_id: String,
+    agent_preset: Option<String>,
 ) -> Result<Value, BridgeError> {
     if let Some(result) = remote_invoke_for_window(
         &HostContext::from_app(app.clone()),
         &state,
         &window,
         "agent:get-supported-efforts",
-        vec![json!(session_id.clone())],
+        vec![json!(session_id.clone()), json!(agent_preset.clone())],
         DEFAULT_TIMEOUT,
     )
     .await
@@ -4356,7 +4427,8 @@ pub async fn claude_get_supported_efforts(
         return result;
     }
     ensure_local_agent_session_access(&app, &window, &session_id)?;
-    Ok(ClaudeRuntimeRouter::from_states(app, &state, &codex_state).supported_efforts(&session_id))
+    Ok(ClaudeRuntimeRouter::from_states(app, &state, &codex_state)
+        .supported_efforts(&session_id, agent_preset.as_deref()))
 }
 
 #[cfg(feature = "desktop")]
@@ -4367,13 +4439,14 @@ pub async fn claude_get_supported_codex_sandbox_modes(
     state: State<'_, SidecarState>,
     codex_state: State<'_, CodexAppServerState>,
     session_id: String,
+    agent_preset: Option<String>,
 ) -> Result<Value, BridgeError> {
     if let Some(result) = remote_invoke_for_window(
         &HostContext::from_app(app.clone()),
         &state,
         &window,
         "agent:get-supported-codex-sandbox-modes",
-        vec![json!(session_id.clone())],
+        vec![json!(session_id.clone()), json!(agent_preset.clone())],
         DEFAULT_TIMEOUT,
     )
     .await
@@ -4382,7 +4455,7 @@ pub async fn claude_get_supported_codex_sandbox_modes(
     }
     ensure_local_agent_session_access(&app, &window, &session_id)?;
     Ok(ClaudeRuntimeRouter::from_states(app, &state, &codex_state)
-        .supported_codex_sandbox_modes(&session_id))
+        .supported_codex_sandbox_modes(&session_id, agent_preset.as_deref()))
 }
 
 #[cfg(feature = "desktop")]
@@ -4393,13 +4466,14 @@ pub async fn claude_get_supported_codex_approval_policies(
     state: State<'_, SidecarState>,
     codex_state: State<'_, CodexAppServerState>,
     session_id: String,
+    agent_preset: Option<String>,
 ) -> Result<Value, BridgeError> {
     if let Some(result) = remote_invoke_for_window(
         &HostContext::from_app(app.clone()),
         &state,
         &window,
         "agent:get-supported-codex-approval-policies",
-        vec![json!(session_id.clone())],
+        vec![json!(session_id.clone()), json!(agent_preset.clone())],
         DEFAULT_TIMEOUT,
     )
     .await
@@ -4408,7 +4482,7 @@ pub async fn claude_get_supported_codex_approval_policies(
     }
     ensure_local_agent_session_access(&app, &window, &session_id)?;
     Ok(ClaudeRuntimeRouter::from_states(app, &state, &codex_state)
-        .supported_codex_approval_policies(&session_id))
+        .supported_codex_approval_policies(&session_id, agent_preset.as_deref()))
 }
 
 #[cfg(feature = "desktop")]
@@ -4970,6 +5044,43 @@ pub async fn claude_set_effort(
         );
     }
     Ok(result)
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn claude_set_fast_mode(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, SidecarState>,
+    codex_state: State<'_, CodexAppServerState>,
+    session_id: String,
+    enabled: bool,
+) -> Result<Value, BridgeError> {
+    let ctx = HostContext::from_app(app.clone());
+    if let Some(result) = remote_invoke_for_window(
+        &ctx, &state, &window, "agent:set-fast-mode",
+        vec![json!(session_id.clone()), json!(enabled)], DEFAULT_TIMEOUT,
+    ).await { return result; }
+    ensure_local_agent_session_access(&app, &window, &session_id)?;
+    if let Some(result) = codex_state.set_fast_mode(&ctx, &session_id, enabled) { return result; }
+    call_blocking(app, state, "claude.setFastMode", json!({ "sessionId": session_id, "enabled": enabled })).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn claude_reload_session(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, SidecarState>,
+    codex_state: State<'_, CodexAppServerState>,
+    session_id: String,
+) -> Result<Value, BridgeError> {
+    if let Some(result) = remote_invoke_for_window(
+        &HostContext::from_app(app.clone()), &state, &window, "agent:reload-session",
+        vec![json!(session_id.clone())], Duration::from_secs(300),
+    ).await { return result; }
+    ensure_local_agent_session_access(&app, &window, &session_id)?;
+    ClaudeRuntimeRouter::from_states(app, &state, &codex_state).reload_session(session_id).await
 }
 
 #[cfg(feature = "desktop")]
@@ -6110,6 +6221,9 @@ mod tests {
             .iter()
             .map(|model| model["value"].as_str().unwrap())
             .collect::<Vec<_>>();
+        assert_eq!(values[0], "claude-opus-5-5:auto-compact-200k");
+        assert!(values.contains(&"claude-opus-5-5:auto-compact-300k"));
+        assert!(values.contains(&"claude-opus-5-5:1m"));
         assert!(values.contains(&"claude-fable-5-1:auto-compact-200k"));
         assert!(values.contains(&"claude-fable-5-1:auto-compact-300k"));
         assert!(values.contains(&"claude-fable-5-1:1m"));
@@ -6435,6 +6549,26 @@ mod tests {
             archive_empty_page()
         );
 
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn archive_prompt_metadata_does_not_return_message_bodies() {
+        let data_dir = temp_data_dir("archive-prompts");
+        let rows = json!([
+            { "id": "u1", "role": "user", "content": "prompt" },
+            { "id": "a1", "role": "assistant", "content": "x".repeat(1_000_000) },
+            { "id": "tool", "role": "user", "toolName": "AskUserQuestion", "input": {} },
+            { "id": "u2", "role": "user", "content": "next prompt" }
+        ]);
+        archive_messages_in_dir(&data_dir, "session-prompts", &rows).unwrap();
+        let mut file = OpenOptions::new().append(true).open(archive_file_path(&data_dir, "session-prompts")).unwrap();
+        writeln!(file, "malformed\n").unwrap();
+        let metadata = load_archived_from_dir(&data_dir, "session-prompts", 0, 0);
+        assert_eq!(metadata["promptIds"], json!(["u1", "u2"]));
+        assert_eq!(metadata["messages"], json!([]));
+        assert_eq!(metadata["total"], 5);
+        assert_eq!(load_archived_from_dir(&data_dir, "missing", 0, 0)["promptIds"], json!([]));
         fs::remove_dir_all(data_dir).ok();
     }
 

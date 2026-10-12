@@ -17,9 +17,10 @@ import {
   clearSessionStream,
   resetSessionTranscript,
 } from '../lib/state.mjs'
-import { normalizeClaudeEffortMode, isUltracodeMode } from '../lib/claude-effort.mjs'
+import { normalizeClaudeEffortMode, isUltracodeMode, runtimeEffortForMode } from '../lib/claude-effort.mjs'
 import { autoCompactWindowForClaudeSelection, expectedContextWindowForModel, sdkModelForClaudeSelection } from '../lib/models.mjs'
-import { closeLiveQuery } from './claude-send.mjs'
+import { closeLiveQuery, reloadClaudeSession } from './claude-send.mjs'
+import { readFastModePolicy, supportsClaudeFastMode, refreshFastMode, isFastModeDebugEnabled } from '../lib/fast-mode.mjs'
 
 function applyEffortOptions(session, options) {
   const mode = normalizeClaudeEffortMode(options?.effort, options?.ultracode === true)
@@ -39,6 +40,7 @@ import {
   isCodexResting,
   isCodexSession,
   resetCodexSession,
+  reloadCodexSession,
   restCodexSession,
   resumeCodexSession,
   setCodexApprovalPolicy,
@@ -294,6 +296,13 @@ registerHandler('claude.clientResume', async (params) => {
 // streaming guard, and emit a single system-message hint so the panel
 // shows "tap to wake". Wake clears the flag; the next sendMessage also
 // clears it (see claude.sendMessage below).
+registerHandler('claude.reloadSession', async (params) => {
+  const sessionId = params?.sessionId
+  if (typeof sessionId !== 'string' || !sessionId) throw new Error('claude.reloadSession: missing sessionId')
+  if (isCodexSession(sessionId)) return reloadCodexSession(params)
+  return reloadClaudeSession(sessionId)
+})
+
 registerHandler('claude.restSession', async (params) => {
   const sessionId = params?.sessionId
   if (typeof sessionId !== 'string' || !sessionId) return false
@@ -477,6 +486,16 @@ registerHandler('claude.setModel', async (params) => {
   if (isCodexSession(sessionId)) return setCodexModel(params)
   const s = ensureSession(sessionId)
   if (typeof params?.model === 'string') s.model = params.model
+  if (s.fastMode && !supportsClaudeFastMode(s.model)) {
+    s.fastMode = false
+    s.fastModeState = 'off'
+    // The old CLI settings layer must not keep Fast on under the new model.
+    if (!s.streaming) closeLiveQuery(s)
+    else if (s.liveQuery?.applyFlagSettings) {
+      try { await s.liveQuery.applyFlagSettings({ fastMode: false }) }
+      catch (err) { logWarn(`Fast disable control failed for ${sessionId}: ${err?.message || err}`) }
+    }
+  }
   let windowChanged = false
   if (typeof params?.autoCompactWindow === 'number') {
     s.autoCompactWindow = params.autoCompactWindow
@@ -516,6 +535,7 @@ registerHandler('claude.setModel', async (params) => {
       }
     }
   }
+  sendEvent('claude:status', { sessionId, meta: buildSessionMeta(s) })
   return true
 })
 
@@ -524,8 +544,56 @@ registerHandler('claude.setEffort', async (params) => {
   if (typeof sessionId !== 'string' || !sessionId) return false
   if (isCodexSession(sessionId)) return setCodexEffort(params)
   const s = ensureSession(sessionId)
+  const prevEffort = s.effort
+  const wasUltracode = isUltracodeMode(s.effort) || s.ultracode === true
   applyEffortOptions(s, params)
+  if (s.effort === prevEffort) return true
+  // Effort is passed to the CLI when the query is built, so a running query
+  // keeps its old level unless it is told about the change. Apply it live
+  // through the flag-settings control method; toggling ultracode changes the
+  // query's settings layer (see buildQueryOptions), so that rebuilds instead.
+  const controlTarget = (s.liveQuery && !s.liveQuery.isClosed)
+    ? s.liveQuery
+    : (s.streaming ? s.currentQuery : null)
+  if (controlTarget) {
+    const isUltracode = isUltracodeMode(s.effort) || s.ultracode === true
+    if (isUltracode !== wasUltracode) {
+      closeLiveQuery(s)
+    } else if (typeof controlTarget.applyFlagSettings === 'function') {
+      try { await controlTarget.applyFlagSettings({ effortLevel: runtimeEffortForMode(s.effort) }) }
+      catch (err) {
+        logWarn(`setEffort control failed for ${sessionId}: ${err?.message || err}`)
+        closeLiveQuery(s)
+      }
+    } else {
+      closeLiveQuery(s)
+    }
+  }
   return true
+})
+
+registerHandler('claude.setFastMode', async (params) => {
+  const sessionId = params?.sessionId
+  const s = sessions.get(sessionId)
+  if (!s || isCodexSession(sessionId) || typeof params?.enabled !== 'boolean') {
+    throw new Error('Fast mode requires a started session and a boolean value.')
+  }
+  refreshFastMode(s)
+  if (params.enabled && !isFastModeDebugEnabled()) throw new Error('Fast mode requires BAT_DEBUG=1 on the host.')
+  const policy = readFastModePolicy()
+  if (params.enabled && !policy.allowed) throw new Error('Enable Fast mode in host settings first.')
+  if (params.enabled && !supportsClaudeFastMode(s.model)) throw new Error('This model does not support Fast mode.')
+  if (s.streaming || s.runtimeStatus) throw new Error('Wait for the current turn to finish before changing Fast mode.')
+  // SDK noninteractive Fast requires startup opt-in; rebuild the idle query
+  // with resume, retaining the transcript, rather than pretending a flag worked.
+  closeLiveQuery(s)
+  s.fastMode = params.enabled
+  s.fastModeEpoch = policy.epoch
+  s.fastModeState = params.enabled ? 'pending' : 'off'
+  s.fastModeDisabledReason = null
+  const meta = buildSessionMeta(s)
+  sendEvent('claude:status', { sessionId, meta })
+  return meta
 })
 
 registerHandler('claude.resetSession', async (params) => {
@@ -577,6 +645,10 @@ registerHandler('claude.getSessionState', async (params) => {
     codexApprovalPolicy: s.codexApprovalPolicy,
     messages: Array.isArray(s.messages) ? s.messages : [],
     isStreaming: s.streaming === true,
+    // Include current turn/phase metadata, not only the transcript. Clients
+    // need an explicit idle snapshot to clear a pre-restart turn, and must
+    // distinguish idle from the pre-stream `starting`/queued window.
+    meta: buildSessionMeta(s),
     streamingText: s.streamingText || '',
     streamingThinking: s.streamingThinking || '',
     // A prompt the agent is blocked on. claude:ask-user and

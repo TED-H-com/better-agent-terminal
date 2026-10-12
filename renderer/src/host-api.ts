@@ -1,10 +1,10 @@
 // Host API adapter.
 //
 // Renderer code should import { host } from this module instead of reading
-// window.batAppAPI directly. The adapter routes ported namespaces through
-// Tauri invoke commands. Anything that isn't ported yet
-// throws a clear "not yet implemented" error so missing coverage fails
-// loudly instead of silently no-oping.
+// window.batAppAPI directly. The adapter maps the established host methods and
+// event listeners to Tauri commands and events. Rust owns native services and
+// agent runtime routing; unsupported methods use the compatibility fallbacks
+// defined below.
 //
 // Runtime selection happens via getHostKind() using Tauri's injected
 // window.__TAURI_INTERNALS__ hook; we also accept the legacy __TAURI__ global
@@ -13,6 +13,16 @@
 import { dispatchTauriNativeDrop } from './utils/tauri-native-drop'
 
 type BatAppAPI = any
+
+export interface RemoteTunnelEndpoint {
+  ready: boolean
+  tunneled: boolean
+  host: string
+  port: number
+  spawned: boolean
+  error?: string
+  output?: string
+}
 
 export type HostKind = 'tauri' | 'unknown'
 
@@ -55,8 +65,9 @@ export const host: BatAppAPI = new Proxy({} as BatAppAPI, {
 
 // --- Tauri implementation ----------------------------------------------------
 //
-// Each ported namespace lives in its own factory so adding the next one is a
-// localised change. Anything unported delegates to a "not implemented" stub.
+// Host namespaces map to their command handlers below. Unknown namespaces
+// throw descriptive errors; the agent method proxies and window.batAppAPI shim
+// retain their permissive compatibility fallbacks.
 
 function notImplemented(name: string): never {
   throw new Error(`host-api: ${name} is not yet implemented under Tauri`)
@@ -918,11 +929,9 @@ function createTauriHost(): BatAppAPI {
         getInvoke()<{ status: string; file: string }[]>('git_get_status', { cwd }),
     },
     claude: new Proxy({}, {
-      // The Claude surface is large (30+ host methods).
-      // Phase 2 ports authStatus/accountList plus the four session
-      // lifecycle calls and six event-stream listeners that the renderer
-      // attaches at startup. Everything else still throws a per-method
-      // "not yet implemented". claude_ping is internal-only.
+      // Keep the established agent method and event surface. Rust selects the
+      // native runtime or SDK sidecar below these command routes; renderer
+      // callers do not choose or mix session runtime ownership.
       get(_t, prop) {
         const key = String(prop)
         if (key === 'authStatus') {
@@ -1254,9 +1263,16 @@ function createTauriHost(): BatAppAPI {
           return (sessionId: string, effort: string) =>
             getInvoke()<unknown>('claude_set_effort', { sessionId, effort })
         }
+        if (key === 'setFastMode') {
+          return (sessionId: string, enabled: boolean) =>
+            getInvoke()<unknown>('claude_set_fast_mode', { sessionId, enabled })
+        }
         if (key === 'resetSession') {
           return (sessionId: string) =>
             getInvoke()<unknown>('claude_reset_session', { sessionId })
+        }
+        if (key === 'reloadSession') {
+          return (sessionId: string) => getInvoke()<unknown>('claude_reload_session', { sessionId })
         }
         // canUseTool round-trip resolution. Renderer's permission UI calls
         // these when the user clicks Allow/Deny on a permission prompt or
@@ -1526,9 +1542,7 @@ function createTauriHost(): BatAppAPI {
         getInvoke()<boolean>('worker_procfile_stop', { panelId, name }),
     },
     remote: {
-      // Phase 3 namespace; sidecar stubs return shaped objects so the
-      // renderer's polling clientStatus() / serverStatus() doesn't crash
-      // when it destructures `.connected` / `.running`.
+      // Rust owns remote server/client lifecycles and their status snapshots.
       startServer: (options?: unknown) =>
         getInvoke()<unknown>('remote_start_server', { options }),
       stopServer: () => getInvoke()<unknown>('remote_stop_server'),
@@ -1536,6 +1550,10 @@ function createTauriHost(): BatAppAPI {
       rotateToken: () => getInvoke()<unknown>('remote_rotate_token'),
       connect: (host: string, port: number, token: string, fingerprint: string, label?: string) =>
         getInvoke()<unknown>('remote_connect', { host, port, token, fingerprint, label }),
+      // Must follow every successful connect: when the host-side target
+      // profile is itself remote, the host proxies this window to it.
+      attachProfile: (profileId: string) =>
+        getInvoke()<{ chained?: boolean; contextId?: string; error?: string }>('remote_attach_profile', { profileId }),
       disconnect: () => getInvoke()<unknown>('remote_disconnect'),
       clientStatus: () =>
         getInvoke()<{
@@ -1549,6 +1567,16 @@ function createTauriHost(): BatAppAPI {
         getInvoke()<unknown>('remote_test_connection', { host, port, token, fingerprint }),
       listProfiles: (host: string, port: number, token: string, fingerprint: string) =>
         getInvoke()<unknown>('remote_list_profiles', { host, port, token, fingerprint }),
+    },
+    remoteTunnel: {
+      // Client-side SSH port forward for remote profiles with an sshTarget.
+      // Returns the endpoint to dial (the forwarded local port, or the
+      // profile's own host:port when no tunnel is configured).
+      ensure: (spec: { profileId?: string; sshTarget?: string; remoteHost?: string; remotePort?: number }) =>
+        getInvoke()<RemoteTunnelEndpoint>('remote_tunnel_ensure', { spec }),
+      stop: (profileId: string) => getInvoke()<boolean>('remote_tunnel_stop', { profileId }),
+      status: (profileId: string) =>
+        getInvoke()<{ running: boolean; port?: number; uptimeSeconds?: number; output?: string | null }>('remote_tunnel_status', { profileId }),
     },
     tunnel: {
       getConnection: () => getInvoke()<unknown>('tunnel_get_connection'),
@@ -1615,16 +1643,15 @@ function installTauriMetricLogger(api: BatAppAPI): void {
   })
 }
 
-// Permissive shim used to keep the React tree alive while we port the rest
-// of the host surface. Unlike createTauriHost(), this version returns
-// best-effort no-op values for unimplemented methods so synchronous reads
+// Compatibility shim for the existing window.batAppAPI contract. It forwards
+// supported namespaces to the host adapter and returns best-effort no-op
+// values for unknown namespaces so synchronous reads
 // during render (e.g. window.batAppAPI.platform, getDetachedId(),
-// onSomething(cb)) don't blow up. Each unported access logs once via
+// onSomething(cb)) don't blow up. Each unsupported access logs once via
 // console.warn so the gap is visible in DevTools.
 //
 // Wire via installTauriShim() from main.tsx — it is intentionally NOT the
-// default behaviour of `host`, because tests and ported call sites should
-// continue to fail loudly instead of silently no-oping.
+// default behaviour of `host`, which rejects unknown namespaces.
 
 function detectPlatform(): 'win32' | 'darwin' | 'linux' {
   if (typeof navigator === 'undefined') return 'linux'
@@ -1665,7 +1692,7 @@ const PORTED_NAMESPACES = new Set([
   'pty', 'workspace', 'update', 'debug', 'git', 'app',
   'notification', 'system', 'github', 'snippet', 'profile',
   'claude', 'claudeChannel', 'claudeCli', 'remoteFs', 'worktree', 'agent', 'workerBuffer',
-  'remote', 'tunnel',
+  'remote', 'tunnel', 'remoteTunnel',
 ])
 
 export function installTauriShim(): void {
@@ -1688,9 +1715,8 @@ export function installTauriShim(): void {
       return new Proxy({}, {
         get(_n, sub) {
           const subKey = String(sub)
-          // getDetachedId is the one synchronous method preload.ts exposes
-          // that the renderer reads during initial render — return null so
-          // React doesn't choke.
+          // getDetachedId is synchronous in the renderer contract and is read
+          // during initial render; its fallback must return a value directly.
           if (key === 'workspace' && subKey === 'getDetachedId') {
             return () => { warnOnce('workspace.getDetachedId'); return null }
           }
