@@ -5,6 +5,9 @@
 // thread/turn/item notifications back into the existing claude:* event shape
 // consumed by the renderer.
 
+#[path = "codex_pm_runtime.rs"]
+mod pm_runtime;
+
 use crate::app_data;
 use crate::codex_account_store;
 use crate::codex_auth;
@@ -328,6 +331,7 @@ struct PendingApproval {
 
 #[derive(Default)]
 struct CodexRuntime {
+    pm: Option<Arc<pm_runtime::PmState>>,
     connection: Mutex<Option<Arc<CodexConnection>>>,
     last_connection_activity: Mutex<Option<Instant>>,
     idle_reaper_running: AtomicBool,
@@ -474,6 +478,39 @@ pub struct CodexAppServerState {
     runtime: Option<Arc<CodexRuntime>>,
 }
 
+/// Process-local ordinary input identity; unrelated to SDK usage/turn totals.
+/// Every accepted handler entry is counted before preparation or queue waits.
+#[derive(Clone)]
+struct NativeInputState(Arc<Mutex<NativeInputCounters>>);
+struct NativeInputCounters { epoch: String, received: u64, pending: u64 }
+impl Default for NativeInputState {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(NativeInputCounters {
+            epoch: format!("{:032x}", rand::random::<u128>()), received: 0, pending: 0,
+        })))
+    }
+}
+impl NativeInputState {
+    fn begin(&self) -> NativeInputGuard {
+        let mut value = self.0.lock().expect("native input identity lock");
+        value.received = value.received.saturating_add(1);
+        value.pending = value.pending.saturating_add(1);
+        NativeInputGuard(self.clone())
+    }
+    fn view(&self) -> Value {
+        let value = self.0.lock().expect("native input identity lock");
+        json!({"schema":"bat_input_state_v1", "epoch":value.epoch,
+            "received":value.received, "pending":value.pending})
+    }
+}
+struct NativeInputGuard(NativeInputState);
+impl Drop for NativeInputGuard {
+    fn drop(&mut self) {
+        let mut value = self.0.0.lock().expect("native input identity lock");
+        value.pending = value.pending.saturating_sub(1);
+    }
+}
+
 #[derive(Clone)]
 struct CodexSession {
     session_id: String,
@@ -511,6 +548,7 @@ struct CodexSession {
     last_output_tokens: u64,
     last_cache_read_tokens: u64,
     num_turns: u64,
+    input_state: NativeInputState,
     last_turn_started_at: Option<Instant>,
     last_turn_first_token_ms: Option<u64>,
     last_turn_duration_ms: Option<u64>,
@@ -612,6 +650,7 @@ impl CodexSession {
             "outputTokens": self.output_tokens,
             "durationMs": self.start_time.elapsed().as_millis() as u64,
             "numTurns": self.num_turns,
+            "inputState": self.input_state.view(),
             "contextWindow": self.context_window,
             "maxOutputTokens": 0,
             "contextTokens": context_tokens,
@@ -778,7 +817,7 @@ fn is_codex_agent_preset(options: &Value) -> bool {
 }
 
 pub fn should_handle_codex(options: &Option<Value>) -> bool {
-    options.as_ref().map(is_codex_agent_preset).unwrap_or(false)
+    options.as_ref().map(|value| value.get("pmRuntimeProfile").is_some() || is_codex_agent_preset(value)).unwrap_or(false)
 }
 
 fn effective_cwd(options: &Value, context: &str) -> Result<String, BridgeError> {
@@ -3270,6 +3309,7 @@ impl CodexAppServerState {
     }
 
     fn mark_shared_auth_valid(&self, app: &HostContext, reason: &str) {
+        if self.runtime.as_ref().is_some_and(|runtime| runtime.pm.is_some()) { return; }
         if !codex_unified_enabled(app) {
             return;
         }
@@ -3295,6 +3335,7 @@ impl CodexAppServerState {
     }
 
     fn mark_shared_auth_needs_login(&self, app: &HostContext, reason: &str) {
+        if self.runtime.as_ref().is_some_and(|runtime| runtime.pm.is_some()) { return; }
         if !codex_unified_enabled(app) {
             return;
         }
@@ -3540,7 +3581,7 @@ impl CodexAppServerState {
     fn drop_connection(&self, app: &HostContext, reason: &str) {
         if matches!(reason, "unified-switch" | "unified-migrate" | "account-login" | "account-remove" | "legacy-switch" | "sync-active-changed") {
             let runtimes = self.inner.session_runtimes.lock().expect("codex runtime map lock")
-                .values().cloned().collect::<Vec<_>>();
+                .values().filter(|runtime| runtime.pm.is_none()).cloned().collect::<Vec<_>>();
             for runtime in runtimes {
                 *runtime.pending_unarchive.lock().expect("codex unarchive lock") = None;
                 Self { inner: self.inner.clone(), runtime: Some(runtime) }.take_connection_for_reap();
@@ -4633,6 +4674,7 @@ impl CodexAppServerState {
                     continue;
                 }
 
+                session.input_state = NativeInputState::default();
                 let was_active = session.is_running
                     || session.is_resting
                     || session.abort_requested
@@ -4909,7 +4951,7 @@ impl CodexAppServerState {
     // we never spawn an app-server just to read usage.
     pub fn fetch_account_rate_limits(&self, app: &HostContext) -> Option<Value> {
         let connection = self.live_connection().or_else(|| {
-            let runtimes = self.inner.session_runtimes.lock().ok()?.values().cloned().collect::<Vec<_>>();
+            let runtimes = self.inner.session_runtimes.lock().ok()?.values().filter(|runtime| runtime.pm.is_none()).cloned().collect::<Vec<_>>();
             runtimes.into_iter().find_map(|runtime|
                 Self { inner: self.inner.clone(), runtime: Some(runtime) }.live_connection())
         })?;
@@ -4939,6 +4981,9 @@ impl CodexAppServerState {
     }
 
     fn ensure_connection(&self, app: &HostContext) -> Result<Arc<CodexConnection>, String> {
+        if self.runtime.as_ref().is_some_and(|runtime| runtime.pm.is_some()) {
+            return self.live_connection().ok_or_else(|| "PM_RUNTIME_RESTART_FORBIDDEN".into());
+        }
         let _spawn_guard = self.spawn_lock().lock().map_err(|_| "codex spawn lock poisoned")?;
         let (active_changed, current_auth_id) =
             self.sync_unified_active_from_shared(app, "ensure-connection")?;
@@ -5152,6 +5197,10 @@ impl CodexAppServerState {
         session_id: String,
         options: Option<Value>,
     ) -> Result<Value, BridgeError> {
+        if options.as_ref().is_some_and(|value| value.get("pmRuntimeProfile").is_some()) {
+            return self.start_pm_session(app, session_id, options.unwrap());
+        }
+        self.reject_pm_session(app, &session_id)?;
         let operation_lock = self.turn_operation_lock(&session_id);
         let guard = operation_lock.lock()
             .map_err(|_| bridge_error("Codex turn operation lock poisoned"))?;
@@ -5204,6 +5253,7 @@ impl CodexAppServerState {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 0,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -5337,11 +5387,14 @@ impl CodexAppServerState {
         session_id: String,
         context_markdown: String,
     ) -> Result<Value, BridgeError> {
+        self.reject_pm_session(app, &session_id)?;
+        let input_entry = self.begin_native_input(&session_id)?;
         let item = codex_context_transfer_item(&context_markdown).map_err(bridge_error)?;
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let _turn_operation_guard = turn_operation_lock
             .lock()
             .map_err(|_| bridge_error("Codex turn operation lock poisoned"))?;
+        self.require_current_native_input(&session_id, &input_entry)?;
         let thread_id = {
             let sessions = self.inner.sessions.lock().expect("codex sessions lock");
             let session = sessions
@@ -5406,6 +5459,8 @@ impl CodexAppServerState {
         sdk_session_id: String,
         options: Option<Value>,
     ) -> Result<Value, BridgeError> {
+        if options.as_ref().is_some_and(|value| value.get("pmRuntimeProfile").is_some()) { return Err(bridge_error("PM_RUNTIME_RESUME_FORBIDDEN")); }
+        self.reject_pm_session(app, &session_id)?;
         let operation_lock = self.turn_operation_lock(&session_id);
         let _guard = operation_lock.lock()
             .map_err(|_| bridge_error("Codex turn operation lock poisoned"))?;
@@ -5501,6 +5556,7 @@ impl CodexAppServerState {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 0,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -5604,6 +5660,23 @@ impl CodexAppServerState {
         Ok(json!({ "ok": true, "sessionId": session_id, "sdkSessionId": sdk_session_id }))
     }
 
+    fn begin_native_input(&self, session_id: &str) -> Result<NativeInputGuard, BridgeError> {
+        let sessions = self.inner.sessions.lock().expect("codex sessions lock");
+        let session = sessions.get(session_id).ok_or_else(|| bridge_error("Codex session not started"))?;
+        // Count under the session lock so reset cannot replace the epoch between
+        // choosing its identity and publishing this pending entry.
+        Ok(session.input_state.begin())
+    }
+
+    fn require_current_native_input(&self, session_id: &str, entry: &NativeInputGuard) -> Result<(), BridgeError> {
+        let sessions = self.inner.sessions.lock().expect("codex sessions lock");
+        let session = sessions.get(session_id).ok_or_else(|| bridge_error("Codex session not started"))?;
+        if !Arc::ptr_eq(&session.input_state.0, &entry.0.0) {
+            return Err(bridge_error("Agent restarted; queued input belongs to the previous runtime"));
+        }
+        Ok(())
+    }
+
     pub fn send_message(
         &self,
         app: &HostContext,
@@ -5611,6 +5684,8 @@ impl CodexAppServerState {
         prompt: String,
         images: Vec<String>,
     ) -> Result<Value, BridgeError> {
+        if self.pm_state(&session_id).is_some() { return Err(bridge_error("PM_RUNTIME_SEND_IDENTITY_REQUIRED")); }
+        let input_entry = self.begin_native_input(&session_id)?;
         let owner = self.for_session(&session_id);
         if self.inner.reloading_sessions.lock().expect("codex reload lock").contains(&session_id) {
             return Err(bridge_error("Session is reloading; wait before sending a message"));
@@ -5638,6 +5713,7 @@ impl CodexAppServerState {
         let _turn_operation_guard = turn_operation_lock
             .lock()
             .map_err(|_| bridge_error("Codex turn operation lock poisoned"))?;
+        self.require_current_native_input(&session_id, &input_entry)?;
         if !owner.owns_session_runtime(&session_id)
             || self.inner.reloading_sessions.lock().expect("codex reload lock").contains(&session_id) {
             return Ok(json!({ "ok": false, "cancelled": true, "error": "Agent restarted; queued message cancelled" }));
@@ -6135,6 +6211,7 @@ impl CodexAppServerState {
         app: &HostContext,
         session_id: String,
     ) -> Result<Value, BridgeError> {
+        if self.pm_state(&session_id).is_some() { return Ok(self.stop_pm_session(&session_id, "explicit_abort")); }
         log_codex(app, &session_id, "abort_session requested");
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let _turn_operation_guard = turn_operation_lock
@@ -6258,6 +6335,7 @@ impl CodexAppServerState {
     }
 
     pub fn stop_session(&self, session_id: String) -> Value {
+        if self.pm_state(&session_id).is_some() { return self.stop_pm_session(&session_id, "explicit_stop"); }
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let turn_operation_guard = turn_operation_lock
             .lock()
@@ -6295,6 +6373,7 @@ impl CodexAppServerState {
         app: &HostContext,
         session_id: String,
     ) -> Result<Value, BridgeError> {
+        self.reject_pm_session(app, &session_id)?;
         let turn_operation_lock = self.turn_operation_lock(&session_id);
         let _turn_operation_guard = turn_operation_lock
             .lock()
@@ -6351,6 +6430,7 @@ impl CodexAppServerState {
             session.last_output_tokens = 0;
             session.last_cache_read_tokens = 0;
             session.num_turns = 0;
+            session.input_state = NativeInputState::default();
             session.last_turn_started_at = None;
             session.last_turn_first_token_ms = None;
             session.last_turn_duration_ms = None;
@@ -6383,6 +6463,7 @@ impl CodexAppServerState {
     }
 
     pub fn reload_session(&self, app: &HostContext, session_id: &str) -> Result<Value, BridgeError> {
+        self.reject_pm_session(app, &session_id)?;
         if !self.inner.reloading_sessions.lock().expect("codex reload lock").insert(session_id.to_string()) {
             return Err(bridge_error("Session is already reloading"));
         }
@@ -6398,6 +6479,7 @@ impl CodexAppServerState {
             let session = sessions.get_mut(session_id)
                 .ok_or_else(|| bridge_error("Codex session not started"))?;
             session.check_reload_available()?;
+            session.input_state = NativeInputState::default();
             let (partial, interrupted_tools, had_work) = session.prepare_reload();
             (session.clone(), partial, interrupted_tools, had_work)
         };
@@ -6478,6 +6560,7 @@ impl CodexAppServerState {
     }
 
     pub fn rest_session(&self, app: &HostContext, session_id: &str) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         session.is_resting = true;
@@ -6504,6 +6587,7 @@ impl CodexAppServerState {
     }
 
     pub fn wake_session(&self, session_id: &str) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         session.is_resting = false;
@@ -6556,6 +6640,7 @@ impl CodexAppServerState {
             .expect("codex sessions lock")
             .get(session_id)
             .map(CodexSession::metadata)
+            .map(|mut meta| { if let Some(pm) = self.pm_state(session_id) { meta["pmRuntime"] = pm.view(); } meta })
     }
 
     pub fn get_context_usage(&self, session_id: &str) -> Option<Value> {
@@ -6587,6 +6672,7 @@ impl CodexAppServerState {
     }
 
     pub fn set_model(&self, app: &HostContext, session_id: &str, model: String) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         if session.model == model {
@@ -6612,6 +6698,7 @@ impl CodexAppServerState {
     }
 
     pub fn set_fast_mode(&self, app: &HostContext, session_id: &str, enabled: bool) -> Option<Result<Value, BridgeError>> {
+        if self.pm_state(&session_id).is_some() { return Some(Err(bridge_error("PM_RUNTIME_IMMUTABLE"))); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         if enabled && !crate::commands::settings::fast_mode_debug_enabled() {
@@ -6629,6 +6716,7 @@ impl CodexAppServerState {
     }
 
     pub fn set_effort(&self, app: &HostContext, session_id: &str, effort: String) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         let next = normalize_effort(Some(&effort));
@@ -6653,6 +6741,7 @@ impl CodexAppServerState {
         session_id: &str,
         mode: String,
     ) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         let next = normalize_sandbox(Some(&mode));
@@ -6675,6 +6764,7 @@ impl CodexAppServerState {
         session_id: &str,
         policy: String,
     ) -> Option<Value> {
+        if self.pm_state(&session_id).is_some() { return Some(json!({"ok":false,"error":"PM_RUNTIME_IMMUTABLE"})); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get_mut(session_id)?;
         let next = normalize_approval(Some(&policy));
@@ -6696,6 +6786,7 @@ impl CodexAppServerState {
         app: &HostContext,
         session_id: &str,
     ) -> Result<Value, BridgeError> {
+        self.reject_pm_session(app, &session_id)?;
         let (thread_id, model, cwd, approval_policy, sandbox_mode, meta) = {
             let sessions = self.inner.sessions.lock().expect("codex sessions lock");
             let session = sessions
@@ -8386,6 +8477,7 @@ mod tests {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 1,
+            input_state: NativeInputState::default(),
             last_turn_started_at: Some(Instant::now()),
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -9235,6 +9327,7 @@ mod tests {
             last_output_tokens: 50,
             last_cache_read_tokens: 25,
             num_turns: 1,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -9287,6 +9380,7 @@ mod tests {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 0,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -9347,6 +9441,7 @@ mod tests {
             last_output_tokens: 0,
             last_cache_read_tokens: 0,
             num_turns: 1,
+            input_state: NativeInputState::default(),
             last_turn_started_at: None,
             last_turn_first_token_ms: None,
             last_turn_duration_ms: None,
@@ -10200,4 +10295,112 @@ invalid json
         ));
         assert!(state.inner.connection.try_lock().unwrap().is_none());
     }
+    #[test]
+    fn native_input_identity_counts_pending_entries_not_sdk_usage() {
+        let input = NativeInputState::default();
+        let epoch = input.view()["epoch"].clone();
+        let first = input.begin();
+        let second = input.begin();
+        assert_eq!(input.view()["received"], 2);
+        assert_eq!(input.view()["pending"], 2);
+        drop(first);
+        assert_eq!(input.view()["pending"], 1);
+        drop(second);
+        assert_eq!(input.view(), json!({"schema":"bat_input_state_v1", "epoch":epoch, "received":2, "pending":0}));
+        assert_ne!(NativeInputState::default().view()["epoch"], epoch);
+    }
+
+    #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn native_input_identity_is_visible_while_original_send_waits_for_turn_lock() {
+        let (app, _) = session_sync_test_host();
+        let state = CodexAppServerState::default();
+        let mut session = test_codex_session();
+        session.is_running = false;
+        let identity = session.input_state.clone();
+        state.inner.sessions.lock().unwrap().insert("session-1".into(), session);
+        let turn = state.turn_operation_lock("session-1");
+        let held = turn.lock().unwrap();
+        std::thread::scope(|scope| {
+            let sending = scope.spawn(|| state.send_message(&app, "session-1".into(), "queued input".into(), vec![]));
+            let until = Instant::now() + Duration::from_secs(2);
+            while identity.view()["received"] == 0 {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            let meta = state.get_session_meta("session-1").unwrap();
+            assert_eq!(meta["isStreaming"], false);
+            assert_eq!(meta["numTurns"], 1);
+            assert_eq!(meta["inputState"]["received"], 1);
+            assert_eq!(meta["inputState"]["pending"], 1);
+            // End only this fake session before releasing the gate; no provider starts.
+            state.inner.sessions.lock().unwrap().remove("session-1");
+            drop(held);
+            let result = sending.join().unwrap();
+            assert!(result.is_err() || result.unwrap()["cancelled"] == true);
+        });
+        assert_eq!(identity.view()["pending"], 0);
+        assert_eq!(identity.view()["received"], 1);
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    fn stale_queued_input_cannot_enter_replacement_runtime(inject: bool) {
+        let (app, _) = session_sync_test_host();
+        let state = CodexAppServerState::default();
+        let mut session = test_codex_session();
+        session.is_running = false;
+        let original = session.input_state.clone();
+        state.inner.sessions.lock().unwrap().insert("session-1".into(), session);
+        let turn = state.turn_operation_lock("session-1");
+        let held = turn.lock().unwrap();
+        std::thread::scope(|scope| {
+            let sending = scope.spawn(|| {
+                if inject {
+                    state.inject_context(&app, "session-1".into(), format!("{BAT_CONTEXT_TRANSFER_MARKER}\nqueued context"))
+                } else {
+                    state.send_message(&app, "session-1".into(), "queued input".into(), vec![])
+                }
+            });
+            let until = Instant::now() + Duration::from_secs(2);
+            while original.view()["received"] == 0 {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            assert_eq!(original.view()["pending"], 1);
+            // Model reset/reload winning the turn lock before the queued entry:
+            // the replacement owns a different input epoch and native thread.
+            let replacement = NativeInputState::default();
+            {
+                let mut sessions = state.inner.sessions.lock().unwrap();
+                let current = sessions.get_mut("session-1").unwrap();
+                current.input_state = replacement.clone();
+                current.thread_id = Some("replacement-native-thread".into());
+            }
+            let new_entry = replacement.begin();
+            drop(held);
+            let result = sending.join().unwrap();
+            assert!(result.is_err(), "stale entry unexpectedly entered the new runtime");
+            assert_eq!(original.view()["pending"], 0);
+            assert_eq!(original.view()["received"], 1);
+            assert_eq!(replacement.view()["pending"], 1, "old guard altered the new epoch");
+            assert_eq!(replacement.view()["received"], 1);
+            assert!(state.inner.connection.lock().unwrap().is_none());
+            assert_eq!(state.get_session_meta("session-1").unwrap()["sdkSessionId"], "replacement-native-thread");
+            drop(new_entry);
+            assert_eq!(replacement.view()["pending"], 0);
+        });
+    }
+
+    #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn native_input_identity_rejects_stale_send_after_reset() {
+        stale_queued_input_cannot_enter_replacement_runtime(false);
+    }
+
+    #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn native_input_identity_rejects_stale_context_injection_after_reset() {
+        stale_queued_input_cannot_enter_replacement_runtime(true);
+    }
+
 }

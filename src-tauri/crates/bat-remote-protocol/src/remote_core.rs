@@ -390,6 +390,8 @@ fn legacy_v1_param_keys(channel: &str) -> Option<&'static [&'static str]> {
             "clientMessageId",
             "displayPrompt",
             "suppressUserEcho",
+            "pmRuntimeId",
+            "pmContextDigest",
         ]),
         "claude:stop-session"
         | "claude:abort-session"
@@ -401,6 +403,7 @@ fn legacy_v1_param_keys(channel: &str) -> Option<&'static [&'static str]> {
         | "claude:get-supported-agents"
         | "claude:get-session-state"
         | "claude:get-session-meta"
+        | "claude:get-pm-runtime"
         | "claude:get-worktree-status"
         | "claude:get-context-usage"
         | "claude:fork-session"
@@ -1701,4 +1704,16 @@ mod tests {
         assert!(is_proxied_remote_event("claude:stream"));
         assert!(!is_proxied_remote_event("settings:load"));
     }
+    #[test]
+    fn pm_identity_fields_survive_existing_remote_argument_transport() {
+        let values = vec![json!("session-pm"), json!(" frozen context "), json!([]), Value::Null,
+            json!("client-original"), Value::Null, Value::Null, json!("runtime-original"), json!("context-original")];
+        let params = legacy_v1_args_to_params("claude:send-message", &values);
+        assert_eq!(params["clientMessageId"], "client-original");
+        assert_eq!(params["pmRuntimeId"], "runtime-original");
+        assert_eq!(params["pmContextDigest"], "context-original");
+        assert_eq!(invoke_params_for_protocol(RemoteProtocol::V2, "claude:send-message", &[], Some(params.clone())), params);
+        assert_eq!(legacy_v1_args_to_params("claude:get-pm-runtime", &[json!("session-pm")]), json!({"sessionId":"session-pm"}));
+    }
+
 }

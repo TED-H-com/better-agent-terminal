@@ -1,6 +1,7 @@
 // Per-session in-memory state. The sessions Map is the singleton
 // canonical store consumed by every claude.* handler.
 
+import { randomBytes } from 'node:crypto'
 import { expectedContextWindowForModel } from './models.mjs'
 import { effectiveFastMode, supportsClaudeFastMode } from './fast-mode.mjs'
 
@@ -39,6 +40,22 @@ export function saveSessionConfig(sessionId, session) {
     if (session[key] !== undefined) snapshot[key] = session[key]
   }
   sessionConfigs.set(sessionId, snapshot)
+}
+
+export function newNativeInputState() {
+  return { schema: 'bat_input_state_v1', epoch: randomBytes(16).toString('hex'), received: 0, pending: 0 }
+}
+
+export function beginNativeInput(s) {
+  const value = s.inputState
+  if (!value || !Number.isSafeInteger(value.received) || !Number.isSafeInteger(value.pending)
+      || value.received >= Number.MAX_SAFE_INTEGER) throw new Error('native input identity unavailable')
+  value.received += 1
+  value.pending += 1
+  let settled = false
+  return () => {
+    if (!settled) { settled = true; value.pending -= 1 }
+  }
 }
 
 export function clearSessionConfig(sessionId) {
@@ -83,6 +100,8 @@ export function ensureSession(sessionId) {
       // that prompt just because the previous result frame has not fully
       // unwound yet.
       sendQueue: null,
+      // Never persist into sessionConfigs or infer this from SDK num_turns.
+      inputState: newNativeInputState(),
       // Idempotency records for renderer-originated sends. A Tauri/remote RPC
       // may time out while the SDK turn keeps running; retrying the same
       // clientMessageId must acknowledge the accepted turn instead of
@@ -210,6 +229,7 @@ export function buildSessionMeta(s) {
     outputTokens,
     durationMs: 0,
     numTurns: total?.numTurns ?? 0,
+    inputState: s.inputState ? { ...s.inputState } : null,
     contextWindow,
     maxOutputTokens: 0,
     contextTokens,

@@ -4,6 +4,7 @@ fn main() {
     // share the same compiled application library.
     ensure_bundle_mode_marker();
     export_app_version();
+    export_source_revision();
     configure_windows_common_controls_manifest();
     // Tauri's build-time codegen (context, capabilities, resource copy) is only
     // needed for the desktop shell. A headless `--no-default-features` build
@@ -84,4 +85,33 @@ fn configure_windows_common_controls_manifest() {
 fn is_windows_msvc_target() -> bool {
     std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+}
+
+fn export_source_revision() {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(manifest_dir())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|out| out.trim().to_owned())
+    };
+    // A linked worktree has a .git file, not a .git directory. Track the actual
+    // worktree HEAD and shared branch ref so source identity updates after commit.
+    let mut refs = vec!["HEAD".to_string(), "packed-refs".to_string()];
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        refs.push(branch);
+    }
+    for name in refs {
+        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
+            let path = manifest_dir().join(path);
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    println!(
+        "cargo:rustc-env=BAT_SOURCE_REVISION={}",
+        git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
+    );
 }
