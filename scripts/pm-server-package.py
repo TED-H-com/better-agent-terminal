@@ -64,7 +64,7 @@ def main():
         "kind": "bat-pm-server-candidate",
         "target": "linux-x86_64",
         "source_revision": source,
-        "source_repository": "https://github.com/teddashh/better-agent-terminal",
+        "source_repository": "https://github.com/TED-H-com/better-agent-terminal",
         "version": json.loads((repo / "package.json").read_text())["version"],
         "pm_profile": "codex-pm-linux-v1",
         "pm_profile_version": 1,

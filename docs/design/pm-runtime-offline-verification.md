@@ -80,7 +80,7 @@ A successful fresh feature job supplies new whole-workspace evidence for its
 recorded SHA; the old failure remains part of the review history.
 
 The first GitHub run at `ab69c2c`,
-[38187107006](https://github.com/teddashh/better-agent-terminal/actions/runs/38187107006),
+[38187107006](https://github.com/TED-H-com/better-agent-terminal/actions/runs/38187107006),
 passed TypeScript, renderer build, sidecar and real inotify checks in both jobs.
 Both then failed bubblewrap's loopback address setup with
 `Failed RTM_NEWADDR: Operation not permitted` while the AppArmor restriction was
