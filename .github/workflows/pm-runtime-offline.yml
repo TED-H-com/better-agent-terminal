@@ -172,3 +172,11 @@ jobs:
 
       - name: Require unchanged tracked source
         run: git diff --exit-code HEAD
+
+      - name: Verify credential-safe startup and existing token authentication
+        if: matrix.source == 'feature'
+        run: |
+          pnpm run test:bat-server-token-security
+          cargo build --manifest-path src-tauri/Cargo.toml --locked \
+            --no-default-features --features headless --bin bat-server
+          python3 tests/bat_server_startup_security.py "$CARGO_TARGET_DIR/debug/bat-server"
