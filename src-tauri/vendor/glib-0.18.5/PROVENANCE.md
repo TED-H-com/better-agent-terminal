@@ -21,9 +21,9 @@ The only change to the published crate is in `src/variant_iter.rs`:
 +                &mut p,
 ```
 
-`scripts/verify-vendored-glib.sh` downloads the checksum-pinned crate and
+`python3 scripts/verify-vendored-glib.py` downloads the checksum-pinned crate and
 proves that the vendored tree contains exactly those two changed lines plus
-this provenance file.
+the two provenance/validation documents.
 
 Remove the override and this directory when Tauri's supported Linux graph
 uses `glib >= 0.20.0`, or when gtk-rs publishes a compatible fixed 0.18 release.

@@ -15,6 +15,9 @@ Validation must include the optimized iterator tests, since debug-only and
 headless builds do not exercise the original failure:
 
 ```sh
-cargo test --manifest-path src-tauri/vendor/glib-0.18.5/Cargo.toml --release --lib variant_iter::tests
+python3 scripts/verify-vendored-glib.py
+glib_test_dir=$(mktemp -d)
+cp -R src-tauri/vendor/glib-0.18.5/. "$glib_test_dir/"
+cargo test --manifest-path "$glib_test_dir/Cargo.toml" --release --lib variant_iter::tests
 cargo check --manifest-path src-tauri/Cargo.toml --workspace --locked
 ```

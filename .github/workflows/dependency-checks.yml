@@ -10,6 +10,7 @@ on:
       - src-tauri/Cargo.toml
       - src-tauri/Cargo.lock
       - src-tauri/vendor/**
+      - scripts/verify-vendored-glib.py
       - .github/workflows/dependency-checks.yml
   workflow_dispatch:
 
@@ -54,6 +55,10 @@ jobs:
           pnpm run test:chat-markdown
           pnpm run build:tauri-sidecar
       - name: Exercise optimized GLib iterator implementation
-        run: cargo test --manifest-path src-tauri/vendor/glib-0.18.5/Cargo.toml --release --lib variant_iter::tests
+        run: |
+          python3 scripts/verify-vendored-glib.py
+          glib_test_dir=$(mktemp -d "$RUNNER_TEMP/glib-regression.XXXXXX")
+          cp -R src-tauri/vendor/glib-0.18.5/. "$glib_test_dir/"
+          cargo test --manifest-path "$glib_test_dir/Cargo.toml" --release --lib variant_iter::tests
       - name: Check the GTK desktop dependency graph
         run: cargo check --manifest-path src-tauri/Cargo.toml --workspace --locked
