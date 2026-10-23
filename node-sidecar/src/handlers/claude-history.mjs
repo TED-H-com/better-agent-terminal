@@ -549,6 +549,12 @@ registerHandler('claude.fetchSubagentMessages', async (params) => {
 // guarantee survives a renderer that loses its own bookkeeping across remounts.
 // First write wins — a re-archived row is by definition already stored.
 const archivedIdsBySession = new Map()
+const archiveWrites = new Map()
+const MAX_SEEN_IDS = 10_000
+function rememberId(seen, id) {
+  seen.add(id)
+  if (seen.size > MAX_SEEN_IDS) seen.delete(seen.values().next().value)
+}
 
 // Seeded once per session from the file, then maintained in memory. Returns a
 // promise (not a Set) so concurrent flushes share one read instead of racing to
@@ -562,7 +568,7 @@ function archivedIds(sessionId) {
         if (!line.trim()) continue
         try {
           const id = JSON.parse(line)?.id
-          if (typeof id === 'string') ids.add(id)
+          if (typeof id === 'string') rememberId(ids, id)
         } catch { /* malformed line — nothing to dedupe against */ }
       }
       return ids
@@ -573,7 +579,7 @@ function archivedIds(sessionId) {
   return pending
 }
 
-registerHandler('claude.archiveMessages', async (params) => {
+async function archiveMessages(params) {
   const sessionId = params?.sessionId
   const messages = params?.messages
   if (typeof sessionId !== 'string' || !sessionId) return false
@@ -585,25 +591,56 @@ registerHandler('claude.archiveMessages', async (params) => {
     // Ids staged separately and only committed once the write lands. Marking
     // them seen up front would make a failed append permanent: the retry would
     // filter out the very rows that never reached disk.
+    // Once the bounded cache fills, check candidate IDs against disk as well.
+    // Eviction must never allow an older replay to be appended again.
+    const diskMatches = new Set()
+    if (seen.size >= MAX_SEEN_IDS) {
+      const candidates = new Set(messages.map(m => m?.id).filter(id => typeof id === 'string'))
+      const input = createReadStream(archiveFilePath(sessionId), { encoding: 'utf8' })
+      const reader = createInterface({ input, crlfDelay: Infinity })
+      try {
+        for await (const line of reader) {
+          try {
+            const id = JSON.parse(line)?.id
+            if (candidates.has(id)) diskMatches.add(id)
+          } catch { /* malformed rows have no usable id */ }
+        }
+      } finally {
+        reader.close()
+        input.destroy()
+      }
+    }
     const staged = new Set()
     // A row with no id cannot be deduped, so it is written through rather than
     // dropped: losing history is worse than storing it twice.
     const fresh = messages.filter(m => {
       const id = m?.id
       if (typeof id !== 'string') return true
-      if (seen.has(id) || staged.has(id)) return false
+      if (seen.has(id) || diskMatches.has(id) || staged.has(id)) return false
       staged.add(id)
       return true
     })
     if (fresh.length === 0) return true
     const lines = fresh.map(m => JSON.stringify(m)).join('\n') + '\n'
     await appendFile(archiveFilePath(sessionId), lines, 'utf-8')
-    for (const id of staged) seen.add(id)
+    for (const id of staged) rememberId(seen, id)
     return true
   } catch (err) {
     logWarn(`claude.archiveMessages: ${err instanceof Error ? err.message : String(err)}`)
     return false
   }
+}
+
+// Serialize per session: two clients may replay/flush the same window together.
+registerHandler('claude.archiveMessages', (params) => {
+  const sessionId = params?.sessionId
+  const previous = archiveWrites.get(sessionId) || Promise.resolve()
+  const pending = previous.catch(() => {}).then(() => archiveMessages(params))
+  archiveWrites.set(sessionId, pending)
+  void pending.finally(() => {
+    if (archiveWrites.get(sessionId) === pending) archiveWrites.delete(sessionId)
+  }).catch(() => {})
+  return pending
 })
 
 registerHandler('claude.loadArchived', async (params) => {
