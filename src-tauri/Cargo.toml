@@ -8,6 +8,7 @@ default-run = "better-agent-terminal"
 
 [workspace]
 members = [".", "crates/*"]
+exclude = ["vendor/glib-0.18.5"]
 default-members = ["."]
 resolver = "2"
 
@@ -205,3 +206,8 @@ strip = "symbols"
 # 184/170/153/163/170s, peaking at 4 — the standard runner's width already). Both
 # came off the same local harness whose absolute numbers CI contradicts, so treat
 # them as directions, not values.
+
+# GTK3 still requires glib 0.18; this copy backports upstream gtk-rs-core#1343.
+# See vendor/glib-0.18.5/SECURITY-PATCH.md and remove when GTK permits glib >=0.20.
+[patch.crates-io]
+glib = { path = "vendor/glib-0.18.5" }
