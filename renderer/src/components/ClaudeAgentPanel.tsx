@@ -550,6 +550,8 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
   }, [isWorktreeSession, terminal?.worktreePath, terminal?.worktreeBranch])
   const markdownCwd = worktreeInfo?.worktreePath || terminal?.worktreePath || cwd
   const [promptSuggestion, setPromptSuggestion] = useState<string | null>(null)
+  const [historyBefore, setHistoryBefore] = useState<number | null>(null)
+  const [isLoadingHistoryPage, setIsLoadingHistoryPage] = useState(false)
   const [isResumingHistory, setIsResumingHistory] = useState(false)
   const [isTransferringToCodex, setIsTransferringToCodex] = useState(false)
   const [activePlanFile, setActivePlanFile] = useState<string | null>(null)
@@ -2230,6 +2232,7 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
         await ensureSessionStarted()
         retryBackoff.reset()
         if (cancelled) return
+        setMessages(prev => prev.filter(m => m.id !== `sys-resume-failed-${sessionId}`))
         const existingState = await host.claude.getSessionState(sessionId).catch(() => null)
         if (cancelled || !existingState) return
         const existingMessages = normalizeMessageItems(existingState.messages)
@@ -2242,7 +2245,7 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
         // Fresh sessions already initialize with an empty messages array.
         if (existingMessages.length > 0) {
           for (const item of existingMessages) seenMessageIds.add(item.id)
-          setMessages(dedupeMessagesById(existingMessages))
+          setMessages(prev => dedupeMessagesById([...prev, ...existingMessages]))
         } else if (host.debug.isDebugMode === true) {
           dlog(`${stag} skip empty getSessionState messages; preserving rendered history count=${messageCountRef.current} remote=${isRemoteConnected}`)
         }
@@ -2286,7 +2289,11 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
             return
           }
           dlog(`${stag} mount effect init failed: ${formatError(err, { sessionId })}`)
-          if (isRemoteConnected) retryTimer = setTimeout(() => { void initialize() }, retryBackoff.next())
+          setMessages(prev => [...prev.filter(m => m.id !== `sys-resume-failed-${sessionId}`), {
+            id: `sys-resume-failed-${sessionId}`, sessionId, role: 'system' as const,
+            content: `Session resume failed; retrying: ${message}`, timestamp: Date.now(),
+          }])
+          retryTimer = setTimeout(() => { void initialize() }, retryBackoff.next())
         }
       }
     }
@@ -2388,7 +2395,7 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
           : 'local remount'
         dlog(`${stag} ensureSessionStarted: ${attachKind}; clientResume for history sdkSessionId=${historySdkSessionId ? historySdkSessionId.slice(0, 8) : 'host-owned'}`)
         try {
-          await host.claude.clientResume(
+          const replay = await host.claude.clientResume(
             sessionId,
             historySdkSessionId,
             historyCwd,
@@ -2404,6 +2411,7 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
             effectiveEffort,
             effectiveUltracode ? true : undefined,
           )
+          setHistoryBefore((replay as { before?: number | null })?.before ?? null)
           if (isRemoteConnected) {
             remoteHistoryAttachedRef.current = true
           } else {
@@ -2457,6 +2465,7 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
             effectiveUltracode ? true : undefined,
             getAutoCompactWindowForModel(effectiveModel || savedModel, settingsStore.getSettings().autoCompactWindow),
           ) as ResumeSessionResult | null
+          setHistoryBefore((resumeResult as { before?: number | null })?.before ?? null)
           if (!resumeResult?.stale) {
             if (isRemoteConnected) {
               remoteHistoryAttachedRef.current = true
@@ -5444,6 +5453,24 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
             <div className="claude-load-more">
               <button className="claude-load-more-btn" onClick={loadNewerArchived} disabled={isLoadingMore}>{t('claude.loadNewerMessages')}</button>
               <button className="claude-load-more-btn" onClick={loadLatestArchived} disabled={isLoadingMore}>{t('claude.backToLatestMessages')}</button>
+            </div>
+          )}
+          {historyBefore !== null && (
+            <div className="claude-load-more">
+              <button className="claude-load-more-btn" disabled={isLoadingHistoryPage} onClick={async () => {
+                setIsLoadingHistoryPage(true)
+                try {
+                  const page = await host.claude.clientResume(sessionId, workspaceStore.getState().terminals.find(t => t.id === sessionId)?.sdkSessionId || '', cwd,
+                    undefined, undefined, undefined, undefined, undefined, undefined,
+                    undefined, undefined, undefined, undefined, undefined, historyBefore) as {
+                      items?: unknown[]; before?: number | null
+                    }
+                  setMessages(prev => dedupeMessagesById([...normalizeMessageItems(page.items || []), ...prev]))
+                  setHistoryBefore(page.before ?? null)
+                } catch (err) {
+                  host.debug.log(`History page failed: ${formatError(err, { sessionId })}`)
+                } finally { setIsLoadingHistoryPage(false) }
+              }}>Load older history</button>
             </div>
           )}
           {isResumingHistory && (

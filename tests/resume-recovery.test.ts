@@ -58,3 +58,14 @@ test('seen IDs are session isolated, bounded, and survive live window removal', 
   sessionA.clear()
   assert.equal(sessionA.size, 0)
 })
+
+
+test('one failed session advances only its own jittered retry gate', () => {
+  const sessionA = createBackoff(() => 0.5)
+  const sessionB = createBackoff(() => 0.5)
+  assert.equal(sessionA.next(), 500)
+  assert.equal(sessionA.next(), 1000)
+  assert.equal(sessionB.next(), 500)
+  sessionB.reset()
+  assert.equal(sessionA.next(), 2000)
+})

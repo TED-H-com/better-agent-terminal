@@ -2015,6 +2015,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         await ensureSessionStarted()
         retryBackoff.reset()
         if (cancelled) return
+        setMessages(prev => prev.filter(m => m.id !== `sys-resume-failed-${sessionId}`))
         const existingState = await host.claude.getSessionState(sessionId)
         if (cancelled || !existingState) return
         const existingMessages = normalizeMessageItems(existingState.messages)
@@ -2092,7 +2093,11 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
             return
           }
           dlog(`${stag} mount effect init failed: ${formatError(err, { sessionId })}`)
-          if (isRemoteConnected) retryTimer = setTimeout(() => { void initialize() }, retryBackoff.next())
+          setMessages(prev => [...prev.filter(m => m.id !== `sys-resume-failed-${sessionId}`), {
+            id: `sys-resume-failed-${sessionId}`, sessionId, role: 'system' as const,
+            content: `Session resume failed; retrying: ${message}`, timestamp: Date.now(),
+          }])
+          retryTimer = setTimeout(() => { void initialize() }, retryBackoff.next())
         }
       }
     }

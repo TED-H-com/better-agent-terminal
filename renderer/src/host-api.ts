@@ -1152,10 +1152,12 @@ function createTauriHost(): BatAppAPI {
             permissionMode?: string,
             effort?: string,
             ultracode?: boolean,
+            historyBefore?: number,
           ) => getInvoke()<unknown>('claude_client_resume', {
             sessionId,
             sdkSessionId,
             options: await attachWorkspaceIdentity(sessionId, {
+              ...(historyBefore !== undefined ? { historyBefore } : {}),
               cwd,
               model,
               apiVersion,
