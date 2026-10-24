@@ -22,6 +22,10 @@ nul
 # Diagnosis reports
 tests/*.json
 
+# E2E test reports
+playwright-report/
+test-results/
+
 # Bundled Node runtime (fetched per-platform via scripts/fetch-node-runtime.mjs).
 # We track the dir itself + its docs so the Tauri bundle.resources entry
 # resolves, but the actual binaries are too large + platform-specific to commit.
