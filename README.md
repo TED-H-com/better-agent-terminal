@@ -364,6 +364,8 @@ pnpm run tauri:build:debug  # Local unsigned package
 
 ## Architecture
 
+See [docs/architecture/index.md](docs/architecture/index.md) for detailed documentation on the process model, Claude Code integration hooks, and workspace session management.
+
 ```
 better-agent-terminal/
 ├── renderer/                          # React renderer running inside the Tauri webview
