@@ -381,6 +381,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bat-error-log"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "regex",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "bat-filesystem"
 version = "0.1.0"
 dependencies = [
@@ -467,6 +477,7 @@ dependencies = [
  "bat-accounts",
  "bat-agent-bridge",
  "bat-app-storage",
+ "bat-error-log",
  "bat-filesystem",
  "bat-git",
  "bat-host-support",

@@ -49,6 +49,7 @@ serde_json = "1"
 # headless Linux hosts (issue #117). The headless build is being stood up
 # incrementally; until it lands, every supported build keeps `desktop` on.
 [dependencies]
+bat-error-log = { path = "crates/bat-error-log" }
 bat-accounts = { path = "crates/bat-accounts" }
 bat-agent-bridge = { path = "crates/bat-agent-bridge" }
 bat-app-storage = { path = "crates/bat-app-storage" }

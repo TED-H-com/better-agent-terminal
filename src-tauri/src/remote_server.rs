@@ -1209,6 +1209,7 @@ fn run_accept_loop(
                             active_invokes,
                             spawn_peer.clone(),
                         ) {
+                            bat_error_log::log("error", "server.ws.error", &err);
                             remote_debug_log(
                                 &client_ctx,
                                 format!("client closed peer={spawn_peer} error={err}"),
@@ -1230,6 +1231,7 @@ fn run_accept_loop(
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => {
+                bat_error_log::log("error", "server.accept.error", &err.to_string());
                 // Resource pressure (for example EMFILE/ENFILE) is recoverable.
                 // Keep the listener alive and retry instead of leaving a headless
                 // process parked forever with a dead accept loop.
@@ -1388,7 +1390,11 @@ fn handle_client(
             {
                 continue;
             }
-            Err(_) => break,
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
+            Err(err) => {
+                bat_error_log::log("error", "server.ws.error", &err.to_string());
+                break;
+            }
         };
         let frame = match msg {
             Message::Text(text)
@@ -1648,6 +1654,9 @@ fn handle_client(
                             json!({ "type": "invoke-result", "id": id, "result": value })
                         }
                         Err(err) => {
+                            if channel == "claude:start-session" {
+                                bat_error_log::log("error", "session.spawn_failed", &err);
+                            }
                             remote_debug_log(
                                 &invoke_app,
                                 format!(
