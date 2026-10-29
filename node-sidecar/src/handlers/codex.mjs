@@ -5,6 +5,8 @@
 // handlers delegate here for codex-agent / codex-agent-worktree presets.
 // Runtime ownership stays below the renderer contract.
 
+import { readHistoryPage, boundHistoryItems, HISTORY_PAGE_MAX_BYTES } from '../lib/history-page.mjs'
+import { open } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir, homedir } from 'node:os'
@@ -370,8 +372,17 @@ async function findSessionLog(threadId) {
   return null
 }
 
+export async function readCodexHead(file) {
+  const handle = await open(file, 'r')
+  try {
+    const buffer = Buffer.alloc(64 * 1024)
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+    return buffer.subarray(0, bytesRead).toString('utf8')
+  } finally { await handle.close() }
+}
+
 async function readSessionIdFromLog(file) {
-  const content = await readFile(file, 'utf-8').catch(() => '')
+  const content = await readCodexHead(file).catch(() => '')
   for (const line of content.split('\n')) {
     if (!line.trim()) continue
     try {
@@ -397,13 +408,32 @@ function normalizeCodexCwdForMatch(value) {
   return normalized
 }
 
-async function readSessionLines(threadId) {
-  const file = await findSessionLog(threadId)
-  if (!file) return []
-  const content = await readFile(file, 'utf-8').catch(() => '')
-  return content.split('\n').filter(Boolean).map(line => {
-    try { return JSON.parse(line) } catch { return null }
-  }).filter(Boolean)
+export async function readCodexHistoryPage(file, sessionId, before) {
+  const page = await readHistoryPage(file, { before })
+  let position = page.start
+  let items = []
+  for (const line of page.raw.split('\n')) {
+    const at = position
+    position += Buffer.byteLength(line) + 1
+    let entry
+    try { entry = JSON.parse(line) } catch { continue }
+    if (entry.type !== 'event_msg') continue
+    const payload = entry.payload || {}
+    const role = payload.type === 'user_message' ? 'user' : payload.type === 'agent_message' ? 'assistant' : null
+    if (!role || typeof payload.message !== 'string') continue
+    const ts = Date.parse(entry.timestamp)
+    items.push({ id: `hist-${role}-${at}`, sessionId, role, content: payload.message, timestamp: Number.isFinite(ts) ? ts : 0 })
+  }
+  if (page.gap) items.push({ id: page.gap.id, sessionId, role: 'system', content: '[History gap: record exceeds history byte window]', timestamp: 0, historyGap: page.gap })
+  items = boundHistoryItems(items, sessionId)
+  let bytes = 0
+  items = items.map(item => {
+    const size = Buffer.byteLength(JSON.stringify(item))
+    if (bytes + size >= HISTORY_PAGE_MAX_BYTES - 128 * 1024) return { id: item.id, sessionId, role: 'system', timestamp: 0, content: '[History gap: page byte budget exceeded]', historyGap: { sizeBytes: size } }
+    bytes += size
+    return item
+  })
+  return { items, before: page.before, hasMore: page.hasMore, bytesRead: page.bytesRead }
 }
 
 export async function listCodexSessions(cwd = '', root = codexSessionsRoot()) {
@@ -413,7 +443,7 @@ export async function listCodexSessions(cwd = '', root = codexSessionsRoot()) {
     try {
       const st = await stat(file)
       const fallbackId = file.replace(/\.jsonl$/, '').split(/[\\/]/).pop() || ''
-      const content = await readFile(file, 'utf-8').catch(() => '')
+      const content = await readCodexHead(file)
       let id = ''
       let sessionCwd = ''
       let preview = ''
@@ -451,21 +481,13 @@ async function codexThreadExists(threadId) {
 async function loadHistory(sessionId, threadId) {
   send('claude:resume-loading', sessionId, 'loading', true)
   try {
-    const lines = await readSessionLines(threadId)
-    const items = []
-    for (const entry of lines) {
-      const ts = entry.timestamp ? Date.parse(entry.timestamp) : Date.now()
-      if (entry.type !== 'event_msg') continue
-      const payload = entry.payload || {}
-      if (payload.type === 'user_message' && typeof payload.message === 'string') {
-        items.push({ id: `hist-user-${items.length}`, sessionId, role: 'user', content: payload.message, timestamp: Number.isFinite(ts) ? ts : Date.now() })
-      } else if (payload.type === 'agent_message' && typeof payload.message === 'string') {
-        items.push({ id: `hist-assistant-${items.length}`, sessionId, role: 'assistant', content: payload.message, timestamp: Number.isFinite(ts) ? ts : Date.now() })
-      }
-    }
+    const file = await findSessionLog(threadId)
+    const page = file ? await readCodexHistoryPage(file, sessionId) : { items: [], before: null, hasMore: false }
+    const items = page.items
     const s = sessions.get(sessionId)
     if (s) s.state.messages = items.slice(-300)
     send('claude:history', sessionId, 'items', items)
+    return { before: page.before, hasMore: page.hasMore }
   } finally {
     send('claude:resume-loading', sessionId, 'loading', false)
   }
@@ -571,6 +593,11 @@ export async function resumeCodexSession(params) {
   const threadId = params?.sdkSessionId
   if (typeof sessionId !== 'string' || !sessionId) throw new Error('codex.resumeSession: missing sessionId')
   if (typeof threadId !== 'string' || !threadId) throw new Error('codex.resumeSession: missing thread id')
+  const before = params?.options?.historyBefore
+  if (before !== undefined && before !== null) {
+    const file = await findSessionLog(sdkThreadIds.get(sessionId) || threadId)
+    return file ? { ok: true, ...await readCodexHistoryPage(file, sessionId, before) } : { ok: true, items: [], before: null, hasMore: false }
+  }
   const canResume = await codexThreadExists(threadId)
   if (!canResume) {
     const existing = sessions.get(sessionId)
@@ -593,9 +620,10 @@ export async function resumeCodexSession(params) {
       s.threadId = threadId
       s.metadata.sdkSessionId = threadId
     }
-    await loadHistory(sessionId, threadId).catch(err => {
+    const history = await loadHistory(sessionId, threadId).catch(err => {
       logWarn(`[codex:${sessionId.slice(0, 8)}] load history failed: ${stringifyCodexError(err)}`)
     })
+    Object.assign(result, history)
   } else {
     send('claude:resume-loading', sessionId, 'loading', false)
   }

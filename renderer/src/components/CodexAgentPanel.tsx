@@ -682,6 +682,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
   }, [awaitingUser, noteAgentEvent])
   // Message archiving — keep renderer memory bounded
   const [loadedArchive, setLoadedArchive] = useState<MessageItem[]>([])
+  const [historyBefore, setHistoryBefore] = useState<number | null>(null)
+  const [isLoadingHistoryPage, setIsLoadingHistoryPage] = useState(false)
   const [hasMoreArchived, setHasMoreArchived] = useState(false)
   const [isLoadingMore, setIsLoadingMore] = useState(false)
   const archivedCountRef = useRef(0)
@@ -1789,6 +1791,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         historyItemsReceivedRef.current = false
         resetSubagentState()
         setMessages([])
+        setHistoryBefore(null)
         resetArchivePage()
         setLoadedArchive([])
         autoLoadedArchiveSessionRef.current = null
@@ -2050,6 +2053,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           loadedFromArchiveRef.current === 0
         ) {
           setMessages([])
+          setHistoryBefore(null)
         } else if (host.debug.isDebugMode === true) {
           dlog(`${stag} skip empty getSessionState messages; preserving rendered history/archive count=${messageCountRef.current}/${archivedCountRef.current}`)
         }
@@ -2159,6 +2163,9 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       const existingState = await host.claude.getSessionState(sessionId)
       if (existingState) {
         dlog(`${stag} ensureSessionStarted: existing session`)
+        const replay = await host.claude.clientResume(sessionId, savedSdkSessionId || '', cwd,
+          undefined, undefined, undefined, undefined, undefined, terminalState?.agentPreset) as { before?: number | null }
+        setHistoryBefore(replay?.before ?? null)
         return
       }
 
@@ -2185,7 +2192,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
             permissionMode,
             effectiveEffort,
             effectiveUltracode ? true : undefined,
-          ) as { stale?: boolean } | null
+          ) as { stale?: boolean; before?: number | null } | null
+          setHistoryBefore(resumeResult?.before ?? null)
           if (!resumeResult?.stale) return
           dlog(`${stag} ensureSessionStarted: stale sdkSessionId=${savedSdkSessionId.slice(0, 8)}; starting fresh session`)
           workspaceStore.setTerminalSdkSessionId(sessionId, undefined)
@@ -2505,6 +2513,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     historyItemsReceivedRef.current = false
     autoLoadedArchiveSessionRef.current = null
     setMessages([])
+    setHistoryBefore(null)
     resetArchivePage()
     setLoadedArchive([])
     archivedCountRef.current = 0
@@ -2524,7 +2533,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     const resumeUsesWorktree = terminal?.agentPreset === 'codex-agent-worktree' || !!terminal?.worktreePath
     const resumeModel = currentModel || settingsStore.getSettings().defaultCodexModel || DEFAULT_CODEX_MODEL
     const resumeEffort = isCodexSession ? effortLevel : (effortLevelForClaudeMode(effortLevel) || 'high')
-    await host.claude.resumeSession(
+    const resumePage = await host.claude.resumeSession(
       sessionId,
       sdkSessionId,
       cwd,
@@ -2540,6 +2549,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       resumeEffort,
       !isCodexSession && isUltracodeEffortMode(effortLevel) ? true : undefined,
     )
+    setHistoryBefore((resumePage as { before?: number | null })?.before ?? null)
     workspaceStore.setTerminalSdkSessionId(sessionId, sdkSessionId)
   }, [sessionId, cwd, isV2Session, terminal?.agentPreset, terminal?.worktreePath, terminal?.worktreeBranch, currentModel, codexSandboxMode, codexApprovalPolicy, permissionMode, effortLevel, resetSubagentState])
 
@@ -2854,6 +2864,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       historyItemsReceivedRef.current = false
       autoLoadedArchiveSessionRef.current = null
       setMessages([])
+      setHistoryBefore(null)
       resetArchivePage()
       setLoadedArchive([])
       archivedCountRef.current = 0
@@ -4901,6 +4912,22 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
             setContextMenu({ x: e.clientX, y: e.clientY, kind: 'messages' })
           }}
         >
+          {historyBefore !== null && (
+            <div className="claude-load-more">
+              <button className="claude-load-more-btn" disabled={isLoadingHistoryPage} onClick={async () => {
+                setIsLoadingHistoryPage(true)
+                try {
+                  const page = await host.claude.clientResume(sessionId,
+                    workspaceStore.getState().terminals.find(t => t.id === sessionId)?.sdkSessionId || '', cwd,
+                    undefined, undefined, undefined, undefined, undefined, terminal?.agentPreset,
+                    undefined, undefined, undefined, undefined, undefined, historyBefore) as { items?: unknown[]; before?: number | null }
+                  setMessages(prev => dedupeMessagesById([...normalizeMessageItems(page.items || []), ...prev]))
+                  setHistoryBefore(page.before ?? null)
+                } catch (err) { host.debug.log(`Codex history page failed: ${String(err)}`) }
+                finally { setIsLoadingHistoryPage(false) }
+              }}>Load older history</button>
+            </div>
+          )}
           {(hasMoreArchived || isLoadingMore) && (
             <div className="claude-load-more">
               <button

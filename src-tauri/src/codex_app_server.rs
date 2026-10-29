@@ -22,7 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::hash::Hasher;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2257,7 +2257,13 @@ fn codex_sessions_root(app: &HostContext) -> Option<PathBuf> {
 }
 
 fn read_session_meta_id(path: &Path) -> Option<String> {
-    let content = fs::read_to_string(path).ok()?;
+    let mut content = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_end(&mut content)
+        .ok()?;
+    let content = String::from_utf8_lossy(&content);
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -2407,11 +2413,28 @@ fn push_history_message(
     items.push(message);
 }
 
+#[cfg(test)]
 fn codex_history_items_from_content(session_id: &str, content: &str) -> Vec<Value> {
+    codex_history_items_from_content_at(session_id, content, None)
+}
+
+fn codex_history_items_from_content_at(
+    session_id: &str,
+    content: &str,
+    base: Option<u64>,
+) -> Vec<Value> {
     let mut items = Vec::new();
     let mut unmatched_messages = Vec::new();
     let mut turn_id = String::new();
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+    let mut byte_offset = 0u64;
+    for line in content.split_inclusive('\n') {
+        let fallback_index = base
+            .map(|base| (base + byte_offset) as usize)
+            .unwrap_or(items.len());
+        byte_offset += line.len() as u64;
+        if line.trim().is_empty() {
+            continue;
+        }
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -2446,7 +2469,7 @@ fn codex_history_items_from_content(session_id: &str, content: &str) -> Vec<Valu
                         .filter(|message| !message.trim().is_empty())
                     {
                         let message = json!({
-                            "id": format!("hist-{role}-{}", items.len()),
+                            "id": format!("hist-{role}-{fallback_index}"),
                             "sessionId": session_id,
                             "role": role,
                             "content": message,
@@ -2567,7 +2590,7 @@ fn codex_history_items_from_content(session_id: &str, content: &str) -> Vec<Valu
                             .and_then(Value::as_str)
                             .filter(|id| !id.is_empty())
                             .map(str::to_string)
-                            .unwrap_or_else(|| format!("hist-{id_prefix}-{}", items.len()));
+                            .unwrap_or_else(|| format!("hist-{id_prefix}-{fallback_index}"));
                         let message = json!({
                             "id": id,
                             "sessionId": session_id,
@@ -2586,7 +2609,7 @@ fn codex_history_items_from_content(session_id: &str, content: &str) -> Vec<Valu
                             .and_then(Value::as_str)
                             .filter(|id| !id.is_empty())
                             .map(str::to_string)
-                            .unwrap_or_else(|| format!("hist-reasoning-{}", items.len()));
+                            .unwrap_or_else(|| format!("hist-reasoning-{fallback_index}"));
                         items.push(json!({
                             "id": id,
                             "sessionId": session_id,
@@ -2864,16 +2887,70 @@ fn history_event_result(payload: &Value) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn load_codex_history_items(app: &HostContext, session_id: &str, thread_id: &str) -> Vec<Value> {
+fn bound_codex_history(items: Vec<Value>, session_id: &str) -> Vec<Value> {
+    let mut bytes = 0;
+    items.into_iter().map(|item| {
+        let size = serde_json::to_vec(&item).map(|b| b.len()).unwrap_or(usize::MAX);
+        if size > 1600 * 1024 || bytes + size > 1600 * 1024 {
+            let gap = json!({ "id": item["id"], "sessionId": session_id, "role": "system", "timestamp": 0,
+                "content": format!("[History gap: oversized history item omitted ({size} bytes)]"),
+                "historyGap": { "id": item["id"], "sizeBytes": size } });
+            bytes += serde_json::to_vec(&gap).unwrap().len();
+            gap
+        } else { bytes += size; item }
+    }).collect()
+}
+
+fn codex_history_page(
+    app: &HostContext,
+    session_id: &str,
+    thread_id: &str,
+    before: Option<u64>,
+) -> Value {
+    let empty = json!({ "items": [], "before": null, "hasMore": false });
     let Some(root) = codex_sessions_root(app) else {
-        return Vec::new();
+        return empty;
     };
     let Some(path) = find_codex_session_log(&root, thread_id) else {
-        return Vec::new();
+        return empty;
     };
-    fs::read_to_string(path)
-        .map(|content| codex_history_items_from_content(session_id, &content))
-        .unwrap_or_default()
+    codex_history_page_from_path(&path, session_id, before).unwrap_or(empty)
+}
+
+fn codex_history_page_from_path(
+    path: &Path,
+    session_id: &str,
+    before: Option<u64>,
+) -> Option<Value> {
+    let (mut raw, mut cursor, _) = crate::transcript_file::tail(path, before).ok()?;
+    loop {
+        let mut items =
+            codex_history_items_from_content_at(session_id, &raw, Some(cursor.unwrap_or(0)));
+        let size = serde_json::to_vec(&items).ok()?.len();
+        if size >= 1800 * 1024 {
+            // Move the exclusive older cursor to the first retained line,
+            // rather than dropping ordinary records to satisfy the wire cap.
+            let content = raw.trim_end_matches('\n');
+            let cut = content
+                .as_bytes()
+                .iter()
+                .enumerate()
+                .find(|(i, b)| *i >= content.len() / 2 && **b == b'\n')
+                .map(|(i, _)| i + 1)
+                .or_else(|| content.find('\n').map(|i| i + 1));
+            if let Some(cut) = cut {
+                cursor = Some(cursor.unwrap_or(0) + cut as u64);
+                raw = raw[cut..].to_owned();
+                continue;
+            }
+            items = bound_codex_history(items, session_id);
+        }
+        if raw.is_empty() && cursor.is_some() {
+            items.push(json!({ "id": format!("hist-gap-{}", cursor.unwrap()), "sessionId": session_id,
+                "role": "system", "timestamp": 0, "content": "[History gap: record exceeds history byte window]" }));
+        }
+        return Some(json!({ "items": items, "before": cursor, "hasMore": cursor.is_some() }));
+    }
 }
 
 fn item_type(item: &Value) -> Option<&str> {
@@ -5355,12 +5432,44 @@ impl CodexAppServerState {
         let (thread_id, meta, messages) = {
             let sessions = self.inner.sessions.lock().expect("codex sessions lock");
             let session = sessions.get(session_id)?;
-            (session.thread_id.clone(), session.metadata(), session.messages.clone())
+            (
+                session.thread_id.clone(),
+                session.metadata(),
+                session.messages.clone(),
+            )
         };
-        emit(app, "claude:history", session_id, "items", json!(messages));
+        let page = thread_id
+            .as_deref()
+            .map(|id| codex_history_page(app, session_id, id, None));
+        let mut history = page
+            .as_ref()
+            .and_then(|p| p["items"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        // Preserve live rows (including an active turn) after the disk window.
+        // Loading the window too ensures the older-page cursor skips no rows.
+        let mut ids: HashSet<String> = history
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(str::to_owned))
+            .collect();
+        history.extend(messages.into_iter().filter(|item| {
+            item["id"]
+                .as_str()
+                .map(|id| ids.insert(id.to_owned()))
+                .unwrap_or(true)
+        }));
+        emit(
+            app,
+            "claude:history",
+            session_id,
+            "items",
+            json!(bound_codex_history(history, session_id)),
+        );
         emit(app, "claude:status", session_id, "meta", meta);
         Some(json!({ "ok": true, "sessionId": session_id,
-            "sdkSessionId": thread_id, "alreadyLive": true }))
+    "sdkSessionId": thread_id, "alreadyLive": true,
+    "before": page.as_ref().and_then(|p| p.get("before")),
+    "hasMore": page.as_ref().and_then(|p| p.get("hasMore")) }))
     }
 
     /// Reopening a client view reads the host-owned thread and its settings.
@@ -5375,6 +5484,12 @@ impl CodexAppServerState {
         let operation_lock = self.turn_operation_lock(&session_id);
         let _guard = operation_lock.lock()
             .map_err(|_| bridge_error("Codex turn operation lock poisoned"))?;
+        if let Some(before) = options.as_ref().and_then(|o| o.get("historyBefore")).filter(|v| !v.is_null()) {
+            let before = before.as_u64().ok_or_else(|| bridge_error("Invalid history cursor"))?;
+            let thread_id = self.inner.sessions.lock().expect("codex sessions lock")
+                .get(&session_id).and_then(|s| s.thread_id.clone()).unwrap_or(sdk_session_id.clone());
+            return Ok(codex_history_page(app, &session_id, &thread_id, Some(before)));
+        }
         if let Some(existing) = self.attach_existing_session(app, &session_id) {
             return Ok(existing);
         }
@@ -5619,7 +5734,8 @@ impl CodexAppServerState {
         if let Some(payload) = worktree_payload(&options) {
             emit(app, "claude:worktree-info", &session_id, "payload", payload);
         }
-        let history_items = load_codex_history_items(app, &session_id, &sdk_session_id);
+        let history_page = codex_history_page(app, &session_id, &sdk_session_id, None);
+        let history_items = history_page["items"].as_array().cloned().unwrap_or_default();
         log_codex(
             app,
             &session_id,
@@ -5657,7 +5773,7 @@ impl CodexAppServerState {
             "loading",
             json!(false),
         );
-        Ok(json!({ "ok": true, "sessionId": session_id, "sdkSessionId": sdk_session_id }))
+        Ok(json!({ "ok": true, "sessionId": session_id, "sdkSessionId": sdk_session_id, "before": history_page["before"], "hasMore": history_page["hasMore"] }))
     }
 
     fn begin_native_input(&self, session_id: &str) -> Result<NativeInputGuard, BridgeError> {
@@ -8354,6 +8470,54 @@ fn handle_turn_completed(
 
 #[cfg(test)]
 mod tests {
+    fn large_codex_frames(mb: usize) {
+        let path = std::env::temp_dir().join(format!("bat-codex-{}-{mb}.jsonl", std::process::id()));
+        crate::transcript_file::tests::large_fixture(&path, mb, true);
+        let recent = codex_history_page_from_path(&path, "session", None).unwrap();
+        assert!(recent["hasMore"].as_bool().unwrap());
+        let older = codex_history_page_from_path(&path, "session", recent["before"].as_u64()).unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for page in [&recent, &older] {
+            assert!(!page["items"].as_array().unwrap().is_empty());
+            for item in page["items"].as_array().unwrap() {
+                assert!(ids.insert(item["id"].as_str().unwrap()));
+            }
+            let params = json!({ "sessionId":"session", "items":page["items"] });
+            let frame = json!({ "type":"event", "channel":"agent:history", "args":["session",page["items"]], "params":params });
+            assert!(
+                serde_json::to_vec(&frame).unwrap().len()
+                    < crate::remote_core::REMOTE_RESPONSE_MAX_BYTES
+            );
+        }
+        // The same record keeps its ID after an append shifts the tail window.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            f,
+            "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"new\"}}}}"
+        )
+        .unwrap();
+        let changed = codex_history_page_from_path(&path, "session", None).unwrap();
+        let last_id = recent["items"].as_array().unwrap().last().unwrap()["id"].clone();
+        assert!(changed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == last_id));
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn codex_frames_30mb() {
+        large_codex_frames(30);
+    }
+    #[test]
+    #[ignore = "generates a 500MB temporary rollout; run locally"]
+    fn codex_frames_500mb() {
+        large_codex_frames(500);
+    }
+
     use super::*;
     use std::env;
 

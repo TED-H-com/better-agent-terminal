@@ -1452,7 +1452,7 @@ fn read_codex_session_summary(path: &Path) -> Option<(String, String, String)> {
     let Ok(file) = fs::File::open(path) else {
         return None;
     };
-    let reader = BufReader::new(file);
+    let reader = BufReader::new(file.take(64 * 1024));
     let mut thread_id = String::new();
     let mut cwd = String::new();
     let mut preview = String::new();
@@ -2364,27 +2364,15 @@ pub(crate) fn load_archived_from_dir(
         }
         return json!({ "messages": [], "total": total, "hasMore": total > offset as usize, "promptIds": prompt_ids });
     }
-    let raw = match fs::read_to_string(archive_file_path(data_dir, session_id)) {
-        Ok(value) => value,
-        Err(_) => return archive_empty_page(),
-    };
-    let lines = raw
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    let total = lines.len();
-    let offset = offset as usize;
-    let limit = limit as usize;
-    let end = total.saturating_sub(offset);
-    if end == 0 {
-        return json!({ "messages": [], "total": total, "hasMore": false });
-    }
-    let start = end.saturating_sub(limit);
-    let messages = lines[start..end]
-        .iter()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .collect::<Vec<_>>();
-    json!({ "messages": messages, "total": total, "hasMore": start > 0 })
+    let (lines, total, has_more) = match crate::transcript_file::archive_page(
+        &archive_file_path(data_dir, session_id), offset as usize, limit as usize,
+    ) { Ok(page) => page, Err(_) => return archive_empty_page() };
+    let end = total.saturating_sub(offset as usize);
+    let start = end.saturating_sub(lines.len());
+    let messages = lines.iter().filter_map(|line| serde_json::from_str::<Value>(line).ok()).collect::<Vec<_>>();
+    let mut page = json!({ "messages": messages, "total": total, "hasMore": has_more });
+    if start > end.saturating_sub(limit as usize) { page["start"] = json!(start); }
+    page
 }
 
 pub(crate) fn clear_archive_in_dir(data_dir: &Path, session_id: &str) -> bool {
@@ -5656,6 +5644,30 @@ pub async fn claude_enable_all_project_mcp(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_listing_never_scans_past_head_budget() {
+        let path = std::env::temp_dir().join(format!("bat-codex-head-{}.jsonl", std::process::id()));
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session_meta", "payload":{"id":"thread-head", "cwd":"/repo"}})
+        )
+        .unwrap();
+        writeln!(file, "{}", " ".repeat(128 * 1024)).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"event_msg", "payload":{"type":"user_message", "message":"must not be read"}})
+        )
+        .unwrap();
+        let (id, cwd, preview) = read_codex_session_summary(&path).unwrap();
+        assert_eq!(id, "thread-head");
+        assert_eq!(cwd, "/repo");
+        assert!(preview.is_empty());
+        fs::remove_file(path).unwrap();
+    }
+
     use super::*;
     use std::env;
     use std::time::{SystemTime, UNIX_EPOCH};
