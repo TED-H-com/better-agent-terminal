@@ -50,7 +50,7 @@ export function transcriptArchivePrefix<T extends { status?: string }>(items: re
   return items.slice(0, excess)
 }
 
-export interface ArchiveResult { messages: unknown[]; total: number; hasMore: boolean; promptIds?: string[] }
+export interface ArchiveResult { messages: unknown[]; total: number; hasMore: boolean; promptIds?: string[]; start?: number }
 export interface ArchivePage<T> { items: T[]; start: number; end: number; total: number }
 type ArchiveLoader = (offset: number, limit: number) => Promise<ArchiveResult>
 
@@ -69,7 +69,13 @@ export async function readArchivePage<T>(load: ArchiveLoader, normalize: (items:
     if (wantedEnd !== undefined && nextTotal !== total) { total = nextTotal; continue }
     total = nextTotal
     const end = Math.max(0, total - offset)
-    const start = Math.max(0, end - limit)
+    const start = typeof result.start === 'number' ? Math.max(0, Math.min(end, result.start)) : Math.max(0, end - limit)
+    // A byte-bounded host may return a shorter suffix than requested. Retry
+    // forward navigation with that row count to retain the requested anchor.
+    if (request.start !== undefined && start > request.start) {
+      limit = Math.max(1, end - start)
+      continue
+    }
     const items = normalize(result.messages || [])
     const fitting = fittingTranscriptCount(items, request.start !== undefined)
     if (fitting < items.length) { limit = Math.max(1, fitting); continue }

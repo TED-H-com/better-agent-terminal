@@ -46,6 +46,24 @@ pub fn guard_remote_invoke_response(response: Value) -> Value {
     })
 }
 
+/// Final transport cap, including legacy args and before compression. Normal
+/// history producers page before reaching this safety net.
+pub fn guard_remote_outbound_frame(frame: Value) -> Value {
+    let frame = guard_remote_history_event(frame);
+    if serialized_response_size(&frame) < REMOTE_RESPONSE_MAX_BYTES {
+        return frame;
+    }
+    if frame.get("type").and_then(Value::as_str) == Some("event") {
+        return json!({ "type": "event", "channel": "remote:payload-too-large",
+            "params": { "channel": frame["channel"].as_str().unwrap_or("").chars().take(256).collect::<String>(), "maxBytes": REMOTE_RESPONSE_MAX_BYTES }, "args": [] });
+    }
+    let response = guard_remote_invoke_response(frame);
+    if serialized_response_size(&response) >= REMOTE_RESPONSE_MAX_BYTES {
+        return json!({ "type": "invoke-error", "id": null, "code": "REMOTE_RESPONSE_TOO_LARGE", "error": "Remote response envelope exceeds the size budget" });
+    }
+    response
+}
+
 // Safety net for histories from other runtimes and relayed hosts. Ordinary
 // Claude pages are budgeted by their producer, with cursors, before this point.
 pub fn guard_remote_history_event(mut frame: Value) -> Value {

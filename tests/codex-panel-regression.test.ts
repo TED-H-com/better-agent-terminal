@@ -133,7 +133,7 @@ async function main() {
   }
   assert.match(
     source,
-    /const resumeResult = await host\.claude\.resumeSession\([\s\S]*effectiveModel \|\| savedModel[\s\S]*permissionMode,\s*effectiveEffort[\s\S]*\) as \{ stale\?: boolean \} \| null/,
+    /const resumeResult = await host\.claude\.resumeSession\([\s\S]*effectiveModel \|\| savedModel[\s\S]*permissionMode,\s*effectiveEffort[\s\S]*\) as \{ stale\?: boolean; before\?: number \| null \} \| null/,
     'Codex auto-resume should preserve effective model, permission mode, and effort',
   )
   assert.match(

@@ -25,6 +25,7 @@ mod async_rt;
 mod claude_usage;
 mod codex_app_server;
 mod codex_auth;
+mod transcript_file;
 mod commands;
 mod event_hub;
 mod host_context;

@@ -66,7 +66,7 @@ const REMOTE_RESOURCE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_REMOTE_CONNECTIONS: usize = 64;
 const MAX_REMOTE_INVOKES: usize = 128;
 const REMOTE_OUTBOUND_QUEUE_CAPACITY: usize = 256;
-const REMOTE_OUTBOUND_BURST: usize = 64;
+const REMOTE_OUTBOUND_BURST: usize = 1;
 struct ClaudeRemoteLoginClaim {
     touched: Instant,
     login_id: Option<String>,
@@ -792,6 +792,15 @@ fn flush_remote_event_buffer(
     }
 }
 
+thread_local! { static INVOKE_PRODUCER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+struct InvokeProducerGuard(bool);
+impl InvokeProducerGuard {
+    fn enter() -> Self { Self(INVOKE_PRODUCER.with(|v| v.replace(true))) }
+}
+impl Drop for InvokeProducerGuard {
+    fn drop(&mut self) { INVOKE_PRODUCER.with(|v| v.set(self.0)); }
+}
+
 fn send_remote_event_to_clients(
     clients: &Arc<Mutex<Vec<RemoteClientRecord>>>,
     channel: &str,
@@ -806,24 +815,43 @@ fn send_remote_event_to_clients(
     let params = sanitized.as_ref();
     let args = event_params_to_legacy_v1_args(channel, params);
     let agent_channel = remote_agent_channel(channel);
+    // Never wait for a peer while holding the global clients lock: the WS
+    // loop needs that lock during authentication/disconnect as well.
+    let targets = clients
+        .lock()
+        .map(|clients| {
+            clients
+                .iter()
+                .map(|c| (c.tx.clone(), c.close.clone(), c.contexts.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for (tx, close, contexts) in targets {
+        if close.load(Ordering::Acquire) {
+            continue;
+        }
+        contexts.local_event(channel, params);
+        if contexts.has_contexts() && channel != "profile:changed" {
+            continue;
+        }
+        if canonical_remote_channel(channel) == "claude:sync-event"
+            && !contexts.accepts_root_sync(params)
+        {
+            continue;
+        }
+        let frame =
+            json!({ "type": "event", "channel": agent_channel, "params": params, "args": args });
+        if canonical_remote_channel(channel) == "claude:history"
+            && INVOKE_PRODUCER.with(|v| v.get())
+        {
+            queue_invoke_remote_frame(&tx, &close, frame);
+        } else {
+            try_queue_remote_frame(&tx, &close, frame);
+        }
+    }
     if let Ok(mut clients) = clients.lock() {
-        clients.retain(|client| {
-            client.contexts.local_event(channel, params);
-            if client.contexts.has_contexts() && channel != "profile:changed" {
-                return !client.close.load(Ordering::Acquire);
-            }
-            if canonical_remote_channel(channel) == "claude:sync-event" && !client.contexts.accepts_root_sync(params) {
-                return !client.close.load(Ordering::Acquire);
-            }
-            let frame = json!({
-                "type": "event",
-                "channel": agent_channel.clone(),
-                "params": params.clone(),
-                "args": args.clone(),
-            });
-            try_queue_remote_frame(&client.tx, &client.close, frame)
-        });
-    };
+        clients.retain(|c| !c.close.load(Ordering::Acquire));
+    }
 }
 
 fn try_queue_remote_frame(
@@ -840,6 +868,33 @@ fn try_queue_remote_frame(
             // drop the socket on its next poll.
             close.store(true, Ordering::Release);
             false
+        }
+    }
+}
+
+// Invoke producers may wait for the connection loop; broadcasts must never
+// block the shared event hub. A deadline still bounds an unread peer.
+fn queue_invoke_remote_frame(
+    tx: &mpsc::SyncSender<Value>,
+    close: &Arc<AtomicBool>,
+    frame: Value,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut frame = guard_remote_history_event(frame);
+    loop {
+        if close.load(Ordering::Acquire) {
+            return false;
+        }
+        match tx.try_send(frame) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Full(pending)) if Instant::now() < deadline => {
+                frame = pending;
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => {
+                close.store(true, Ordering::Release);
+                return false;
+            }
         }
     }
 }
@@ -1199,6 +1254,7 @@ fn run_accept_loop(
 struct DeadlineTcpStream {
     socket: TcpStream,
     deadline: Option<Instant>,
+    poll_timeout: Duration,
 }
 
 impl DeadlineTcpStream {
@@ -1223,14 +1279,19 @@ impl DeadlineTcpStream {
 
 impl Read for DeadlineTcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let timeout = if self.deadline.is_some() {
-            REMOTE_HANDSHAKE_TIMEOUT
-        } else {
-            REMOTE_SOCKET_POLL_TIMEOUT
-        };
-        self.socket
-            .set_read_timeout(Some(self.timeout(timeout)?))?;
-        self.socket.read(buf)
+        loop {
+            let timeout = if self.deadline.is_some() {
+                REMOTE_HANDSHAKE_TIMEOUT
+            } else { self.poll_timeout };
+            self.socket.set_read_timeout(Some(self.timeout(timeout)?))?;
+            match self.socket.read(buf) {
+                // Linux may report an SO_RCVTIMEO expiry as EAGAIN just
+                // before the absolute login deadline. Keep enforcing that
+                // deadline rather than leaking a platform-specific timeout.
+                Err(err) if self.deadline.is_some() && matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => continue,
+                result => return result,
+            }
+        }
     }
 }
 
@@ -1277,6 +1338,7 @@ fn handle_client(
         DeadlineTcpStream {
             socket: stream,
             deadline: Some(Instant::now() + REMOTE_HANDSHAKE_TIMEOUT),
+            poll_timeout: REMOTE_SOCKET_POLL_TIMEOUT,
         },
     );
     let mut ws = accept_websocket_tls(tls)
@@ -1302,15 +1364,22 @@ fn handle_client(
             remote_debug_log(&ctx, format!("client revoked peer={peer}"));
             break;
         }
+        let mut sent_outbound = false;
         for _ in 0..REMOTE_OUTBOUND_BURST {
             match out_rx.try_recv() {
                 Ok(mut frame) => {
                     if mobile_tool_previews { crate::remote_tool_preview::compact(&mut frame); }
                     send_frame(&mut ws, frame, client_compression)?;
+                    sent_outbound = true;
                 }
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
+        // Keep checking inbound pings between large frames without limiting
+        // ordinary output to one frame per idle (200ms) socket timeout.
+        ws.get_mut().sock.poll_timeout = if sent_outbound {
+            Duration::from_millis(2)
+        } else { REMOTE_SOCKET_POLL_TIMEOUT };
         let msg = match ws.read() {
             Ok(msg) => msg,
             Err(tungstenite::Error::Io(err))
@@ -1555,7 +1624,10 @@ fn handle_client(
                     let event_close = invoke_close.clone();
                     let sink: ContextSink = Arc::new(move |frame| {
                         if !event_close.load(Ordering::Acquire) {
-                            try_queue_remote_frame(&event_tx, &event_close, frame);
+                            let is_history = frame.get("channel").and_then(Value::as_str)
+                                .map(|c| canonical_remote_channel(c) == "claude:history").unwrap_or(false);
+                            if is_history { queue_invoke_remote_frame(&event_tx, &event_close, frame); }
+                            else { try_queue_remote_frame(&event_tx, &event_close, frame); }
                         }
                     });
                     let result = invoke_with_profile_context(
@@ -1585,7 +1657,7 @@ fn handle_client(
                             json!({ "type": "invoke-error", "id": id, "error": err })
                         }
                     };
-                    let _ = try_queue_remote_frame(
+                    let _ = queue_invoke_remote_frame(
                         &invoke_tx,
                         &invoke_close,
                         guard_remote_invoke_response(response),
@@ -1699,6 +1771,96 @@ mod profile_context_integration_tests {
                 .starts_with("bat-profile-context-test-"));
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn history_burst_keeps_websocket_pongs_alive() {
+        use rustls::pki_types::ServerName;
+        use rustls::{ClientConfig, ClientConnection, RootCertStore};
+        let host = TestHost::new();
+        let cert = ensure_remote_certificate(&host.dir).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(cert.cert_der)).unwrap();
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let port = host.info["port"].as_u64().unwrap() as u16;
+        let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        tcp.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        let tls = StreamOwned::new(
+            ClientConnection::new(config, ServerName::try_from("localhost").unwrap()).unwrap(),
+            tcp,
+        );
+        let mut ws = tungstenite::client(format!("wss://localhost:{port}/"), tls)
+            .unwrap()
+            .0;
+        ws.send(Message::Text(
+            json!({"type":"auth", "id":"auth", "token":host.info["token"]})
+                .to_string()
+                .into(),
+        ))
+        .unwrap();
+        let auth = ws.read().unwrap().into_text().unwrap();
+        assert_eq!(decode_remote_text_frame(&auth).unwrap()["result"], true);
+        let clients = host
+            .server
+            .inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clients
+            .clone();
+        let producer = thread::spawn(move || {
+            let _scope = InvokeProducerGuard::enter();
+            for i in 0..600 {
+                send_remote_event_to_clients(
+                    &clients,
+                    "claude:history",
+                    &json!({"sessionId":"test", "items":[{"id":i,"content":"x".repeat(8192)}]}),
+                );
+            }
+        });
+        let (mut history, mut pongs) = (0, 0);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while history < 600 {
+            assert!(Instant::now() < deadline, "history/pongs must not stall");
+            let msg = ws.read().unwrap();
+            let Message::Text(text) = msg else {
+                continue;
+            };
+            assert!(text.len() < crate::remote_core::REMOTE_RESPONSE_MAX_BYTES);
+            let frame = decode_remote_text_frame(&text).unwrap();
+            if frame["type"] == "pong" {
+                pongs += 1;
+                ws.send(Message::Text(
+                    json!({"type":"ping","id":"heartbeat"}).to_string().into(),
+                ))
+                .unwrap();
+            } else if frame["channel"]
+                .as_str()
+                .map(|c| canonical_remote_channel(c) == "claude:history")
+                .unwrap_or(false)
+            {
+                assert_eq!(frame["params"]["items"][0]["id"], history);
+                history += 1;
+                if history == 100 {
+                    ws.send(Message::Text(
+                        json!({"type":"ping","id":"heartbeat"}).to_string().into(),
+                    ))
+                    .unwrap();
+                }
+            }
+        }
+        producer.join().unwrap();
+        assert!(
+            pongs > 10,
+            "heartbeat replies must interleave with queued history"
+        );
+        let _ = ws.close(None);
     }
 
     #[test]
@@ -2245,6 +2407,7 @@ fn invoke_with_profile_context(
     contexts: &ProfileContexts,
     sink: ContextSink,
 ) -> Result<Value, String> {
+    let _producer = InvokeProducerGuard::enter();
     let channel = canonical_remote_channel(channel);
     let args = frame
         .get("args")
@@ -4052,6 +4215,7 @@ fn send_frame<S: io::Read + io::Write>(
     frame: Value,
     compression: RemoteCompression,
 ) -> Result<(), String> {
+    let frame = crate::remote_core::guard_remote_outbound_frame(frame);
     match encode_remote_frame(&frame, compression)? {
         RemoteFramePayload::Text(text) => ws.send(Message::Text(text.into())),
         RemoteFramePayload::Binary(bytes) => ws.send(Message::Binary(bytes.into())),
@@ -4081,6 +4245,46 @@ fn protocol_name(protocol: RemoteProtocol) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invoke_history_backpressure_preserves_order_without_revoking_peer() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let close = Arc::new(AtomicBool::new(false));
+        let producer_close = close.clone();
+        let producer = thread::spawn(move || {
+            for i in 0..600 {
+                assert!(queue_invoke_remote_frame(
+                    &tx,
+                    &producer_close,
+                    json!({"type":"invoke-result", "id":i})
+                ));
+            }
+        });
+        for i in 0..600 {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap()["id"], i);
+        }
+        producer.join().unwrap();
+        assert!(!close.load(Ordering::Acquire));
+        let (tx, _rx) = mpsc::sync_channel(1);
+        tx.send(json!({})).unwrap();
+        assert!(!try_queue_remote_frame(&tx, &close, json!({})));
+        assert!(
+            close.load(Ordering::Acquire),
+            "broadcast overflow must still revoke unread peers"
+        );
+    }
+
+    #[test]
+    fn outbound_safety_net_caps_all_frame_kinds() {
+        for kind in ["event", "invoke-result"] {
+            let frame = json!({"type":kind, "channel":"agent:history", "params":{"sessionId":"s", "items":[{"content":"x".repeat(5*1024*1024)}]}, "result":"x".repeat(5*1024*1024)});
+            let capped = crate::remote_core::guard_remote_outbound_frame(frame);
+            assert!(
+                serde_json::to_vec(&capped).unwrap().len()
+                    < crate::remote_core::REMOTE_RESPONSE_MAX_BYTES
+            );
+        }
+    }
+
     use super::*;
 
     fn test_client_info(window_id: Option<&str>, label: &str) -> RemoteClientInfo {
@@ -4177,6 +4381,7 @@ mod tests {
         let mut stream = DeadlineTcpStream {
             socket,
             deadline: Some(Instant::now() + Duration::from_millis(100)),
+            poll_timeout: REMOTE_SOCKET_POLL_TIMEOUT,
         };
         let writer = thread::spawn(move || {
             for _ in 0..12 {

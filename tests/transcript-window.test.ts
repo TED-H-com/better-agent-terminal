@@ -55,6 +55,18 @@ async function main() {
   seen.push(...page.items.map(item => item.id))
   assert.deepEqual(seen, rows.map(item => item.id))
 
+  // Host byte limits can shorten a page before it reaches the renderer.
+  const boundedLoad = async (offset: number, limit: number) => {
+    const end = Math.max(0, rows.length - offset)
+    const start = Math.max(0, end - Math.min(limit, 2))
+    return { messages: rows.slice(start, end), total: rows.length, hasMore: start > 0, start }
+  }
+  const tail = await readArchivePage(boundedLoad, normalize, { total: rows.length, limit: 120 })
+  assert.equal(tail.start, rows.length - 2)
+  const forward = await readArchivePage(boundedLoad, normalize, { total: rows.length, start: 7, limit: 120 })
+  assert.equal(forward.start, 7)
+  assert.deepEqual(forward.items.map(item => item.id), ['7', '8'])
+
   const anchor = await readArchivePage(load, normalize, { total: rows.length, end: 80, limit: 20 })
   rows.push(row(500), row(501))
   const older = await readArchivePage(load, normalize, { total: anchor.total, end: anchor.start, limit: 20 })

@@ -3,6 +3,7 @@
 // loadArchived, clearArchive.
 
 import { readFile, appendFile, mkdir, readdir, unlink } from 'node:fs/promises'
+import { readArchivePage } from '../lib/archive-page.mjs'
 import { readHistoryPage, historyGap, boundHistoryItems, HISTORY_PAGE_MAX_BYTES } from '../lib/history-page.mjs'
 import { createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
@@ -588,18 +589,17 @@ function rememberId(seen, id) {
 function archivedIds(sessionId) {
   let pending = archivedIdsBySession.get(sessionId)
   if (!pending) {
-    pending = readFile(archiveFilePath(sessionId), 'utf-8').then(raw => {
+    pending = (async () => {
       const ids = new Set()
-      for (const line of raw.split('\n')) {
-        if (!line.trim()) continue
-        try {
-          const id = JSON.parse(line)?.id
-          if (typeof id === 'string') rememberId(ids, id)
-        } catch { /* malformed line — nothing to dedupe against */ }
-      }
-      return ids
-      // ENOENT simply means nothing has been archived yet.
-    }).catch(() => new Set())
+      const input = createReadStream(archiveFilePath(sessionId), { encoding: 'utf8' })
+      const reader = createInterface({ input, crlfDelay: Infinity })
+      try {
+        for await (const line of reader) {
+          try { const id = JSON.parse(line)?.id; if (typeof id === 'string') rememberId(ids, id) } catch { /* malformed row */ }
+        }
+        return ids
+      } finally { reader.close(); input.destroy() }
+    })().catch(() => new Set())
     archivedIdsBySession.set(sessionId, pending)
   }
   return pending
@@ -698,20 +698,11 @@ registerHandler('claude.loadArchived', async (params) => {
       input.destroy()
     }
   }
-  let raw
-  try {
-    raw = await readFile(archiveFilePath(sessionId), 'utf-8')
-  } catch {
-    return { messages: [], total: 0, hasMore: false }
-  }
-  const lines = raw.split('\n').filter(l => l.trim())
-  const total = lines.length
-  // Mirror Electron's tail-paging: load N items ending at (total - offset).
-  // Caller uses offset to skip already-loaded entries from the bottom.
-  const end = total - offset
-  let start = Math.max(0, end - limit)
-  if (end <= 0) return { messages: [], total, hasMore: false }
-  const slice = lines.slice(start, end)
+  let page
+  try { page = await readArchivePage(archiveFilePath(sessionId), offset, limit) }
+  catch { return { messages: [], total: 0, hasMore: false } }
+  const { lines: slice, total } = page
+  let start = page.start
   let messages = []
   for (const line of slice) {
     try { messages.push(JSON.parse(line)) } catch { /* drop malformed */ }
@@ -721,7 +712,8 @@ registerHandler('claude.loadArchived', async (params) => {
     messages.shift()
     start++
   }
-  return { messages, total, hasMore: start > 0 }
+  return { messages, total, hasMore: start > 0,
+    ...(start > Math.max(0, total - offset - limit) ? { start } : {}) }
 })
 
 registerHandler('claude.clearArchive', async (params) => {
