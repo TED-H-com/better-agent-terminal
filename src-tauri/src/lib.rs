@@ -115,6 +115,7 @@ fn execute_headless_server_cli<F>(run_server: F) -> i32
 where
     F: FnOnce(HeadlessServerArgs) -> Result<(), String>,
 {
+    bat_error_log::install(env!("BAT_APP_VERSION"));
     match parse_headless_server_args(std::env::args().skip(1)) {
         Ok(HeadlessCliAction::Help) => {
             print_headless_server_help();
@@ -127,6 +128,7 @@ where
             match run_server(args) {
                 Ok(()) => 0,
                 Err(err) => {
+                    bat_error_log::log("error", "server.start_failed", &err);
                     eprintln!("bat-server failed: {err}");
                     1
                 }
