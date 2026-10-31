@@ -76,6 +76,7 @@
     "test:tauri-resource-cache-keys": "node tests/tauri-resource-cache-keys.test.mjs",
     "test:tauri-compile-cache": "node tests/tauri-compile-cache.test.mjs && node tests/stable-rust-crates-cache.test.mjs",
     "test:bat-server-token-security": "node tests/bat-server-token-security.test.mjs",
+    "test:e2e": "playwright test",
     "check:tauri-rust": "cd src-tauri && cargo check --workspace --quiet",
     "test:tauri-rust": "cargo test --manifest-path src-tauri/Cargo.toml --workspace --lib",
     "test:session-reload": "tsx tests/session-reload.test.ts && node node-sidecar/tests/session-reload.test.mjs",
@@ -143,6 +144,7 @@
     "@lydell/node-pty-win32-x64": "1.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/cli": "^2.11.1",
     "@types/node": "^24.13.3",

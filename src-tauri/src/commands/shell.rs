@@ -200,9 +200,19 @@ mod tests {
         let bogus = if cfg!(windows) {
             Path::new("Q:\\definitely\\not\\here\\x.txt")
         } else {
+            // On Linux / macOS the root "/" always exists, so this will
+            // fall back to Folder("/").
             Path::new("/definitely-not-here-bat/x.txt")
         };
-        assert!(resolve_reveal_target(bogus).is_none());
+
+        if cfg!(windows) {
+            assert!(resolve_reveal_target(bogus).is_none());
+        } else {
+            match resolve_reveal_target(bogus) {
+                Some(RevealTarget::Folder(p)) => assert_eq!(p.to_str().unwrap(), "/"),
+                other => panic!("expected Folder(/) for an absolute miss on unix, got {other:?}"),
+            }
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
