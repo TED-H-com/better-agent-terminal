@@ -2231,6 +2231,113 @@ mod tests {
         assert_eq!(history_file_name(&opts), "workspace_one_term_history");
     }
 
+    #[derive(Debug)]
+    struct ZombieChild {
+        killed: Arc<AtomicBool>,
+        wait_calls: Arc<std::sync::atomic::AtomicUsize>,
+        required_waits: usize,
+    }
+
+    impl ZombieChild {
+        fn new(required_waits: usize) -> Self {
+            Self {
+                killed: Arc::new(AtomicBool::new(false)),
+                wait_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                required_waits,
+            }
+        }
+    }
+
+    impl ChildKiller for ZombieChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed.store(true, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(ZombieChild {
+                killed: self.killed.clone(),
+                wait_calls: self.wait_calls.clone(),
+                required_waits: self.required_waits,
+            })
+        }
+    }
+
+    impl Child for ZombieChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            let calls = self.wait_calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            if self.killed.load(AtomicOrdering::SeqCst) && calls >= self.required_waits {
+                Ok(Some(ExitStatus::with_exit_code(0)))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn wait(&mut self) -> std::io::Result<ExitStatus> {
+            self.killed.store(true, AtomicOrdering::SeqCst);
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(1)
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[test]
+    fn terminate_pty_child_prevents_zombies_by_polling_try_wait() {
+        let app = PtyContext::new(None, Arc::new(|_, _, _| {}));
+        let mut child = ZombieChild::new(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        terminate_pty_child(&app, "term-1", 1, &mut child, deadline);
+
+        assert!(child.killed.load(AtomicOrdering::SeqCst));
+        assert_eq!(child.wait_calls.load(AtomicOrdering::SeqCst), 3);
+    }
+
+    #[test]
+    fn terminate_pty_child_gives_up_after_deadline() {
+        let app = PtyContext::new(None, Arc::new(|_, _, _| {}));
+        let mut child = ZombieChild::new(100);
+        let deadline = Instant::now() + Duration::from_millis(15);
+
+        terminate_pty_child(&app, "term-1", 1, &mut child, deadline);
+
+        assert!(child.killed.load(AtomicOrdering::SeqCst));
+        let calls = child.wait_calls.load(AtomicOrdering::SeqCst);
+        assert!(calls >= 1);
+        assert!(calls < 100);
+    }
+
+    #[test]
+    fn kill_pty_session_terminates_child_and_cleans_up_state() {
+        let app = PtyContext::new(None, Arc::new(|_, _, _| {}));
+        let state = PtyState::default();
+        let id = "kill-test";
+
+        let mut session = fake_session(1, FakeMasterPty::plain());
+        let killed = Arc::new(AtomicBool::new(false));
+        session.child = Box::new(FakeChild {
+            killed: killed.clone(),
+        });
+
+        state
+            .inner
+            .lock()
+            .unwrap()
+            .insert(id.into(), PtyEntry::Active(session));
+
+        kill_pty_session(&app, &state, id).unwrap();
+
+        assert!(killed.load(AtomicOrdering::SeqCst));
+        assert!(!state.inner.lock().unwrap().contains_key(id));
+    }
+
     #[test]
     fn history_file_name_hashes_id_without_key() {
         let opts = CreatePtyOptions {
