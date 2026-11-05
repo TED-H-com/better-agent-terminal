@@ -362,6 +362,12 @@ pnpm run tauri:build:debug  # Local unsigned package
 
 ---
 
+## Documentation
+
+- **[Architecture](docs/architecture/index.md)** — Detailed documentation on the process model, Claude Code integration hooks, and workspace session management.
+- **[API Reference](docs/api/index.md)** — Information on the host adapter and internal APIs.
+- **[Developer Usage](docs/usage/index.md)** — Guidelines for development, testing, and running the application.
+
 ## Architecture
 
 See [docs/architecture/index.md](docs/architecture/index.md) for detailed documentation on the process model, Claude Code integration hooks, and workspace session management.
