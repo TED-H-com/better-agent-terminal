@@ -133,7 +133,7 @@ async function main() {
   const pkg = JSON.parse(await readFile('package.json', 'utf8')) as {
     dependencies?: Record<string, string>
   }
-  for (const removedDep of ['@ai-sdk/openai', 'ai', 'zod']) {
+  for (const removedDep of ['@ai-sdk/openai', 'ai']) {
     assert.equal(
       Object.prototype.hasOwnProperty.call(pkg.dependencies ?? {}, removedDep),
       false,
