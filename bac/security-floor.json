@@ -278,7 +278,7 @@
           ]
         }
       ],
-      "reason": "One fixed seed advisory has no firstPatched value; retain that advisory and use the highest non-null firstPatched value (3.4.16), as resolved 3.4.17 exceeds it."
+      "reason": "One fixed advisory for this package records no first patched version; the floor is the highest first patched version among the others (3.4.16), and the resolved 3.4.17 exceeds it."
     },
     {
       "package": "esbuild",
@@ -1192,7 +1192,7 @@
           ]
         }
       ],
-      "reason": "Seed alerts 43\u201345 name package.json; root manifest advisories apply to pnpm-lock.yaml, alongside the lockfile alerts for the same package."
+      "reason": "Three of this package's alerts name package.json; advisories reported against the root manifest apply to pnpm-lock.yaml, alongside the lock file alerts for the same package."
     },
     {
       "package": "source-map-js",

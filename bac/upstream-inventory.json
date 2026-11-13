@@ -19,7 +19,7 @@
       "feature": "security patches",
       "reason": "The sidecar manifest raises direct Zod from ^4.4.3 to ^4.6.7.",
       "plan": "drop-when-upstream-has-it",
-      "planReason": "Lead decision: ^4.4.3 already admits 4.6.7, so this minimum can be dropped after adding a reviewed Zod floor (no Zod advisory is present in the supplied seed).",
+      "planReason": "^4.4.3 already admits 4.6.7, so this raised minimum can be dropped once a reviewed Zod floor exists (the dependency alerts behind the floor file contain no Zod advisory).",
       "added": 1,
       "removed": 1,
       "digest": "86e353f3b5e441e0317b827b54735ac9fc826599283d84df3dde1009cc5b573d"
@@ -96,7 +96,7 @@
       "feature": "security patches and archive test entry",
       "reason": "Security minimums/overrides and archive test invocation use the root dependency/test entrypoint.",
       "plan": "move-to-extension",
-      "planReason": "Lead decision: retain sharp range change (^0.34.5 excludes floor 0.35.5), ip-address@10 override (express-rate-limit pins 10.1.0), and mermaid>katex override (Mermaid requires ^0.16.47, excluding floor 0.18.2); dompurify ^3.3.3, esbuild ^0.28.0, mermaid ^11.13.0, vite ^8.0.0 and uuid ^14.0.0 already allow their patched floors and their raised minimums can be dropped with the floor enforced; tsx ^4.21.0 also allows 4.23.15, so its raised minimum can be dropped while the all-resolved esbuild floor forces an updated tsx resolution (upstream tsx 4.21.0 locks esbuild 0.27.7); zod@4 override is range-redundant (^4.0.0 peers allow 4.6.7) but has no seed floor, so dropping it requires lead acceptance of that coverage gap or a reviewed new floor; move the fork archive test invocation to bac CI.",
+      "planReason": "Retain the sharp range change (^0.34.5 excludes floor 0.35.5), ip-address@10 override (express-rate-limit pins 10.1.0), and mermaid>katex override (Mermaid requires ^0.16.47, excluding floor 0.18.2); dompurify ^3.3.3, esbuild ^0.28.0, mermaid ^11.13.0, vite ^8.0.0 and uuid ^14.0.0 already allow their patched floors and their raised minimums can be dropped with the floor enforced; tsx ^4.21.0 also allows 4.23.15, so its raised minimum can be dropped while the all-resolved esbuild floor forces an updated tsx resolution (upstream tsx 4.21.0 locks esbuild 0.27.7); zod@4 override is range-redundant (^4.0.0 peers allow 4.6.7) but has no floor entry, so dropping it requires a reviewed new floor or an explicit decision to accept that gap; move the fork archive test invocation to bac CI.",
       "added": 14,
       "removed": 9,
       "digest": "c31f44399bc8c45cc37db76d7fefe06bbdf8b2a572a9a76fab31396707cf8094"
@@ -173,7 +173,7 @@
       "feature": "PM producer and archive transport",
       "reason": "Inline final frame guard plus PM legacy mapping/tests extend upstream protocol handling.",
       "plan": "move-to-extension",
-      "planReason": "Lead decision: move PM contracts behind bac capability routing and offer generic payload capping upstream; resolve compatibility before retaining the current claude:get-pm-runtime and remote:payload-too-large additions.",
+      "planReason": "Move PM contracts behind bac capability routing and offer generic payload capping upstream; resolve compatibility before retaining the current claude:get-pm-runtime and remote:payload-too-large additions.",
       "added": 33,
       "removed": 0,
       "digest": "ed015c19ffd27e16c7acd4a5e10aad49469646615704c06ddebe506ca38670a2"
@@ -217,7 +217,7 @@
       "feature": "PM producer, archive transport and error log",
       "reason": "Server embeds PM routing, bounded transport/backpressure, logging and regression tests.",
       "plan": "move-to-extension",
-      "planReason": "Lead decision: separate PM bac routing and logger hooks from generic transport fixes, offer the latter upstream, and retain only lifecycle calls after compatibility review.",
+      "planReason": "Separate PM bac routing and logger hooks from generic transport fixes, offer the latter upstream, and retain only lifecycle calls after compatibility review.",
       "added": 261,
       "removed": 29,
       "digest": "214922639a33d9c54fcb88bb4537543ce84e98308361fe7c58e1d69cd0d1a225"
