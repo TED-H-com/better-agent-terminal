@@ -109,7 +109,6 @@ impl Store {
         let bac = match open_at(&data, c"bac", flags, 0) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                writable(&data, data_dir)?;
                 match mkdir_at(&data, c"bac") {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}

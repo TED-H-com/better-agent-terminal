@@ -134,8 +134,15 @@ fn readonly_directory_without_identity_is_unavailable() {
     let scratch = Scratch::new();
     let root = scratch.store();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
-    assert_eq!(load_or_create(&root), Err(Error::StorageUnavailable));
-    assert!(!root.join("bac").exists());
+    // The root has no mode policy. Kernel access checks normally refuse mkdir;
+    // a privileged process can create there and must not be refused by a precheck.
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(load_or_create(&root), Err(Error::StorageUnavailable));
+        assert!(!root.join("bac").exists());
+    } else {
+        assert!(load_or_create(&root).is_ok());
+    }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     load_or_create(&root).unwrap();
     fs::remove_file(target(&root)).unwrap();
@@ -639,4 +646,15 @@ fn storage_reason_names_are_unique_bounded_and_the_only_client_detail() {
             assert_eq!(error.wire_error().reply(), expected);
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn writable_data_root_has_no_integrity_mode_policy() {
+    let scratch = Scratch::new();
+    let root = scratch.store();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+    let id = load_or_create(&root).unwrap();
+    assert_eq!(load_or_create(&root).unwrap(), id);
+    assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o777);
 }
