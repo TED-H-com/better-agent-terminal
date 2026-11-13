@@ -1,0 +1,58 @@
+{
+  "received": [
+    {
+      "capabilities": {
+        "profileContext": 1,
+        "remoteAuth": {
+          "claude": "paste-code-v1",
+          "codex": "device-code-v1"
+        },
+        "toolPayloadPreview": 1
+      },
+      "compression": "gzip",
+      "id": "auth",
+      "protocol": "bat-remote/v2",
+      "result": true,
+      "serverVersion": "3.2.18",
+      "type": "auth-result"
+    },
+    {
+      "args": [
+        {
+          "data": "{\"workspaces\":[{\"id\":\"fixture-workspace\",\"name\":\"one\"}],\"terminals\":[],\"activeWorkspaceId\":\"fixture-workspace\",\"activeTerminalId\":null}",
+          "profileId": "default"
+        }
+      ],
+      "channel": "workspace:reload",
+      "params": {
+        "data": "{\"workspaces\":[{\"id\":\"fixture-workspace\",\"name\":\"one\"}],\"terminals\":[],\"activeWorkspaceId\":\"fixture-workspace\",\"activeTerminalId\":null}",
+        "profileId": "default"
+      },
+      "type": "event"
+    },
+    {
+      "args": [
+        {
+          "data": "{\"workspaces\":[{\"id\":\"fixture-workspace\",\"name\":\"two\"}],\"terminals\":[],\"activeWorkspaceId\":\"fixture-workspace\",\"activeTerminalId\":null}",
+          "profileId": "default"
+        }
+      ],
+      "channel": "workspace:reload",
+      "params": {
+        "data": "{\"workspaces\":[{\"id\":\"fixture-workspace\",\"name\":\"two\"}],\"terminals\":[],\"activeWorkspaceId\":\"fixture-workspace\",\"activeTerminalId\":null}",
+        "profileId": "default"
+      },
+      "type": "event"
+    },
+    {
+      "code": "REMOTE_RESPONSE_TOO_LARGE",
+      "details": {
+        "maxBytes": 4194304,
+        "sizeBytes": 5243166
+      },
+      "error": "Remote response exceeds the serialized size budget; request a smaller page",
+      "id": "load-large",
+      "type": "invoke-error"
+    }
+  ]
+}
