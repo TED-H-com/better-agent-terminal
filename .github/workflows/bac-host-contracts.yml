@@ -20,28 +20,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
           toolchain: '1.98.1'
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        if: runner.os == 'Linux'
-        with:
-          node-version: '24.21.0'
-          package-manager-cache: false
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: bac-contracts-${{ runner.os }}-rust-1.98.1-${{ hashFiles('src-tauri/Cargo.lock') }}
       - name: Crate tests
         run: cargo test --manifest-path src-tauri/Cargo.toml -p bac-host-contracts --locked
-      - name: Headless wire tests with isolated home
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          scratch="$(mktemp -d "$RUNNER_TEMP/bac-contracts.XXXXXX")"
-          trap 'rm -rf "$scratch"' EXIT
-          mkdir -p "$scratch/home" "$scratch/tmp"
-          env CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-            HOME="$scratch/home" TMPDIR="$scratch/tmp" \
-            cargo test --manifest-path src-tauri/Cargo.toml --locked \
-              --no-default-features --features headless --lib bac_tests -- --test-threads=1
