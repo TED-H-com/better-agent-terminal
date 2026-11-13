@@ -10,14 +10,17 @@ No upstream source, package file, lock file or existing workflow is changed.
 ## Run
 
 From the repository root, with the existing Node 24, Rust and installed sidecar
-dependencies (no install is performed by the runner):
+dependencies (no install is performed by the runner). `REPORTS` is any new
+directory outside the repository; the scratch directory holds two source copies
+and two Cargo target directories (about 10 GiB), so keep it on a disk, not on a
+memory-backed file system:
 
 ```sh
 node bac/tests/differential/self-test.mjs
 node bac/tests/differential/run.mjs \
-  --scratch "$HOME/agent-work/tmp/dif" --report "$BAC_EVIDENCE/comparison"
+  --scratch "$HOME/.cache/bac-differential" --report "$REPORTS/comparison"
 node bac/tests/differential/run.mjs --same-binary --repeat 3 \
-  --scratch "$HOME/agent-work/tmp/dif" --report "$BAC_EVIDENCE/stability"
+  --scratch "$HOME/.cache/bac-differential" --report "$REPORTS/stability"
 ```
 
 The default reference is `bac/UPSTREAM_BASE.json`. Override it with
@@ -46,9 +49,11 @@ A successful build is cached by source SHA, release tag, `rustc --version` and
 build-recipe version. A second run skips Cargo, as recorded in `builds.json`.
 Uncommitted changes to tracked runtime source are rejected to avoid silently
 testing a stale HEAD. Commit them before running. `--build-only` prepares the
-pair. For debugging, `--upstream-bin`, `--upstream-source`, `--fork-bin` and
-`--fork-source` accept an existing version-stamped pair; these bypass build
-provenance checks, so do not use them in the CI compatibility gate.
+pair. For debugging, `--upstream-bin` together with `--upstream-source`,
+`--fork-bin` and `--fork-source` accepts an existing version-stamped pair; that
+form bypasses the build provenance checks, so do not use it in the CI
+compatibility gate. (`--upstream-source` on its own is the verified checkout
+described above.)
 
 Use `--scenarios handshake,profiles` for iteration. The full allowlist is still
 checked: a subset comparison fails for unused allowances outside that subset.
@@ -57,10 +62,10 @@ Use a new report directory for each invocation to avoid confusing old artifacts
 with the current run. The build cache can be removed after a round:
 
 ```sh
-rm -rf "$HOME/agent-work/tmp/dif"
+rm -rf "$HOME/.cache/bac-differential"
 ```
 
-Only do this when no run is active, and reserve that directory for this task.
+Only do this when no run is active, and use that directory for nothing else.
 
 ## Isolation and fixtures
 
@@ -226,6 +231,12 @@ The 21 comparator/transport/normalization self-checks passed. Root TypeScript
 checking and renderer compilation passed. Workflow YAML, trigger keys, all eight
 full-SHA action references and six shell blocks were validated locally; GitHub
 Actions itself and its dependency installation/checkout steps were not run here.
+
+After `main` took the `v3.2.18` merge (`a4cf448`), the pair was built and
+measured again from the merged tree, outside any sandbox: the same 21 scenarios,
+547 and 535 frames, 71 differences matching the 71 allowances, none unexplained
+and none stale; three upstream-versus-upstream runs, 63 comparisons, zero
+differences.
 
 An end-to-end run from an empty scratch build cache took **293.575 seconds**;
 its upstream and fork builds took 109.599 and 111.790 seconds. The second full run against the same cache took **72.272 seconds**,

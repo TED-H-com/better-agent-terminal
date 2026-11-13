@@ -57,31 +57,27 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/agent-work/tmp/dif/upstream-*
+            ~/.cache/bac-differential/upstream-*
           key: bac-upstream-${{ runner.os }}-rust-1.98.1-${{ hashFiles('bac/UPSTREAM_BASE.json') }}-v1
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/agent-work/tmp/dif/fork-*
-          key: bac-fork-${{ runner.os }}-rust-1.98.1-${{ github.sha }}-v1
       - name: Comparator negative controls
         run: node bac/tests/differential/self-test.mjs
       - name: Build both archived sources with release version stamping
         run: >-
           node bac/tests/differential/run.mjs --build-only
           --upstream-source .bac-upstream
-          --scratch "$HOME/agent-work/tmp/dif"
+          --scratch "$HOME/.cache/bac-differential"
           --report "$RUNNER_TEMP/bac-differential/build"
       - name: Require three stable upstream-versus-upstream comparisons
         run: >-
           node bac/tests/differential/run.mjs --same-binary --repeat 3
           --upstream-source .bac-upstream
-          --scratch "$HOME/agent-work/tmp/dif"
+          --scratch "$HOME/.cache/bac-differential"
           --report "$RUNNER_TEMP/bac-differential/stability"
       - name: Compare upstream and fork
         run: >-
           node bac/tests/differential/run.mjs
           --upstream-source .bac-upstream
-          --scratch "$HOME/agent-work/tmp/dif"
+          --scratch "$HOME/.cache/bac-differential"
           --report "$RUNNER_TEMP/bac-differential/comparison"
       - name: Upload differential evidence
         if: always()
