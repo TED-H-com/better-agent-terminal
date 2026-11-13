@@ -69,6 +69,20 @@ test('inventory: future base collision fails', t => {
   const r = repository(t); r.inventory.own.push({ path: 'source.txt', feature: 'fixture' }); r.save();
   assert.match(inspect(r.root).errors.join('\n'), /Own path collision/);
 });
+test('inventory: new own files require a collision record, deleted own files require removal', t => {
+  const r = repository(t); r.write('own.txt', 'own implementation\n');
+  assert.match(inspect(r.root).errors.join('\n'), /Unlisted own path/);
+  r.inventory.own.push({ path: 'own.txt', feature: 'fixture' }); r.save();
+  assert.deepEqual(inspect(r.root).errors, []);
+  git(r.root, 'add', 'own.txt'); rmSync(join(r.root, 'own.txt'));
+  assert.match(inspect(r.root).errors.join('\n'), /Stale own path/);
+});
+test('inventory: duplicate entries and missing human explanations fail', t => {
+  const r = repository(t); r.write('source.txt', 'hook\n'); r.hook();
+  r.inventory.upstream[0].reason = ''; r.inventory.upstream.push({ ...r.inventory.upstream[0] }); r.save();
+  const errors = inspect(r.root).errors.join('\n');
+  assert.match(errors, /Duplicate inventory entry/); assert.match(errors, /Incomplete explanation/);
+});
 test('inventory: missing base prints exact fetch command', t => {
   const r = repository(t); r.write('bac/UPSTREAM_BASE.json', JSON.stringify({ repository: 'https://example.invalid/upstream', commit: '0'.repeat(40) }));
   assert.throws(() => inspect(r.root), /git fetch --no-tags https:\/\/example.invalid\/upstream 0000000000000000000000000000000000000000/);

@@ -27,6 +27,7 @@ export function inspect(root, { update = false } = {}) {
   // No rename detection: renaming an upstream file still deletes an owned path.
   const changed = new Set(git(root, 'diff', '--no-renames', '--name-only', '-z', base.commit, '--').split('\0').filter(p => upstream.has(p)));
   const current = new Set(git(root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean));
+  for (const path of git(root, 'ls-files', '--deleted', '-z').split('\0')) current.delete(path);
   const errors = [], stats = [], listed = new Set();
   for (const entry of inventory.upstream) {
     const { path, kind, plan } = entry;
