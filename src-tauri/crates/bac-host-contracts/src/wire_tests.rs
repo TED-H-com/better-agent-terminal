@@ -218,29 +218,30 @@ fn size_precedes_context_and_context_precedes_storage() {
     assert_eq!(code(&call(&c, &f)), "INVALID_REQUEST");
 }
 #[test]
-fn storage_precedes_version_and_errors_do_not_opt_in() {
+fn version_precedes_storage_and_errors_do_not_opt_in() {
     let c = Connection::default();
-    let mut f = hello();
-    f["params"]["protocol"] = json!("wrong");
+    for (v2, protocol, minor) in [(true, "wrong", 0), (true, "bac/1", 1), (false, "bac/1", 0)] {
+        let mut f = hello();
+        f["params"] = json!({"protocol":protocol,"minor":minor});
+        assert_eq!(
+            c.invoke(v2, "bac:hello", &f, || panic!(
+                "unsupported version must not touch storage"
+            )),
+            Error::UnsupportedVersion.reply()
+        );
+        assert_eq!(code(&call(&c, &frame("bac:future"))), "NOT_OPTED_IN");
+    }
     for err in [
         Error::StorageUnavailable,
         Error::StorageCorrupt,
         Error::Internal,
     ] {
         assert_eq!(
-            c.invoke(true, "bac:hello", &f, || Err(err.clone())),
+            c.invoke(true, "bac:hello", &hello(), || Err(err.clone())),
             err.reply()
         );
         assert_eq!(code(&call(&c, &frame("bac:future"))), "NOT_OPTED_IN");
     }
-    assert_eq!(code(&call(&c, &f)), "UNSUPPORTED_VERSION");
-    f = hello();
-    f["params"]["minor"] = json!(1);
-    assert_eq!(code(&call(&c, &f)), "UNSUPPORTED_VERSION");
-    assert_eq!(
-        code(&c.invoke(false, "bac:hello", &hello(), || Ok(HOST.into()))),
-        "UNSUPPORTED_VERSION"
-    );
 }
 #[test]
 fn expected_identity_matches_and_mismatch_revokes_negotiation() {

@@ -129,7 +129,7 @@ pub struct Connection {
 
 impl Connection {
     /// The loader is called only by a shape-valid, context-free hello. Storage
-    /// errors precede version negotiation as specified; no provider fallback.
+    /// errors follow version negotiation; no provider fallback.
     pub fn invoke(
         &self,
         v2: bool,
@@ -214,10 +214,10 @@ impl Connection {
             return Err(Error::ContextNotSupported);
         }
         if hello {
-            let host = load_identity()?;
             if !v2 || params["protocol"] != "bac/1" || params["minor"] != 0 {
                 return Err(Error::UnsupportedVersion);
             }
+            let host = load_identity()?;
             if params
                 .get("expectedHostId")
                 .is_some_and(|expected| expected != &host)

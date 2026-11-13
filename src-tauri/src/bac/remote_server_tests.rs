@@ -163,7 +163,6 @@ mod bac_tests {
         assert!(!host.dir.join("bac").exists());
         assert_eq!(names(&host), before);
     }
-    #[cfg(unix)]
     #[test]
     fn wire_opt_in_is_per_connection_and_reconnect_and_never_falls_back() {
         // The upstream resolver reads a process-wide environment variable.
@@ -179,7 +178,10 @@ mod bac_tests {
                 .env("BAC_TEST_HANDSHAKE_CHILD", "1")
                 .env(
                     "BAT_SIDECAR_SCRIPT",
-                    concat!(env!("CARGO_MANIFEST_DIR"), "/src/bac/fake-sidecar.mjs"),
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/src/bac/remote_server_fake_sidecar.mjs"
+                    ),
                 )
                 .output()
                 .unwrap();
@@ -195,7 +197,7 @@ mod bac_tests {
         // Pre-start only this fixture's fake. The production dispatcher keeps
         // its original resolver and uses the already-running fake bridge.
         let fake = host.dir.join("fake-sidecar.mjs");
-        fs::write(&fake, include_str!("fake-sidecar.mjs")).unwrap();
+        fs::write(&fake, include_str!("remote_server_fake_sidecar.mjs")).unwrap();
         let cfg = crate::sidecar::SpawnConfig {
             node_path: crate::sidecar::which_node().unwrap(),
             script_path: fake,
@@ -275,10 +277,32 @@ mod bac_tests {
         b.close(None).unwrap();
         reconnect.close(None).unwrap();
     }
-    #[cfg(unix)]
     #[test]
     fn wire_hello_validation_and_expected_identity() {
+        fn snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+            fn visit(
+                root: &std::path::Path,
+                dir: &std::path::Path,
+                out: &mut Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+            ) {
+                for entry in fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                    if path.is_dir() {
+                        out.push((relative, None));
+                        visit(root, &path, out);
+                    } else {
+                        out.push((relative, Some(fs::read(path).unwrap())));
+                    }
+                }
+            }
+            let mut result = Vec::new();
+            visit(root, root, &mut result);
+            result.sort();
+            result
+        }
         let host = TestHost::new();
+        let before = snapshot(&host.dir);
         let (mut ws, _, _) = connect(&host, true);
         for (params, expected) in [
             (json!({"protocol":"other","minor":0}), "UNSUPPORTED_VERSION"),
@@ -303,6 +327,13 @@ mod bac_tests {
             )),
             "CONTEXT_NOT_SUPPORTED"
         );
+        assert!(!host.dir.join("bac").exists());
+        assert_eq!(snapshot(&host.dir), before);
+        let (mut legacy, _, _) = connect(&host, false);
+        assert_eq!(error(hello(&mut legacy)), "UNSUPPORTED_VERSION");
+        assert!(!host.dir.join("bac").exists());
+        assert_eq!(snapshot(&host.dir), before);
+        legacy.close(None).unwrap();
         assert_eq!(
             error(invoke(
                 &mut ws,
@@ -357,7 +388,6 @@ mod bac_tests {
         assert_eq!(hello(&mut ws)["ok"], true);
         ws.close(None).unwrap();
     }
-    #[cfg(unix)]
     #[test]
     fn wire_invalid_id_does_not_escape_result_limit() {
         let host = TestHost::new();
@@ -381,19 +411,6 @@ mod bac_tests {
             assert_eq!(frame["result"]["error"]["code"], "INVALID_REQUEST");
             break;
         }
-        ws.close(None).unwrap();
-    }
-    #[cfg(not(unix))]
-    #[test]
-    fn wire_identity_fails_closed_without_a_reviewed_permission_backend() {
-        let host = TestHost::new();
-        let (mut ws, _, auth) = connect(&host, true);
-        assert_eq!(
-            auth["capabilities"]["bac"],
-            json!({"protocol":"bac/1","minor":0})
-        );
-        assert_eq!(error(hello(&mut ws)), "STORAGE_UNAVAILABLE");
-        assert!(!host.dir.join("bac").exists());
         ws.close(None).unwrap();
     }
 }

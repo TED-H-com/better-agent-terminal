@@ -64,7 +64,7 @@ const REMOTE_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const REMOTE_RESOURCE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 // bac-hook: module
-#[path = "bac/mod.rs"] mod bac;
+#[path = "bac/remote_server.rs"] mod bac;
 const MAX_REMOTE_CONNECTIONS: usize = 64;
 const MAX_REMOTE_INVOKES: usize = 128;
 const REMOTE_OUTBOUND_QUEUE_CAPACITY: usize = 256;
@@ -1725,7 +1725,7 @@ fn handle_client(
 #[cfg(all(test, not(feature = "desktop")))]
 mod profile_context_integration_tests {
     // bac-hook: fixture-tests
-    include!("bac/headless_tests.rs");
+    include!("bac/remote_server_tests.rs");
     use super::*;
     use crate::host_context::HeadlessHost;
     use crate::profile_context::ProfileContexts;
