@@ -1,0 +1,330 @@
+{
+  "schema": 1,
+  "diffFormat": "sha256 of git diff --binary --full-index --unified=0 --no-renames --no-ext-diff --no-textconv --diff-algorithm=myers, base to working tree; lock digests are null",
+  "upstream": [
+    {
+      "path": "README.md",
+      "kind": "legacy-patch",
+      "feature": "documentation links",
+      "reason": "The existing README links the fork documentation index.",
+      "plan": "move-to-extension",
+      "planReason": "Move fork navigation to bac/README.md and keep the upstream landing page unchanged.",
+      "added": 8,
+      "removed": 0,
+      "digest": "0fc8660257b1bf0f974de8f863a9cd888f8300c3b5f754f838ec4033605b8beb"
+    },
+    {
+      "path": "node-sidecar/package.json",
+      "kind": "dependency",
+      "feature": "security patches",
+      "reason": "The sidecar manifest raises direct Zod from ^4.4.3 to ^4.6.7.",
+      "plan": "drop-when-upstream-has-it",
+      "planReason": "^4.4.3 already admits 4.6.7, so this raised minimum can be dropped once a reviewed Zod floor exists (the dependency alerts behind the floor file contain no Zod advisory).",
+      "added": 1,
+      "removed": 1,
+      "digest": "86e353f3b5e441e0317b827b54735ac9fc826599283d84df3dde1009cc5b573d"
+    },
+    {
+      "path": "node-sidecar/pnpm-lock.yaml",
+      "kind": "dependency",
+      "feature": "security patches",
+      "reason": "Derived sidecar resolutions preserve the restored npm advisory fixes.",
+      "plan": "keep",
+      "planReason": "Regenerate with targeted pnpm updates and validate frozen consistency plus the floor after each upstream merge.",
+      "added": 98,
+      "removed": 67,
+      "digest": null
+    },
+    {
+      "path": "node-sidecar/src/handlers/claude-history.mjs",
+      "kind": "legacy-patch",
+      "feature": "archive paging and Codex resume transport",
+      "reason": "Archive handler now streams archived IDs and calls bounded archive-page reads.",
+      "plan": "upstream-as-fix",
+      "planReason": "Offer bounded archive reads upstream while preserving upstream queue ordering, deduplication and page envelope.",
+      "added": 16,
+      "removed": 23,
+      "digest": "209cf77e94d5e42af4a8c5adc1339abab81217d2bbd3caeece0856a93c0bad15"
+    },
+    {
+      "path": "node-sidecar/src/handlers/claude-send.mjs",
+      "kind": "hook",
+      "feature": "PM producer",
+      "reason": "Five import/lifecycle lines reset input identity at reload and account for queued native inputs through finally.",
+      "plan": "keep",
+      "planReason": "Retain the smallest queue lifecycle hooks after moving input-state helpers to an own module; add bac-hook markers in a separately reviewed change.",
+      "added": 5,
+      "removed": 0,
+      "digest": "3242809c2670b88e71641c1b9fd417b934ce7ee835cd9c5718dc1844209d1fef"
+    },
+    {
+      "path": "node-sidecar/src/handlers/codex.mjs",
+      "kind": "legacy-patch",
+      "feature": "archive paging and Codex resume transport",
+      "reason": "Inline bounded Codex head/history parsing and before-only resume replace whole-file reads.",
+      "plan": "upstream-as-fix",
+      "planReason": "Offer bounded head/history loading upstream and extract remaining adapter code into own files if declined.",
+      "added": 50,
+      "removed": 22,
+      "digest": "5727c12eb44c3d1a3ec91ddc2359f19a889e0ff7cf31033df51d01ddf56ed4d5"
+    },
+    {
+      "path": "node-sidecar/src/lib/state.mjs",
+      "kind": "legacy-patch",
+      "feature": "PM producer",
+      "reason": "Session state contains inline input identity helpers plus metadata exposure.",
+      "plan": "move-to-extension",
+      "planReason": "Move identity helpers into an own sidecar module and retain only session lifecycle calls, with metadata exposure reviewed against bac capability gating.",
+      "added": 20,
+      "removed": 0,
+      "digest": "80aec9f0ff8415006b79a60f8e02fc2fa082e76bc4c182ad3011f0f375cf095e"
+    },
+    {
+      "path": "node-sidecar/tests/claude-send-ack.test.mjs",
+      "kind": "test",
+      "feature": "PM producer",
+      "reason": "Existing queue fakes assert received/pending counters during success and failure.",
+      "plan": "move-to-extension",
+      "planReason": "Extract PM-specific queue assertions into an own test file while preserving upstream ACK coverage.",
+      "added": 18,
+      "removed": 1,
+      "digest": "612a93aeb5b973c8432fe4226eb3d381370918e3bec6e30b640846fe55a69a3e"
+    },
+    {
+      "path": "package.json",
+      "kind": "dependency",
+      "feature": "security patches and archive test entry",
+      "reason": "Security minimums/overrides and archive test invocation use the root dependency/test entrypoint.",
+      "plan": "move-to-extension",
+      "planReason": "Retain the sharp range change (^0.34.5 excludes floor 0.35.5), ip-address@10 override (express-rate-limit pins 10.1.0), and mermaid>katex override (Mermaid requires ^0.16.47, excluding floor 0.18.2); dompurify ^3.3.3, esbuild ^0.28.0, mermaid ^11.13.0, vite ^8.0.0 and uuid ^14.0.0 already allow their patched floors and their raised minimums can be dropped with the floor enforced; tsx ^4.21.0 also allows 4.23.15, so its raised minimum can be dropped while the all-resolved esbuild floor forces an updated tsx resolution (upstream tsx 4.21.0 locks esbuild 0.27.7); zod@4 override is range-redundant (^4.0.0 peers allow 4.6.7) but has no floor entry, so dropping it requires a reviewed new floor or an explicit decision to accept that gap; move the fork archive test invocation to bac CI.",
+      "added": 14,
+      "removed": 9,
+      "digest": "c31f44399bc8c45cc37db76d7fefe06bbdf8b2a572a9a76fab31396707cf8094"
+    },
+    {
+      "path": "pnpm-lock.yaml",
+      "kind": "dependency",
+      "feature": "security patches",
+      "reason": "Derived root npm resolutions preserve restored transitive security fixes.",
+      "plan": "keep",
+      "planReason": "Use targeted pnpm updates, frozen consistency and all-resolved-version floor checks instead of pinning a textual digest.",
+      "added": 663,
+      "removed": 918,
+      "digest": null
+    },
+    {
+      "path": "renderer/src/components/CodexAgentPanel.tsx",
+      "kind": "legacy-patch",
+      "feature": "archive paging and Codex resume transport",
+      "reason": "Panel owns before cursor, older-history loading and resume return handling.",
+      "plan": "upstream-as-fix",
+      "planReason": "Offer Codex paging UI upstream alongside bounded host history, then remove the fork delta when equivalent behavior lands.",
+      "added": 29,
+      "removed": 2,
+      "digest": "31114ca31871a155fbe57676a47854dda31838c1af1ee67d1c8e995b94eb424f"
+    },
+    {
+      "path": "src-tauri/Cargo.lock",
+      "kind": "dependency",
+      "feature": "security patches, PM producer and error log",
+      "reason": "Derived graph includes restored Rust security versions, local GLib, PM libc and bat-error-log.",
+      "plan": "keep",
+      "planReason": "Regenerate via targeted cargo update --precise and validate --locked resolution, floors and the exact backport source.",
+      "added": 154,
+      "removed": 70,
+      "digest": null
+    },
+    {
+      "path": "src-tauri/Cargo.toml",
+      "kind": "dependency",
+      "feature": "security patches, PM producer and error log",
+      "reason": "Root manifest wires the local error logger, Linux libc and GTK-compatible GLib patch.",
+      "plan": "keep",
+      "planReason": "Retain dependency/module registration and GLib patch until GTK supports fixed glib; move PM-only libc to an own crate when runtime extraction permits.",
+      "added": 10,
+      "removed": 0,
+      "digest": "bbe0d4a85ca2671d5bf30d2a4bfa2f465bed2b2c19775f36a0f5f88ab4b6f6cf"
+    },
+    {
+      "path": "src-tauri/build.rs",
+      "kind": "legacy-patch",
+      "feature": "PM producer",
+      "reason": "Build script defines inline source revision export and worktree ref tracking.",
+      "plan": "move-to-extension",
+      "planReason": "Move the revision exporter to bac build support and leave a single build-script call.",
+      "added": 30,
+      "removed": 0,
+      "digest": "1809a0abe46aa80fa9a0c230f1425c2a82982eda479da66943bd1a0c3e115c47"
+    },
+    {
+      "path": "src-tauri/crates/bat-pty/src/pty.rs",
+      "kind": "test",
+      "feature": "session cleanup tests",
+      "reason": "Three added child reaping/kill tests use private PTY lifecycle helpers.",
+      "plan": "upstream-as-fix",
+      "planReason": "Offer the three cleanup regressions upstream; private-helper access makes a separate integration test less direct.",
+      "added": 107,
+      "removed": 0,
+      "digest": "403342d6d0700d18ac95926af521285c8fbeb5b5e29f5f4e1d7986ab6dc7470d"
+    },
+    {
+      "path": "src-tauri/crates/bat-remote-protocol/src/remote_core.rs",
+      "kind": "legacy-patch",
+      "feature": "PM producer and archive transport",
+      "reason": "Inline final frame guard plus PM legacy mapping/tests extend upstream protocol handling.",
+      "plan": "move-to-extension",
+      "planReason": "Move PM contracts behind bac capability routing and offer generic payload capping upstream; resolve compatibility before retaining the current claude:get-pm-runtime and remote:payload-too-large additions.",
+      "added": 33,
+      "removed": 0,
+      "digest": "ed015c19ffd27e16c7acd4a5e10aad49469646615704c06ddebe506ca38670a2"
+    },
+    {
+      "path": "src-tauri/src/codex_app_server.rs",
+      "kind": "legacy-patch",
+      "feature": "PM producer and archive transport",
+      "reason": "Inline identity/epoch guards and Codex paging remain alongside registration of own PM runtime module.",
+      "plan": "move-to-extension",
+      "planReason": "Extract input identity, history conversion and their tests to own modules, leaving small runtime lifecycle hooks; preserve upstream Fast and stale-turn behavior.",
+      "added": 387,
+      "removed": 20,
+      "digest": "be9abda93cb65e57134d8c9b9b762fd1e7ade71ca4925575a5b1558ab06f267e"
+    },
+    {
+      "path": "src-tauri/src/commands/claude.rs",
+      "kind": "legacy-patch",
+      "feature": "PM producer and archive transport",
+      "reason": "Existing router inserts PM fallback guards and switches archive/listing reads to bounded helpers.",
+      "plan": "move-to-extension",
+      "planReason": "Extract fork routing adapters and keep only bounded-read calls and explicit session-owner dispatch hooks.",
+      "added": 36,
+      "removed": 16,
+      "digest": "c13236548b555da945422c1aa6abddf0a163481ebb0d39d1ae2955eec82959f4"
+    },
+    {
+      "path": "src-tauri/src/lib.rs",
+      "kind": "hook",
+      "feature": "error log and archive paging",
+      "reason": "Three crate-root/startup lines register transcript_file, install the logger and record startup failures.",
+      "plan": "keep",
+      "planReason": "Retain minimal module/startup wiring and add bac-hook markers in a later reviewed change.",
+      "added": 3,
+      "removed": 0,
+      "digest": "e5b9af62b7ccd8f80ff85c8bbe4ca0b85a09ff8a602271b5ecf74436b480eb64"
+    },
+    {
+      "path": "src-tauri/src/remote_server.rs",
+      "kind": "legacy-patch",
+      "feature": "PM producer, archive transport and error log",
+      "reason": "Server embeds PM routing, bounded transport/backpressure, logging and regression tests.",
+      "plan": "move-to-extension",
+      "planReason": "Separate PM bac routing and logger hooks from generic transport fixes, offer the latter upstream, and retain only lifecycle calls after compatibility review.",
+      "added": 261,
+      "removed": 29,
+      "digest": "214922639a33d9c54fcb88bb4537543ce84e98308361fe7c58e1d69cd0d1a225"
+    },
+    {
+      "path": "tests/codex-panel-regression.test.ts",
+      "kind": "test",
+      "feature": "archive paging and Codex resume transport",
+      "reason": "Existing source-shape assertion accepts the additive before cursor return type.",
+      "plan": "drop-when-upstream-has-it",
+      "planReason": "Drop this assertion delta when upstream adopts the corresponding Codex paging return shape.",
+      "added": 1,
+      "removed": 1,
+      "digest": "fe4b3dbad68bc9df95eb5cc8d74a2d6eef4d6563d020f2c7d78b80ac4ab68e8f"
+    },
+    {
+      "path": "tests/transcript-window.test.ts",
+      "kind": "test",
+      "feature": "archive paging and Codex resume transport",
+      "reason": "Fork adds byte-bound forward anchor assertions while production helper already matches upstream.",
+      "plan": "upstream-as-fix",
+      "planReason": "Offer the complementary regression cases upstream, or move them to an own test file without duplicating the production helper.",
+      "added": 11,
+      "removed": 0,
+      "digest": "6a32c16ecd66ed06c333abfbbaa679825983ec45443a007807168b642262a25e"
+    }
+  ],
+  "own": [
+    {
+      "path": ".github/workflows/bac-ci.yml",
+      "feature": "upstream maintenance"
+    },
+    {
+      "path": ".github/workflows/bac-differential.yml",
+      "feature": "wire compatibility tests"
+    },
+    {
+      "path": ".github/workflows/dependency-checks.yml",
+      "feature": "security patches"
+    },
+    {
+      "path": ".github/workflows/pm-runtime-offline.yml",
+      "feature": "PM producer"
+    },
+    {
+      "path": ".github/workflows/pm-server-package.yml",
+      "feature": "PM producer"
+    },
+    {
+      "path": "bac/",
+      "feature": "upstream maintenance"
+    },
+    {
+      "path": "docs/api/",
+      "feature": "documentation"
+    },
+    {
+      "path": "docs/architecture/",
+      "feature": "documentation"
+    },
+    {
+      "path": "docs/design/",
+      "feature": "PM producer"
+    },
+    {
+      "path": "docs/pm-server-candidate.md",
+      "feature": "PM producer"
+    },
+    {
+      "path": "docs/usage/",
+      "feature": "documentation"
+    },
+    {
+      "path": "node-sidecar/src/lib/archive-page.mjs",
+      "feature": "archive paging"
+    },
+    {
+      "path": "node-sidecar/tests/archive-history-paging.test.mjs",
+      "feature": "archive paging"
+    },
+    {
+      "path": "scripts/pm-server-package.py",
+      "feature": "PM producer"
+    },
+    {
+      "path": "scripts/pm-server-smoke.py",
+      "feature": "PM producer"
+    },
+    {
+      "path": "scripts/verify-vendored-glib.py",
+      "feature": "security patches"
+    },
+    {
+      "path": "src-tauri/crates/bat-error-log/",
+      "feature": "error log"
+    },
+    {
+      "path": "src-tauri/src/codex_pm_runtime.rs",
+      "feature": "PM producer"
+    },
+    {
+      "path": "src-tauri/src/transcript_file.rs",
+      "feature": "archive paging"
+    },
+    {
+      "path": "src-tauri/vendor/glib-0.18.5/",
+      "feature": "security patches"
+    }
+  ]
+}

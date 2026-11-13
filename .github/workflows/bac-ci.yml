@@ -1,0 +1,97 @@
+# Fork PR gates: inventory/security floor, upstream script tests, renderer, Linux desktop check.
+# pm-runtime-offline.yml owns headless check/tests (including namespace-dependent tests).
+# Parallel jobs: tests have a 20-minute cap. Desktop has a provisional 30-minute
+# cap until hosted timing is measured. The inventory needs only the base tree.
+name: BAC compatibility CI
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: bac-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  upstream-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: '10.33.2'
+          run_install: false
+      - name: Install locked dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --dir node-sidecar install --frozen-lockfile
+      - name: Test BAC tools
+        run: node --test bac/tools/tests/*.test.mjs
+      - name: Check security floor and local backport provenance
+        run: node bac/tools/check-security-floor.mjs
+      - name: Verify exact GLib backported source
+        run: python3 scripts/verify-vendored-glib.py
+      - name: Check TypeScript and build renderer
+        run: |
+          pnpm exec tsc --noEmit --pretty false
+          pnpm run compile
+      - name: Run every upstream test script named by verify:tauri-pre-ci, plus sidecar
+        run: node bac/tools/run-upstream-tests.mjs
+      - name: Require unchanged tracked source
+        run: git diff --exit-code HEAD
+  desktop-and-inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch the exact inventory base from upstream
+        run: |
+          base=$(node -p "require('./bac/UPSTREAM_BASE.json').commit")
+          [[ "$base" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --depth=1 --no-tags https://github.com/tony1223/better-agent-terminal "$base"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: '10.33.2'
+          run_install: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: '1.98.1'
+      - name: Install upstream release Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils \
+            librsvg2-bin libgdk-pixbuf2.0-bin libglib2.0-bin libgtk-3-bin
+          if apt-cache show libfuse2t64 >/dev/null 2>&1; then
+            sudo apt-get install --no-install-recommends -y libfuse2t64
+          else
+            sudo apt-get install --no-install-recommends -y libfuse2
+          fi
+      - name: Prepare embedded renderer and sidecar
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --dir node-sidecar install --frozen-lockfile
+          pnpm run compile
+          pnpm run build:tauri-sidecar
+      - name: Check Linux desktop workspace with default features
+        working-directory: src-tauri
+        run: cargo check --workspace --locked
+      - name: Check inventory and native lock/manifest consistency
+        run: node bac/tools/check-upstream-inventory.mjs
+      - name: Require unchanged tracked source
+        run: git diff --exit-code HEAD
