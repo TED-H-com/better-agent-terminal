@@ -83,8 +83,16 @@ transport follows `remote_client.rs` and `remote_core.rs`: HTTP upgrade, masked
 WebSocket client frames, v2 auth, named `params` and desktop `args`, and the
 `BATGZIP1\0` gzip envelope. It handles fragmented server messages and control
 frames. Transport boundary self-tests cover 125, 126, 127, 65535 and 65536 bytes.
-TLS certificate verification is disabled only for the owned loopback test
-server's disposable self-signed certificate; this suite does not test pinning.
+Before connecting, the harness reads the owned server's public PEM certificate
+from its explicit `enc:false` storage envelope and checks it against the full
+SHA-256 fingerprint printed in that child's startup banner. TLS validation stays
+on, with that certificate as the sole trust anchor; `checkServerIdentity` pins
+the peer's SHA-256 fingerprint instead of checking its hostname. Encrypted or
+unavailable certificate storage fails closed without decryption or TOFU. The
+self-test rejects an incorrect pin before HTTP or WebSocket data is sent. This
+tests the harness's pinning, not the product's own certificate-pinning code.
+The TLS self-test uses the installed OpenSSL CLI to generate disposable
+certificates and keys in memory; it does not store fixture private keys.
 
 The real sidecar dispatcher is loaded with the SDK override seam used by
 `node-sidecar/tests/fast-mode.test.mjs`. Fake turns yield fixed init/result

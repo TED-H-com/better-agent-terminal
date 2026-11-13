@@ -6,6 +6,7 @@ import { randomBytes } from 'node:crypto'
 import net from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
 import { Client } from './client.mjs'
+import { bannerFingerprint, ownedServerIdentity } from './tls-identity.mjs'
 
 export async function startServer(build, scratch) {
   const dir = await mkdtemp(join(scratch, 'run-'))
@@ -42,7 +43,8 @@ export async function startServer(build, scratch) {
   await writeFile(tokenFile, token, { mode: 0o600 })
   const child = spawn(build.binary, ['--bind=localhost', `--port=${port}`, `--data-dir=${data}`, `--token-file=${tokenFile}`],
     { cwd: dir, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
-  let output = '', error
+  let output = '', banner = '', error, identity
+  child.stdout.on('data', chunk => { banner = (banner + chunk).slice(-65536) })
   for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(-65536) })
   child.on('error', err => { error = err })
   const clients = []
@@ -50,7 +52,7 @@ export async function startServer(build, scratch) {
   const server = { dir, repo, home, data, port, token, clients,
     logs: () => output.replaceAll(token, '<token>').replaceAll(dir, '<scratch>'),
     async connect(gzip = true) {
-      const c = new Client(port, token, `c${clients.length}`, gzip); clients.push(c)
+      const c = new Client(port, token, `c${clients.length}`, gzip, identity); clients.push(c)
       await c.connect(); return c
     },
     async stop() {
@@ -67,10 +69,11 @@ export async function startServer(build, scratch) {
   }
   try {
     const deadline = Date.now() + 15000
-    while (!output.includes(`127.0.0.1:${port}`) && !output.includes(`localhost:${port}`)) {
+    while ((!banner.includes(`wss://127.0.0.1:${port}\n`) && !banner.includes(`wss://localhost:${port}\n`)) || !bannerFingerprint.test(banner)) {
       if (error || child.exitCode !== null || child.signalCode !== null || Date.now() > deadline) throw new Error(`Owned server did not announce port: ${error || output.replaceAll(token, '<token>').replaceAll(dir, '<scratch>')}`)
       await delay(20)
     }
+    identity = ownedServerIdentity(banner, await readFile(join(data, 'server-cert.enc.json'), 'utf8'))
     return server
   } catch (err) { await server.stop(); throw err }
 }

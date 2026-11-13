@@ -2,21 +2,22 @@
 // avoid an undeclared transitive ws dependency. Supports v2 gzip as the desktop
 // client offers it, masked client frames, control frames and fragmentation.
 import tls from 'node:tls'
+import { pinnedTlsOptions } from './tls-identity.mjs'
 import { createHash, randomBytes } from 'node:crypto'
 import { gzipSync, gunzipSync } from 'node:zlib'
 import { setTimeout as delay } from 'node:timers/promises'
 import assert from 'node:assert/strict'
 
 export class Client {
-  constructor(port, token, name, gzip = true) {
-    this.port = port; this.token = token; this.name = name; this.gzip = gzip
+  constructor(port, token, name, gzip = true, identity) {
+    this.port = port; this.token = token; this.name = name; this.gzip = gzip; this.identity = identity
     this.sent = []; this.received = []; this.buffer = Buffer.alloc(0)
     this.fragments = []; this.compressed = false; this.closed = false
   }
   async connect() {
     const key = randomBytes(16).toString('base64')
-    // Only our owned loopback server; verify the WebSocket handshake below.
-    this.socket = tls.connect({ host: '127.0.0.1', port: this.port, rejectUnauthorized: false })
+    // Trust material was obtained from the owned server before any connection.
+    this.socket = tls.connect({ host: '127.0.0.1', port: this.port, ...pinnedTlsOptions(this.identity) })
     this.socket.on('error', err => {
       if (this.expectClose && ['ECONNRESET', 'EPIPE'].includes(err.code)) this.received.push({ transport: 'socket-error', code: err.code })
       else this.failure = err
