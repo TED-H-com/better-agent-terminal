@@ -138,7 +138,7 @@
       "path": "src-tauri/Cargo.toml",
       "kind": "dependency",
       "feature": "security patches, PM producer and error log, opt-in host contracts",
-      "reason": "Root manifest wires the local error logger, Linux libc and GTK-compatible GLib patch. Small marked hooks register and dispatch the opt-in host handshake without sidecar fallback.",
+      "reason": "Root manifest wires the local error logger, Linux libc and GTK-compatible GLib patch. The marked host-contract hook declares the dependency on the local bac-host-contracts crate.",
       "plan": "keep",
       "planReason": "Retain dependency/module registration and GLib patch until GTK supports fixed glib; move PM-only libc to an own crate when runtime extraction permits.",
       "added": 12,

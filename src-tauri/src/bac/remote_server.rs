@@ -32,13 +32,10 @@ pub(super) fn capabilities(mut original: Value, protocol: RemoteProtocol) -> Val
 fn identity(ctx: &HostContext) -> Result<String, Error> {
     static HOSTS: OnceLock<Mutex<HashMap<PathBuf, Arc<Identity>>>> = OnceLock::new();
     let path = ctx.data_dir_opt().ok_or_else(|| {
-        storage_error(
-            ctx,
-            &StorageError::unavailable(
-                Reason::DataDirectoryUnavailable,
-                std::path::Path::new("<unresolved-data-dir>"),
-            ),
-        )
+        storage_error(&StorageError::unavailable(
+            Reason::DataDirectoryUnavailable,
+            std::path::Path::new("<unresolved-data-dir>"),
+        ))
     })?;
     // Keys come only from host configuration, never from BAC request parameters.
     // Separate fixture hosts in one process must not share an identity.
@@ -49,7 +46,7 @@ fn identity(ctx: &HostContext) -> Result<String, Error> {
         .entry(path.clone())
         .or_default()
         .clone();
-    host.get(&path).map_err(|error| storage_error(ctx, &error))
+    host.get(&path).map_err(|error| storage_error(&error))
 }
 
 impl Connection {
@@ -95,16 +92,16 @@ impl StorageDiagnostics {
         }
     }
 }
-fn storage_error(ctx: &HostContext, error: &StorageError) -> Error {
+fn storage_error(error: &StorageError) -> Error {
     static DIAGNOSTICS: OnceLock<StorageDiagnostics> = OnceLock::new();
     DIAGNOSTICS
         .get_or_init(Default::default)
         .log_once(error, |line| {
-            log_storage_refusal(ctx, line);
+            log_storage_refusal(line);
         });
     error.wire_error()
 }
-fn log_storage_refusal(_ctx: &HostContext, line: &str) {
+fn log_storage_refusal(line: &str) {
     bat_error_log::log("warn", "bac.identity.refused", line);
     eprintln!("[tauri] {}", crate::connection_diagnostics::redact(line));
 }
