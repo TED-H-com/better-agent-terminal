@@ -1,5 +1,5 @@
 //! BAC is intercepted before upstream profile routing or sidecar fallback.
-//! Storage diagnostics use the host error spool (headless) and redacted stderr,
+//! Storage diagnostics use redacted stderr and the host error spool where installed,
 //! once per reason. They never open a file below the host data directory.
 use super::{ContextSink, HostContext, ProfileContexts, RemoteProtocol, SidecarState};
 pub(super) use bac_host_contracts::wire::reply_id;

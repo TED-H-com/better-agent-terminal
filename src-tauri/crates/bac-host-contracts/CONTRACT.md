@@ -37,6 +37,10 @@ the verified directory by device/inode, otherwise initialization is unavailable.
 An account able to replace data-root entries can lose/change identity as it can
 replace the host certificate/token. It cannot redirect this store's writes outside
 a verified directory or make it adopt an identity from an unchecked entry.
+These checks protect against other users and link redirection, not another
+process of the same user: it can replace the final entry with another valid private
+identity. Cleanup removes old temporary entries by name within the verified
+directory; it does not prove that the removed inode was the inspected one.
 Windows instead relies on the data root's ACL; bac and host.json reparse points
 are refused. Reading shares read/delete, permitting unlink of a publisher's temp
 hard link without changing the opened file or permitting concurrent writes.
@@ -58,12 +62,16 @@ Only unsupported directory sync is tolerated as described above.
 
 ## Refusal reasons and diagnostics
 
-Storage errors retain their codes/messages and return only
+For unchanged storage situations, storage errors retain their codes/messages and
+add only a reason. Invalid entry types (including sockets) are `STORAGE_CORRUPT`;
+other failed opens are `STORAGE_UNAVAILABLE`. After a failed Unix open, a no-follow
+inspection relative to its parent handle determines the entry type; a failed
+inspection also means unavailable. These replies return only
 `details: {"reason":"<fixed name>"}`. New names may appear: clients treat unknown
 names as unspecified. No path, contents or host ID appear in these details.
-The operator receives a fixed reason and redacted path through the host error
-spool and stderr, at most once per reason per process. Desktop has no installed
-spool and receives stderr only. This diagnostic never opens a file under the
+The operator receives a fixed reason and redacted path through stderr everywhere
+and through the error spool only where the host installed it, at most once per
+reason per process. Desktop has no installed spool and receives stderr only. This diagnostic never opens a file under the
 data directory, regardless of BAT_DEBUG. The host's other diagnostics are separate.
 
 Client-visible reason names:

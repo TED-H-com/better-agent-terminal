@@ -1,4 +1,4 @@
-//! Immutable identity; publication never replaces an existing directory entry.
+//! Identity publication never replaces an existing directory entry.
 //! Unix protects integrity with effective ownership and no group/other write bits.
 //! Windows relies on the host data directory's ACL and rejects reparse points.
 //! Windows std cannot sync directories: after power loss an identity may need to
@@ -15,6 +15,10 @@
 //! Temporary-file sync_all is strict (full sync on Apple): an unsupported file
 //! sync refuses creation with STORAGE_UNAVAILABLE/temp_sync; existing identities
 //! remain readable. Only unsupported directory sync is tolerated as above.
+//! These checks protect against other users and link redirection, not another
+//! process of the same user, which can replace the final entry with another valid
+//! private identity. Cleanup removes old temporary entries by name within the
+//! verified directory; it does not prove that the removed inode was the inspected one.
 use crate::wire::{valid_host_id, Error};
 use serde_json::{json, Value};
 #[cfg(not(unix))]
