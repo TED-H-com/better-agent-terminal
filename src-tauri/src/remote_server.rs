@@ -63,6 +63,8 @@ const REMOTE_SOCKET_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 const REMOTE_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const REMOTE_RESOURCE_LOG_INTERVAL: Duration = Duration::from_secs(10);
+// bac-hook: module
+#[path = "bac/mod.rs"] mod bac;
 const MAX_REMOTE_CONNECTIONS: usize = 64;
 const MAX_REMOTE_INVOKES: usize = 128;
 const REMOTE_OUTBOUND_QUEUE_CAPACITY: usize = 256;
@@ -1356,6 +1358,8 @@ fn handle_client(
     let close = Arc::new(AtomicBool::new(false));
     let contexts = Arc::new(ProfileContexts::default());
     let _context_guard = ConnectionContextGuard(contexts.clone());
+    // bac-hook: connection
+    let bac_connection = Arc::new(bac::Connection::default());
 
     loop {
         if ws.get_ref().sock.expired() {
@@ -1573,7 +1577,8 @@ fn handle_client(
                     "protocol": protocol_name,
                     "compression": client_compression.as_str(),
                     "serverVersion": server_version,
-                    "capabilities": remote_capabilities(),
+                    // bac-hook: auth-capability
+                    "capabilities": bac::capabilities(remote_capabilities(), client_protocol),
                 }),
                 RemoteCompression::None,
             )?;
@@ -1620,6 +1625,8 @@ fn handle_client(
             let invoke_tx = out_tx.clone();
             let invoke_close = Arc::clone(&close);
             let invoke_contexts = contexts.clone();
+            // bac-hook: invoke-connection
+            let invoke_bac = bac_connection.clone();
             let spawn_id = id.clone();
             let spawn_channel = channel.clone();
             if let Err(err) = thread::Builder::new()
@@ -1636,7 +1643,8 @@ fn handle_client(
                             else { try_queue_remote_frame(&event_tx, &event_close, frame); }
                         }
                     });
-                    let result = invoke_with_profile_context(
+                    // bac-hook: dispatch
+                    let result = invoke_bac.invoke(
                         &invoke_ctx,
                         &invoke_sidecar,
                         client_protocol,
@@ -1645,6 +1653,8 @@ fn handle_client(
                         &invoke_contexts,
                         sink,
                     );
+                    // bac-hook: reply-id
+                    let id = bac::reply_id(&channel, id);
                     let response = match result {
                         Ok(value) => {
                             remote_debug_log(
@@ -1714,6 +1724,8 @@ fn handle_client(
 
 #[cfg(all(test, not(feature = "desktop")))]
 mod profile_context_integration_tests {
+    // bac-hook: fixture-tests
+    include!("bac/headless_tests.rs");
     use super::*;
     use crate::host_context::HeadlessHost;
     use crate::profile_context::ProfileContexts;
