@@ -196,3 +196,44 @@ Not covered in round 1:
 
 The closed mobile client is not available. This is a differential protocol gate
 with explicit coverage, not a claim that every possible client is indistinguishable.
+
+## Round 1 measured baseline (2026-11-13)
+
+Upstream commit `07e80f56275075195d05d58cf67a208934874557` and fork runtime
+revision `8fa0bb9` (also rebuilt from harness commit `a36ae7b`; no runtime-source
+changes), both stamped `3.2.18`, produced these measured differences:
+
+| Behavior | Upstream | Fork | Exact allowances |
+| --- | --- | --- | ---: |
+| `claude:get-pm-runtime` for an unknown session | Sidecar metrics and method-not-found | `PM_RUNTIME_RECEIPT_UNAVAILABLE` | 9 |
+| Session metadata on fake Claude/Codex turns | No `inputState` | Native input epoch/schema/counters | 21 |
+| Live Codex `client-resume` result | No cursor fields | `before: null`, `hasMore: false` | 2 |
+| 5 MiB `workspace:reload` event | Delivers original event | `remote:payload-too-large` | 12 |
+| Retained PM ownership directory | Ordinary fake start/resume; ordinary missing-session send error | `PM_RUNTIME_IMMUTABLE` on start/resume; `PM_RUNTIME_RESTART_FORBIDDEN` on send | 27 |
+
+The 71 allowances include duplicate `params`/legacy `args` representations and
+individual missing frames; they represent five behavior categories, not 71
+independent features. Every allowance matched. All 21 scenarios passed with
+547 upstream and 535 fork sent/received frames, zero unexplained differences and
+zero stale entries. Both hosts returned the same `REMOTE_RESPONSE_TOO_LARGE`
+invoke error for the large workspace load: that suspected difference was refuted
+for this path. Extra PM parameters on the ordinary fake Codex send also did not
+change the result; this does not exercise live PM validation.
+
+Three consecutive full upstream-versus-upstream runs of the final harness
+passed: 63 scenario comparisons, zero differences, 217.425 seconds total.
+The 21 comparator/transport/normalization self-checks passed. Root TypeScript
+checking and renderer compilation passed. Workflow YAML, trigger keys, all eight
+full-SHA action references and six shell blocks were validated locally; GitHub
+Actions itself and its dependency installation/checkout steps were not run here.
+
+An end-to-end run from an empty scratch build cache took **293.575 seconds**;
+its upstream and fork builds took 109.599 and 111.790 seconds. The second full run against the same cache took **72.272 seconds**,
+with both build receipts reporting `cached: true` (no Cargo rebuild). These are local debug-build measurements,
+not CI performance guarantees. No desktop build, full Rust unit suite, full
+sidecar suite, macOS/Windows run, live server or real model was exercised.
+
+Exploration initially found client envelope/length-parser mistakes and a fixture
+import/preset mistake; those were fixed, not allowlisted. Time/ID/path fields were
+then scoped explicitly, fixture diagnostic ordering was made deterministic, and
+successful concurrent-save ordering was left uncovered as described above.
