@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source": "Lead dependency-alerts.json export supplied for inv round 1; 150 alert records",
+  "source": "Repository dependency alerts exported as of 2026-11-13; 150 records. Status reconciled on 2026-11-13.",
   "packages": [
     {
       "package": "@hono/node-server",
@@ -10,7 +10,7 @@
         "pnpm-lock.yaml"
       ],
       "minimum": "2.1.6",
-      "status": "open",
+      "status": "enforced",
       "advisories": [
         {
           "id": "GHSA-frvp-7c67-39w9",
@@ -49,7 +49,7 @@
           ]
         }
       ],
-      "reason": "Seed alerts 147\u2013150 remain open, but both current locks resolve 2.1.8 >= 2.1.6 after the documented v3.2.18 targeted updates; retain exported open status pending owner reconciliation, not an assertion that the current version is vulnerable."
+      "note": "Alerts left open in the export have since closed; enforce 2.1.6 in both lockfiles to prevent regression."
     },
     {
       "package": "@modelcontextprotocol/sdk",
@@ -1443,7 +1443,7 @@
           ]
         }
       ],
-      "reason": "The desktop dependency graph resolves zip 4.6.1; patched zip 9.0.5 requires a major migration, deferred in the v3.2.18 merge record."
+      "reason": "Cargo.lock resolves zip 4.6.1 through tauri-plugin-updater 2.10.1; its Windows-only optional zip dependency (^4) is used to extract Windows updater archives, and the fixed 9.0.5 requires a major-version migration."
     }
   ]
 }

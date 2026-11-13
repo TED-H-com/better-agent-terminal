@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, compareVersions } from '../common.mjs';
-import { inspect, diffInfo } from '../check-upstream-inventory.mjs';
+import { inspect, diffInfo, summary } from '../check-upstream-inventory.mjs';
 import { checkFloor } from '../check-security-floor.mjs';
 import { parseCargo, parsePnpm } from '../locks.mjs';
 import { mergeAudit, checklist } from '../merge-audit.mjs';
@@ -24,7 +24,7 @@ function repository(t) {
   write('source.txt', 'base\n'); write('untouched.txt', 'unchanged\n');
   const base = commit();
   write('bac/UPSTREAM_BASE.json', JSON.stringify({ repository: 'https://example.invalid/upstream', tag: 'fixture', commit: base }));
-  const inventory = { upstream: [], own: [] };
+  const inventory = { upstream: [], own: [{ path: 'bac/', feature: 'maintenance' }] };
   const save = () => write('bac/upstream-inventory.json', JSON.stringify(inventory));
   const hook = (path = 'source.txt', kind = 'hook') => inventory.upstream.push({ path, kind, feature: 'fixture', reason: 'Fixture lifecycle hook', plan: 'keep', planReason: 'Needed here.', ...diffInfo(root, base, path) });
   save();
@@ -86,6 +86,91 @@ test('inventory: duplicate entries and missing human explanations fail', t => {
 test('inventory: missing base prints exact fetch command', t => {
   const r = repository(t); r.write('bac/UPSTREAM_BASE.json', JSON.stringify({ repository: 'https://example.invalid/upstream', commit: '0'.repeat(40) }));
   assert.throws(() => inspect(r.root), /git fetch --no-tags https:\/\/example.invalid\/upstream 0000000000000000000000000000000000000000/);
+});
+test('inventory: own directory covers nested files but not a similar prefix', t => {
+  const r = repository(t); r.write('extension/a.txt', 'a'); r.write('extension/nested/b.txt', 'b');
+  r.inventory.own.push({ path: 'extension/', feature: 'fixture' }); r.save();
+  assert.deepEqual(inspect(r.root).errors, []);
+  r.write('extension-other/a.txt', 'outside');
+  assert.match(inspect(r.root).errors.join('\n'), /Unlisted own path: extension-other\/a.txt/);
+});
+test('inventory: bac directory must have an explicit ownership entry', t => {
+  const r = repository(t); r.inventory.own = []; r.save();
+  assert.match(inspect(r.root).errors.join('\n'), /Unlisted own path: bac\/UPSTREAM_BASE.json/);
+});
+test('inventory: empty owned directory fails even if it exists on disk', t => {
+  const r = repository(t); mkdirSync(join(r.root, 'empty'));
+  r.inventory.own.push({ path: 'empty/', feature: 'fixture' }); r.save();
+  assert.match(inspect(r.root).errors.join('\n'), /Empty own directory: empty\/; add a file or review and remove/);
+});
+for (const nested of ['extension/a.txt', 'extension/nested/']) {
+  for (const reverse of [false, true]) test(`inventory: overlapping ownership fails (${nested}, reverse=${reverse})`, t => {
+    const r = repository(t); r.write('extension/a.txt', 'a'); r.write('extension/nested/b.txt', 'b');
+    const entries = ['extension/', nested].map(path => ({ path, feature: 'fixture' }));
+    r.inventory.own.push(...(reverse ? entries.reverse() : entries)); r.save();
+    assert.match(inspect(r.root).errors.join('\n'), /Overlapping own paths:.*remove the nested entry/);
+  });
+}
+test('inventory: a new upstream file under an owned directory collides', t => {
+  const r = repository(t); r.write('extension/upstream.txt', 'new upstream file');
+  const newBase = r.commit();
+  r.write('bac/UPSTREAM_BASE.json', JSON.stringify({ repository: 'fixture', commit: newBase }));
+  r.write('extension/ours.txt', 'our separate file');
+  // The fixture base contains its metadata; only the directory under test is owned.
+  r.inventory.own = [{ path: 'extension/', feature: 'fixture' }]; r.save();
+  assert.match(inspect(r.root).errors.join('\n'), /Own path collision: extension\/ covers upstream path extension\/upstream.txt/);
+});
+test('inventory: malformed own paths and duplicate owners fail', t => {
+  const r = repository(t);
+  r.inventory.own.push({ path: '../outside/', feature: 'fixture' }, { path: 'bac/', feature: 'fixture' }); r.save();
+  const errors = inspect(r.root).errors.join('\n');
+  assert.match(errors, /Invalid own path: ..\/outside\//); assert.match(errors, /Duplicate own path: bac\//);
+});
+test('inventory: declared hook marker passes and summary counts marked/unmarked hook entries', t => {
+  const r = repository(t); r.write('source.txt', 'base\n/* bac-hook: first-hook*/\n'); r.hook();
+  r.inventory.upstream[0].hooks = ['first-hook'];
+  r.write('untouched.txt', 'changed\n'); r.hook('untouched.txt'); r.save();
+  const result = inspect(r.root);
+  assert.deepEqual(result.errors, []);
+  assert.match(summary(result.stats), /Hook entries: 1 marked, 1 unmarked/);
+});
+test('inventory: undeclared marker fails and --update cannot accept it', t => {
+  const r = repository(t); r.write('source.txt', '// bac-hook: undeclared\n'); r.hook(); r.save();
+  assert.match(inspect(r.root, { update: true }).errors.join('\n'), /Undeclared hook marker: undeclared in source.txt; review it and add the ID/);
+});
+test('inventory: declared marker missing from content fails', t => {
+  const r = repository(t); r.write('source.txt', 'hook without marker\n'); r.hook();
+  r.inventory.upstream[0].hooks = ['missing']; r.save();
+  assert.match(inspect(r.root).errors.join('\n'), /Missing hook marker: missing in source.txt; restore its bac-hook comment/);
+});
+test('inventory: a marker in an uninventoried upstream file fails as a new difference', t => {
+  const r = repository(t); r.write('untouched.txt', '// bac-hook: unlisted\n');
+  assert.match(inspect(r.root).errors.join('\n'), /Uninventoried upstream path: untouched.txt/);
+});
+for (const id of ['Upper', 'under_score', '-leading', 'with.dot', '']) test(`inventory: invalid hook ID ${JSON.stringify(id)} fails`, t => {
+  const r = repository(t); r.write('source.txt', `// bac-hook: ${id}\n`); r.hook();
+  r.inventory.upstream[0].hooks = [id]; r.save();
+  const errors = inspect(r.root).errors.join('\n');
+  assert.match(errors, /Invalid hook ID/); assert.match(errors, /Invalid hook marker/);
+});
+test('inventory: hook list must be an array', t => {
+  const r = repository(t); r.write('source.txt', 'hook\n'); r.hook(); r.inventory.upstream[0].hooks = 'bad'; r.save();
+  assert.match(inspect(r.root).errors.join('\n'), /Invalid hooks list: source.txt; declare an array/);
+});
+test('inventory: hook IDs cannot be declared in two files', t => {
+  const r = repository(t);
+  for (const path of ['source.txt', 'untouched.txt']) {
+    r.write(path, '// bac-hook: reused\n'); r.hook(path); r.inventory.upstream.at(-1).hooks = ['reused'];
+  }
+  r.save(); const errors = inspect(r.root).errors.join('\n');
+  assert.match(errors, /Duplicate hook ID: reused.*repository-unique ID/);
+  assert.match(errors, /Duplicate hook marker: reused.*exactly once/);
+});
+test('inventory: duplicate declarations and repeated markers within one file fail', t => {
+  const r = repository(t); r.write('source.txt', '// bac-hook: repeated\n// bac-hook: repeated\n'); r.hook();
+  r.inventory.upstream[0].hooks = ['repeated', 'repeated']; r.save();
+  const errors = inspect(r.root).errors.join('\n');
+  assert.match(errors, /Duplicate hook ID: repeated/); assert.match(errors, /Duplicate hook marker: repeated/);
 });
 const floorEntry = { package: 'sample', minimum: '1.2.0', lockfiles: ['pnpm-lock.yaml'], status: 'enforced', advisories: [{ id: 'GHSA-fixture', severity: 'high' }] };
 function floorResult(versions, entry = floorEntry, read) {

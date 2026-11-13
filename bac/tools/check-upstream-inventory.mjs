@@ -7,6 +7,41 @@ import { checkLocks } from './check-lock-consistency.mjs';
 
 const KINDS = ['hook', 'legacy-patch', 'dependency', 'test', 'deleted'];
 const PLANS = ['keep', 'move-to-extension', 'upstream-as-fix', 'drop-when-upstream-has-it'];
+const HOOK_ID = /^[a-z0-9][a-z0-9-]*$/;
+const covers = (owner, path) => owner.endsWith('/') ? path.startsWith(owner) : path === owner;
+
+function checkHooks(root, entry, current, declared, found, errors) {
+  const { path } = entry;
+  if (entry.hooks !== undefined && !Array.isArray(entry.hooks)) {
+    errors.push(`Invalid hooks list: ${path}; declare an array of unique hook IDs.`);
+    return;
+  }
+  const ids = new Set();
+  for (const id of entry.hooks || []) {
+    if (typeof id !== 'string' || !HOOK_ID.test(id)) {
+      errors.push(`Invalid hook ID in ${path}: ${JSON.stringify(id)}; use [a-z0-9][a-z0-9-]*.`);
+      continue;
+    }
+    if (declared.has(id)) errors.push(`Duplicate hook ID: ${id} in ${path} and ${declared.get(id)}; assign a repository-unique ID.`);
+    else declared.set(id, path);
+    ids.add(id);
+  }
+  const markers = new Set();
+  const content = current.has(path) ? readFileSync(join(root, path), 'utf8') : '';
+  for (const match of content.matchAll(/bac-hook:[ \t]*([^\s]*)/g)) {
+    // Permit a block comment to close immediately after the ID.
+    const id = match[1].replace(/\*\/$/, '');
+    if (!HOOK_ID.test(id)) {
+      errors.push(`Invalid hook marker in ${path}: ${JSON.stringify(id)}; use bac-hook: followed by an ID matching [a-z0-9][a-z0-9-]*.`);
+      continue;
+    }
+    if (found.has(id)) errors.push(`Duplicate hook marker: ${id} in ${path} and ${found.get(id)}; each ID must occur exactly once.`);
+    else found.set(id, path);
+    markers.add(id);
+    if (!ids.has(id)) errors.push(`Undeclared hook marker: ${id} in ${path}; review it and add the ID to this entry's hooks list.`);
+  }
+  for (const id of ids) if (!markers.has(id)) errors.push(`Missing hook marker: ${id} in ${path}; restore its bac-hook comment or review and remove the declaration.`);
+}
 export function basePaths(root, base) {
   return new Set(git(root, 'ls-tree', '-r', '--name-only', '-z', base).split('\0').filter(Boolean));
 }
@@ -28,15 +63,16 @@ export function inspect(root, { update = false } = {}) {
   const changed = new Set(git(root, 'diff', '--no-renames', '--name-only', '-z', base.commit, '--').split('\0').filter(p => upstream.has(p)));
   const current = new Set(git(root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean));
   for (const path of git(root, 'ls-files', '--deleted', '-z').split('\0')) current.delete(path);
-  const errors = [], stats = [], listed = new Set();
+  const errors = [], stats = [], listed = new Set(), declaredHooks = new Map(), foundHooks = new Map();
   for (const entry of inventory.upstream) {
     const { path, kind, plan } = entry;
     if (listed.has(path)) { errors.push(`Duplicate inventory entry: ${path}; keep one reason per path.`); continue; }
     listed.add(path);
     if (!KINDS.includes(kind) || !PLANS.includes(plan) || !entry.feature || !entry.reason || !entry.planReason) errors.push(`Incomplete explanation for ${path}; write kind, feature, reason, plan and planReason.`);
+    checkHooks(root, entry, current, declaredHooks, foundHooks, errors);
     if (!changed.has(path)) { errors.push(`Stale entry: ${path} no longer differs from the base; review and remove its inventory entry.`); continue; }
     const actual = diffInfo(root, base.commit, path);
-    stats.push({ path, kind, feature: entry.feature, ...actual });
+    stats.push({ path, kind, feature: entry.feature, marked: Array.isArray(entry.hooks) && entry.hooks.length > 0, ...actual });
     const deleted = git(root, 'diff', '--no-renames', '--diff-filter=D', '--name-only', base.commit, '--', path).trim() !== '';
     if (deleted !== (kind === 'deleted')) errors.push(`Deletion classification changed: ${path}; review and set kind to ${deleted ? 'deleted' : 'its actual kind'}.`);
     if (LOCKS.includes(path)) {
@@ -49,18 +85,28 @@ export function inspect(root, { update = false } = {}) {
   for (const path of changed) if (!listed.has(path)) errors.push(`Uninventoried upstream path: ${path}; add a human-written inventory entry with feature, kind, reason and plan, then run --update.`);
   const own = new Set();
   for (const entry of inventory.own) {
-    if (!entry.path || !entry.feature || own.has(entry.path)) errors.push(`Invalid/duplicate own-file entry: ${entry.path}`);
+    if (typeof entry.path !== 'string' || !entry.path || entry.path.startsWith('/') || entry.path.includes('\\') || entry.path.replace(/\/$/, '').split('/').some(part => !part || part === '.' || part === '..') || !entry.feature) {
+      errors.push(`Invalid own path: ${entry.path}; use a relative file path or a nonempty directory path ending in /, with a feature.`);
+      continue;
+    }
+    if (own.has(entry.path)) { errors.push(`Duplicate own path: ${entry.path}; keep one owner per path.`); continue; }
+    for (const previous of own) if (covers(previous, entry.path) || covers(entry.path, previous)) errors.push(`Overlapping own paths: ${previous} and ${entry.path}; remove the nested entry so every path has one owner.`);
     own.add(entry.path);
-    if (upstream.has(entry.path)) errors.push(`Own path collision: ${entry.path} now exists in the base; compare both implementations, relocate ours or adopt upstream, and reclassify before merging.`);
-    else if (!current.has(entry.path)) errors.push(`Stale own path: ${entry.path}; review and remove its inventory entry.`);
+    const collision = [...upstream].find(path => covers(entry.path, path) || (entry.path.endsWith('/') && path === entry.path.slice(0, -1)));
+    if (collision) errors.push(`Own path collision: ${entry.path} covers upstream path ${collision}; compare both implementations, relocate ours or adopt upstream, and reclassify before merging.`);
+    if (entry.path.endsWith('/')) {
+      if (![...current].some(path => covers(entry.path, path))) errors.push(`Empty own directory: ${entry.path}; add a file or review and remove its inventory entry.`);
+    } else if (!current.has(entry.path)) errors.push(`Stale own path: ${entry.path}; review and remove its inventory entry.`);
   }
-  for (const path of current) if (!path.startsWith('bac/') && !upstream.has(path) && !own.has(path)) errors.push(`Unlisted own path: ${path}; add it to the own list so future upstream collisions are detected.`);
+  for (const path of current) if (!upstream.has(path) && ![...own].some(owner => covers(owner, path))) errors.push(`Unlisted own path: ${path}; add it to the own list so future upstream collisions are detected.`);
   // Never partially rewrite a structurally invalid inventory.
   if (update && !errors.length) writeFileSync(file, `${JSON.stringify(inventory, null, 2)}\n`);
   return { errors, stats };
 }
 export function summary(stats) {
   const lines = [`Upstream files touched: ${stats.length}`];
+  const hooks = stats.filter(row => row.kind === 'hook');
+  lines.push(`Hook entries: ${hooks.filter(row => row.marked).length} marked, ${hooks.filter(row => !row.marked).length} unmarked`);
   for (const dimension of ['kind', 'feature']) {
     const groups = new Map();
     for (const row of stats) {

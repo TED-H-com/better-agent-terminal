@@ -1,7 +1,7 @@
 # Fork PR gates: inventory/security floor, upstream script tests, renderer, Linux desktop check.
 # pm-runtime-offline.yml owns headless check/tests (including namespace-dependent tests).
-# Two parallel jobs, each capped at 20 min. Cold desktop estimate: 12–18 min
-# (APT/install ~3–5, renderer/sidecar <1, cargo ~8–12); hosted timing must be measured.
+# Parallel jobs: tests have a 20-minute cap. Desktop has a provisional 30-minute
+# cap until hosted timing is measured. The inventory needs only the base tree.
 name: BAC compatibility CI
 on:
   pull_request:
@@ -46,7 +46,7 @@ jobs:
         run: git diff --exit-code HEAD
   desktop-and-inventory:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: '4'
       CARGO_TERM_COLOR: never
@@ -58,7 +58,7 @@ jobs:
         run: |
           base=$(node -p "require('./bac/UPSTREAM_BASE.json').commit")
           [[ "$base" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --no-tags https://github.com/tony1223/better-agent-terminal "$base"
+          git fetch --depth=1 --no-tags https://github.com/tony1223/better-agent-terminal "$base"
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '24'
