@@ -196,6 +196,45 @@ test('oversized remembered record is a bounded placeholder carrying its id and s
   assert.ok(Buffer.byteLength(JSON.stringify(item)) < HISTORY_RESPONSE_MAX_BYTES)
 })
 
+test('tool results at page boundaries remain visible and cursors survive remount snapshots', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bat-tool-page-'))
+  const { loadSessionHistory } = await import('../src/handlers/claude-history.mjs')
+  const { dispatch } = await import('../src/server.mjs')
+  const { sessions, ensureSession } = await import('../src/lib/state.mjs')
+  const { __setProjectsDirOverrideForTests } = await import('../src/lib/data-paths.mjs')
+  const { __setSendEventForTests } = await import('../src/lib/protocol.mjs')
+  __setProjectsDirOverrideForTests(dir)
+  __setSendEventForTests(() => {})
+  const sessionId = 'split-tool-session'
+  const session = ensureSession(sessionId)
+  session.sdkSessionId = 'split-tool'; session.options = { cwd: dir }
+  try {
+    const project = join(dir, dir.replace(/[^a-zA-Z0-9]/g, '-'))
+    await mkdir(project, { recursive: true })
+    await writeFile(join(project, 'split-tool.jsonl'), [
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tool-split', name: 'Bash', input: { command: 'echo ok' } }] } },
+      { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-split', is_error: true, content: 'failed result' }] } },
+    ].map(JSON.stringify).join('\n') + '\n')
+    const latest = await loadSessionHistory(sessionId, 'split-tool', dir, { maxEntries: 1 })
+    assert.equal(latest.items[0].id, 'tool-split')
+    assert.equal(latest.items[0].result, 'failed result')
+    assert.equal(latest.items[0].status, 'error')
+    assert.equal(latest.items[0].historyToolResult, true)
+    const snapshot = (await dispatch({ jsonrpc: '2.0', id: 1, method: 'claude.getSessionState', params: { sessionId } })).result
+    assert.equal(snapshot.historyBefore, latest.before)
+    const previous = await loadSessionHistory(sessionId, 'split-tool', dir, { before: latest.before, maxEntries: 1 })
+    assert.equal(previous.items[0].id, 'tool-split')
+    assert.equal(previous.items[0].toolName, 'Bash')
+    assert.deepEqual(previous.items[0].input, { command: 'echo ok' })
+    assert.equal(session.historyBefore, latest.before, 'paging does not replace the host resume cursor')
+  } finally {
+    sessions.delete(sessionId)
+    __setProjectsDirOverrideForTests(null)
+    __setSendEventForTests(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('serialized expansion of one record is replaced rather than emitting an oversized history event', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'bat-expanded-history-'))
   const { loadSessionHistory } = await import('../src/handlers/claude-history.mjs')

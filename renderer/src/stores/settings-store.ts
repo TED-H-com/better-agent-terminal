@@ -43,6 +43,7 @@ const defaultSettings: AppSettings = {
   createDefaultAgentTerminal: true,
   allowBypassPermissions: true,
   allowFastMode: false,
+  autoResumeAfterRateLimit: false,
   fastModeEpoch: 0,
   defaultEffort: 'high',
   defaultCodexEffort: 'high',
@@ -242,6 +243,12 @@ class SettingsStore {
     this.settings = { ...this.settings, collapseToolOutputs: collapse }
     this.notify()
     this.save()
+  }
+
+  async setAutoResumeAfterRateLimit(enabled: boolean): Promise<void> {
+    await host.settings.save(JSON.stringify({ ...this.settings, autoResumeAfterRateLimit: enabled }))
+    this.settings = { ...this.settings, autoResumeAfterRateLimit: enabled }
+    this.notify()
   }
 
   setCacheExpiryWarning(enabled: boolean): void {
@@ -496,6 +503,7 @@ class SettingsStore {
         }
         parsed.defaultAgent = normalizeDefaultAgent(parsed.defaultAgent)
         parsed.allowFastMode = parsed.allowFastMode === true
+        parsed.autoResumeAfterRateLimit = parsed.autoResumeAfterRateLimit === true
         parsed.fastModeEpoch = Number.isSafeInteger(parsed.fastModeEpoch) && parsed.fastModeEpoch >= 0 ? parsed.fastModeEpoch : 0
         this.settings = { ...defaultSettings, ...parsed }
         this.notify()

@@ -26,7 +26,9 @@ export async function readHistoryPage(path, { before, maxBytes = HISTORY_MAX_BYT
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error('Invalid history limits')
   const file = await open(path, 'r')
   try {
-    const { size } = await file.stat()
+    const metadata = await file.stat()
+    if (!metadata.isFile()) throw new Error('History transcript must be a regular file')
+    const { size } = metadata
     if (before !== undefined && (!Number.isSafeInteger(before) || before < 0 || before > size)) throw new Error('Invalid history cursor')
     const end = before ?? size
     const start = Math.max(0, end - maxBytes)

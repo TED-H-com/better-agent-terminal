@@ -78,12 +78,15 @@ pub fn guard_remote_history_event(mut frame: Value) -> Value {
         return frame;
     }
     let channel = channel.to_owned();
-    let session_id = frame["params"]["sessionId"].clone();
-    frame["params"]["items"] = json!([{
+    let session_id = frame["params"].get("sessionId")
+        .or_else(|| frame["args"].get(0)).cloned().unwrap_or(Value::Null);
+    // Older hosts can call the history array `payload`, or supply only the
+    // legacy args. Replace both copies so no oversized alias survives.
+    frame["params"] = json!({ "sessionId": session_id, "items": [{
         "id": "hist-remote-gap", "sessionId": session_id, "role": "system", "timestamp": 0,
         "content": format!("[History gap: oversized remote history omitted ({size} bytes; hist-remote-gap)]"),
         "historyGap": { "id": "hist-remote-gap", "sizeBytes": size }
-    }]);
+    }] });
     frame["args"] = json!(event_params_to_legacy_v1_args(&channel, &frame["params"]));
     frame
 }
@@ -1831,5 +1834,18 @@ mod response_budget_tests {
         assert_eq!(bounded["params"]["sessionId"], "large-session");
         assert_eq!(bounded["params"]["items"][0]["historyGap"]["id"], "hist-remote-gap");
         assert!(serde_json::to_vec(&bounded).unwrap().len() < REMOTE_RESPONSE_MAX_BYTES);
+        for event in [
+            json!({"type": "event", "channel": "claude:history", "params": {
+                "sessionId": "legacy", "payload": [{"content": "x".repeat(REMOTE_RESPONSE_MAX_BYTES)}]
+            }}),
+            json!({"type": "event", "channel": "claude:history", "args": [
+                "legacy", [{"content": "x".repeat(REMOTE_RESPONSE_MAX_BYTES)}]
+            ]}),
+        ] {
+            let bounded = guard_remote_history_event(event);
+            assert_eq!(bounded["params"]["sessionId"], "legacy");
+            assert!(serde_json::to_vec(&bounded).unwrap().len() < REMOTE_RESPONSE_MAX_BYTES);
+            assert_eq!(bounded["args"][1], bounded["params"]["items"]);
+        }
     }
 }

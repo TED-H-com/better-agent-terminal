@@ -35,12 +35,15 @@ export function refreshFastMode(session) {
   if (session.fastMode && !effectiveFastMode(session)) {
     session.fastMode = false
     session.fastModeState = 'off'
+    session.fastModePending = false
     session.fastModeDisabledReason = null
   }
 }
 
 export function applyFastModeStatus(session, message) {
   if (message?.parent_tool_use_id || !['off', 'on', 'cooldown'].includes(message?.fast_mode_state)) return false
+  // Status from the current query cannot replace a choice for the next turn.
+  if (session.fastModePending) return false
   session.fastModeState = message.fast_mode_state
   session.fastModeDisabledReason = message.fast_mode_disabled_reason || null
   if (message.fast_mode_state === 'off') session.fastMode = false

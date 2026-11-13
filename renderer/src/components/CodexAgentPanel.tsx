@@ -1,6 +1,7 @@
 import { createBackoff, formatError } from '../utils/resume-recovery'
 import { persistTranscriptArchive, readArchivePage, releaseArchivedSnapshots, resolveTranscriptPrompt, transcriptArchivePrefix, type ArchivePage } from '../utils/transcript-window'
 import { host, isTauri } from '../host-api'
+import { getClaudeModelPricing, type ClaudeModelPricing } from '../utils/claude-model-pricing'
 import { useState, useEffect, useRef, useCallback, useMemo, Fragment, cloneElement, isValidElement, memo } from 'react'
 import { describePendingAction } from '../utils/attention'
 import { flushSync } from 'react-dom'
@@ -38,6 +39,7 @@ import { AgentFastModeCheckbox } from './AgentFastModeCheckbox'
 import { useRafBatchedString } from '../utils/use-raf-batched-string'
 import { translateRuntimeMessage } from '../utils/runtime-status-message'
 import { agentSendResultError, isMissingSessionCwdError } from '../utils/agent-send-recovery'
+import { formatErrorMessage } from '../utils/error-message'
 import { dispatchWorkerCommand, parseWorkerSlashCommand } from '../utils/worker-command'
 import { BAT_FAST_SLASH_COMMAND, executeBatFastCommand, parseBatFastCommand } from '../utils/fast-mode-command'
 import { BAT_RELOAD_SLASH_COMMAND } from '../utils/session-reload'
@@ -59,6 +61,7 @@ import { CodexTodoChecklist } from './CodexTodoChecklist'
 import { ReasoningSummary } from './ReasoningSummary'
 import { bindPanelActiveEvent, usePanelActivation, usePanelActiveEffect, type PanelActivation } from '../utils/panel-activation'
 import { prepareFilePickerResults, type FilePickerSearchEntry } from '../utils/file-picker-search'
+import { resolveToolImage, type GeneratedImage } from '../utils/agent-tool-image'
 
 function clearRuntimeStatusMeta(meta: SessionMeta | null): SessionMeta | null {
   if (!meta?.runtimeStatus && !meta?.runtimeMessage && !meta?.runtimeStatusStartedAt) return meta
@@ -193,28 +196,6 @@ function formatContextWindowSuffix(displayName: string, contextWindow?: number):
   return displayName.toLowerCase().includes(label.toLowerCase()) ? '' : ` (${label})`
 }
 
-type GeneratedImage = { dataUrl?: string; path?: string; revisedPrompt?: string }
-
-function parseGeneratedImageResult(result: unknown): GeneratedImage | null {
-  if (typeof result !== 'string') return null
-  try {
-    const parsed = JSON.parse(result) as { type?: string; dataUrl?: string; path?: string; revisedPrompt?: string }
-    if (parsed.type !== 'image_generation') return null
-    if (typeof parsed.dataUrl === 'string' && parsed.dataUrl.startsWith('data:image/')) {
-      return { dataUrl: parsed.dataUrl, revisedPrompt: parsed.revisedPrompt }
-    }
-    // Codex saves the image itself and reports where. Carrying the path instead
-    // of the bytes keeps a megabyte of base64 out of session history; the file
-    // is read back on demand once the card is actually rendered.
-    if (typeof parsed.path === 'string' && parsed.path) {
-      return { path: parsed.path, revisedPrompt: parsed.revisedPrompt }
-    }
-  } catch {
-    return null
-  }
-  return null
-}
-
 function filenameForGeneratedImage(prompt: string, id?: string): string {
   const base = (prompt || id || 'generated-image')
     .replace(/\s+/g, '-')
@@ -235,10 +216,11 @@ function GeneratedImageCard({ image, prompt, onOpen, onSave }: {
   const [failed, setFailed] = useState(false)
 
   useEffect(() => {
-    if (image.dataUrl) { setDataUrl(image.dataUrl); return }
+    setFailed(false)
+    setDataUrl(image.dataUrl ?? null)
+    if (image.dataUrl) return
     if (!image.path) return
     let cancelled = false
-    setFailed(false)
     host.image.readAsDataUrl(image.path)
       .then(url => { if (!cancelled) setDataUrl(url) })
       .catch(() => { if (!cancelled) setFailed(true) })
@@ -272,7 +254,7 @@ function GeneratedImageCard({ image, prompt, onOpen, onSave }: {
         onClick={() => onOpen(dataUrl)}
         title="Open generated image"
       >
-        <img src={dataUrl} alt={prompt || 'Generated image'} />
+        <img src={dataUrl} alt={prompt || 'Generated image'} onError={() => setFailed(true)} />
       </button>
       <div className="codex-generated-image-actions">
         <button type="button" onClick={() => onOpen(dataUrl)}>Open</button>
@@ -461,6 +443,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     if (typeof globalDefault === 'string' && CODEX_EFFORT_LEVELS.includes(globalDefault as CodexEffortLevel)) return globalDefault
     return 'high'
   })
+  const [effortChangePending, setEffortChangePending] = useState(false)
+  const [effortChangeError, setEffortChangeError] = useState('')
   const adoptHostSessionMeta = useCallback((meta: SessionMeta) => {
     workspaceStore.applyTerminalSessionMeta(sessionId, meta)
     if (Object.prototype.hasOwnProperty.call(meta, 'sdkSessionId')) setHasSdkSession(!!meta.sdkSessionId)
@@ -472,7 +456,11 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
     if (approval === 'untrusted' || approval === 'on-request' || approval === 'never') {
       setCodexApprovalPolicy(approval)
     }
-  }, [sessionId])
+    if (isCodexSession && typeof meta.effort === 'string'
+      && CODEX_EFFORT_LEVELS.includes(meta.effort as CodexEffortLevel)) {
+      setEffortLevel(meta.effort)
+    }
+  }, [sessionId, isCodexSession])
   const [claudeUsage, setClaudeUsage] = useState(workspaceStore.claudeUsage)
   const [usageAccount, setUsageAccount] = useState(workspaceStore.usageAccount)
   const [rateLimits, setRateLimits] = useState<Record<string, { resetsAt: number; utilization: number | null; isUsingOverage: boolean }>>({})
@@ -2099,7 +2087,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           dlog(`${stag} mount effect init failed: ${formatError(err, { sessionId })}`)
           setMessages(prev => [...prev.filter(m => m.id !== `sys-resume-failed-${sessionId}`), {
             id: `sys-resume-failed-${sessionId}`, sessionId, role: 'system' as const,
-            content: `Session resume failed; retrying: ${message}`, timestamp: Date.now(),
+            content: t('claude.sessionResumeFailed', { message }), timestamp: Date.now(),
           }])
           retryTimer = setTimeout(() => { void initialize() }, retryBackoff.next())
         }
@@ -3503,12 +3491,23 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
 
   const handleEffortChange = useCallback(async (e: React.ChangeEvent<HTMLSelectElement>) => {
     const next = e.target.value
-    setEffortLevel(next)
-    if (isCodexSession) {
-      workspaceStore.updateTerminalAgentParams(sessionId, { effortLevel: next })
+    setEffortChangePending(true)
+    setEffortChangeError('')
+    try {
+      await ensureSessionStarted()
+      const applied = await host.claude.setEffort(sessionId, next)
+      if (applied !== true) throw new Error('The host did not apply the reasoning effort change.')
+      setEffortLevel(next)
+      setSessionMeta(previous => previous ? { ...previous, effort: next } : previous)
+      if (isCodexSession) {
+        workspaceStore.updateTerminalAgentParams(sessionId, { effortLevel: next })
+      }
+    } catch (error) {
+      setEffortChangeError(formatErrorMessage(error, 'Unable to change reasoning effort.'))
+    } finally {
+      setEffortChangePending(false)
     }
-    await host.claude.setEffort(sessionId, next)
-  }, [sessionId, isCodexSession])
+  }, [sessionId, isCodexSession, ensureSessionStarted])
 
   const handleCodexSandboxModeChange = useCallback(async (e: React.ChangeEvent<HTMLSelectElement>) => {
     const next = e.target.value as CodexSandboxMode
@@ -4103,8 +4102,8 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
       }
 
       // image_view is the same card: an image the agent opened rather than drew.
-      if (item.toolName === 'image_gen' || item.toolName === 'image_view') {
-        const generatedImage = parseGeneratedImageResult(item.result)
+      if (item.toolName === 'image_gen' || item.toolName === 'image_view' || item.toolName === 'view_image') {
+        const generatedImage = resolveToolImage(item.toolName, item.input, item.result, item.status)
         const prompt = generatedImage?.revisedPrompt
           || String(item.input.prompt || item.input.path || '')
         const filename = filenameForGeneratedImage(prompt, item.id)
@@ -4128,7 +4127,9 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 <div className="claude-tool-blocks">
                   <div className="claude-tool-row">
                     <span className="claude-tool-row-label">{item.status === 'running' ? 'RUN' : t('claude.out')}</span>
-                    <span className="claude-tool-row-content">{item.status === 'running' ? 'Generating image...' : stringifyToolResult(item.result)}</span>
+                    <span className="claude-tool-row-content">{item.status === 'running'
+                      ? (item.toolName === 'image_gen' ? 'Generating image...' : 'Loading image...')
+                      : stringifyToolResult(item.result)}</span>
                   </div>
                 </div>
               )}
@@ -5682,12 +5683,13 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
               </span>
             )}
             {(isCodexSession || !isV2Session) && <AgentFastModeCheckbox sessionId={sessionId}
-              disabled={isStreaming} ensureSessionStarted={ensureSessionStarted} />}
+              isStreaming={isStreaming} ensureSessionStarted={ensureSessionStarted} />}
             {(isCodexSession || !isV2Session) && (
               <select
                 className="claude-effort-select"
                 value={effortLevel}
                 onChange={handleEffortChange}
+                disabled={effortChangePending}
                 title={t('claude.effortLevel')}
               >
                 {effortOptions.map(level => (
@@ -5695,6 +5697,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
                 ))}
               </select>
             )}
+            {effortChangeError && <span className="claude-fast-error" role="alert">{effortChangeError}</span>}
             {!isCodexSession && accountInfo?.organization && (
               <span className="claude-status-btn claude-account-info" title={`${accountInfo.email || ''} (${accountInfo.subscriptionType || 'unknown'})`}>
                 {accountInfo.organization}
@@ -5857,46 +5860,15 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
         const hist = cacheHistoryRef.current
         const significant = hist.filter(h => h.totalInput >= 50000)
         const belowCount = significant.filter(h => h.pct < 50).length
-        // Per-MTok pricing — exact model match only, no fallback
-        // Ref: https://platform.claude.com/docs/en/about-claude/pricing
-        const P = (input: number, output: number) => ({ input, output, cacheRead: input * 0.1, cacheWrite5m: input * 1.25, cacheWrite1h: input * 2 })
-        const MODEL_PRICING: Record<string, ReturnType<typeof P>> = {
-          'opus-5-5': { ...P(4, 20), cacheRead: 0.20 },
-          'opus-5':    P(5, 25),    'opus-4-8':  P(5, 25),    'opus-4-7':  P(5, 25),    'opus-4-6':  P(5, 25),    'opus-4-5':  P(5, 25),
-          'opus-4-1':  P(15, 75),   'opus-4':    P(15, 75),   'opus-3': P(15, 75),
-          'sonnet-4-6': P(3, 15),   'sonnet-4-5': P(3, 15),   'sonnet-4': P(3, 15),
-          'sonnet-3-7': P(3, 15),   'sonnet-3-5': P(3, 15),
-          'haiku-4-5': P(1, 5),     'haiku-3-5': P(0.80, 4),  'haiku-3': P(0.25, 1.25),
-        }
-        const getModelPricing = (model: string) => {
-          if (model.includes('opus-5-5')) return MODEL_PRICING['opus-5-5']
-          if (model.includes('opus-5')) return MODEL_PRICING['opus-5']
-          if (model.includes('opus-4-8')) return MODEL_PRICING['opus-4-8']
-          if (model.includes('opus-4-7')) return MODEL_PRICING['opus-4-7']
-          if (model.includes('opus-4-6')) return MODEL_PRICING['opus-4-6']
-          if (model.includes('opus-4-5')) return MODEL_PRICING['opus-4-5']
-          if (model.includes('opus-4-1')) return MODEL_PRICING['opus-4-1']
-          if (model.includes('opus-4-0') || model.match(/opus-4(?!-)\b/) || model.match(/opus-4-2\d{7}/)) return MODEL_PRICING['opus-4']
-          if (model.includes('opus-3') || model.includes('3-opus')) return MODEL_PRICING['opus-3']
-          if (model.includes('sonnet-4-6')) return MODEL_PRICING['sonnet-4-6']
-          if (model.includes('sonnet-4-5')) return MODEL_PRICING['sonnet-4-5']
-          if (model.includes('sonnet-4-0') || model.match(/sonnet-4(?!-)\b/) || model.match(/sonnet-4-2\d{7}/)) return MODEL_PRICING['sonnet-4']
-          if (model.includes('sonnet-3-7') || model.includes('3-7-sonnet')) return MODEL_PRICING['sonnet-3-7']
-          if (model.includes('sonnet-3-5') || model.includes('3-5-sonnet')) return MODEL_PRICING['sonnet-3-5']
-          if (model.includes('haiku-4') || model.includes('4-5-haiku')) return MODEL_PRICING['haiku-4-5']
-          if (model.includes('haiku-3-5') || model.includes('3-5-haiku')) return MODEL_PRICING['haiku-3-5']
-          if (model.includes('haiku-3') || model.includes('3-haiku')) return MODEL_PRICING['haiku-3']
-          return null
-        }
         const fmtCost = (v: number | null) => v === null ? '—' : `$${v.toFixed(4)}`
         // Calculate per-model cost for a history entry using pricing lookup
         const calcModelCosts = (h: typeof hist[0]) => {
           const hasModelUsage = h.modelUsage && Object.keys(h.modelUsage).length > 0
           if (hasModelUsage) {
-            const models: { model: string; cacheRead: number; cacheWrite: number; input: number; output: number; readCost: number | null; writeCost: number | null; totalCost: number | null; pricing: ReturnType<typeof P> | null }[] = []
+            const models: { model: string; cacheRead: number; cacheWrite: number; input: number; output: number; readCost: number | null; writeCost: number | null; totalCost: number | null; pricing: ClaudeModelPricing | null }[] = []
             for (const [model, stats] of Object.entries(h.modelUsage!)) {
-              const p = getModelPricing(model)
               const totalIn = stats.inputTokens + stats.cacheReadInputTokens + stats.cacheCreationInputTokens
+              const p = getClaudeModelPricing(model, totalIn, true)
               if (!p) {
                 models.push({ model, cacheRead: stats.cacheReadInputTokens, cacheWrite: stats.cacheCreationInputTokens, input: totalIn, output: stats.outputTokens, readCost: null, writeCost: null, totalCost: null, pricing: null })
                 continue
@@ -5918,7 +5890,7 @@ const CodexAgentPanelContent = memo(function CodexAgentPanelContent({ sessionId,
           }
           // Fallback: estimate from entry-level model + turn tokens when modelUsage is unavailable (streaming)
           if (h.model) {
-            const p = getModelPricing(h.model)
+            const p = getClaudeModelPricing(h.model, h.totalInput, h.isResult === true)
             const output = h.outputTokens || 0
             if (!p) return [{ model: h.model, cacheRead: h.cacheRead, cacheWrite: h.cacheCreate, input: h.totalInput, output, readCost: null, writeCost: null, totalCost: null, pricing: null }]
             let writePrice = p.cacheWrite5m

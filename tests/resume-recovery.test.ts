@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { createBackoff, formatError } from '../renderer/src/utils/resume-recovery.ts'
-import { BoundedSeenIds, dedupeMessagesById } from '../renderer/src/utils/message-dedupe.ts'
+import { BoundedSeenIds, dedupeMessagesById, mergeHistoryMessages } from '../renderer/src/utils/message-dedupe.ts'
 
 test('formatError selects structured fields for Error, objects, strings and unusual inputs', () => {
   const error = Object.assign(new Error('offline'), { code: 'DISCONNECTED', token: 'never-log' })
@@ -57,6 +57,20 @@ test('seen IDs are session isolated, bounded, and survive live window removal', 
   assert.ok(sessionA.has('b'))
   sessionA.clear()
   assert.equal(sessionA.size, 0)
+})
+
+test('tools split across history pages retain both request metadata and their result', () => {
+  const request = { id: 'tool', toolName: 'Bash', input: { command: 'echo ok' }, status: 'completed' }
+  const result = { id: 'tool', toolName: 'Tool', input: {}, status: 'error', result: 'failed', historyToolResult: true }
+  for (const items of [[request, result], [result, request]]) {
+    const merged = mergeHistoryMessages(items)
+    assert.equal(merged.length, 1)
+    assert.equal(merged[0].toolName, 'Bash')
+    assert.deepEqual(merged[0].input, { command: 'echo ok' })
+    assert.equal(merged[0].status, 'error')
+    assert.equal(merged[0].result, 'failed')
+  }
+  assert.deepEqual(mergeHistoryMessages([{ id: 'message', content: 'old' }, { id: 'message', content: 'current' }]), [{ id: 'message', content: 'current' }])
 })
 
 

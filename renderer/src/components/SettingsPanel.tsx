@@ -110,6 +110,8 @@ export function SettingsPanel({ onClose, isRemoteProfile = false, remoteOrigin =
   const { t } = useTranslation()
   const [activeTab, setActiveTab] = useState<SettingsTab>('general')
   const [settings, setSettings] = useState<AppSettings>(settingsStore.getSettings())
+  const [rateLimitResumeSaving, setRateLimitResumeSaving] = useState(false)
+  const [rateLimitResumeError, setRateLimitResumeError] = useState('')
   const [fastModeSaving, setFastModeSaving] = useState(false)
   const [fastModeError, setFastModeError] = useState('')
   const [availableFonts, setAvailableFonts] = useState<Set<FontType>>(new Set())
@@ -1091,6 +1093,22 @@ export function SettingsPanel({ onClose, isRemoteProfile = false, remoteOrigin =
 
               <div className="settings-section">
                 <h3>{t('settings.agentBehavior')}</h3>
+                <div className="settings-group checkbox-group">
+                  <label>
+                    <input type="checkbox" checked={settings.autoResumeAfterRateLimit === true} disabled={rateLimitResumeSaving}
+                      onChange={async e => {
+                        const enabled = e.target.checked
+                        setRateLimitResumeSaving(true)
+                        setRateLimitResumeError('')
+                        try { await settingsStore.setAutoResumeAfterRateLimit(enabled) }
+                        catch (err) { setRateLimitResumeError(err instanceof Error ? err.message : String(err)) }
+                        finally { setRateLimitResumeSaving(false) }
+                      }} />
+                    {t('settings.autoResumeAfterRateLimit')}
+                  </label>
+                  <p className="settings-hint">{t('settings.autoResumeAfterRateLimitHint')}</p>
+                  {rateLimitResumeError && <p className="settings-hint" role="alert">{rateLimitResumeError}</p>}
+                </div>
                 {isDebugMode && <div className="settings-group checkbox-group">
                   <label>
                     <input type="checkbox" checked={settings.allowFastMode === true} disabled={fastModeSaving}

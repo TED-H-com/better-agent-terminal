@@ -31,12 +31,12 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "desktop")]
 use tauri::{AppHandle, Manager, State, WebviewWindow};
@@ -604,6 +604,62 @@ fn log_auth_line(app: &HostContext, message: &str) {
         .unwrap_or_default();
     let line = format!("{millis} [claude-auth] {message}\n");
     let _ = crate::log_file::append_line_blocking(&dir.join("logs").join("debug.log"), &line);
+}
+
+/// Continue only an existing, idle runtime. Never recreate a stopped session or
+/// use the notification snapshot as proof that its runtime is still alive.
+pub(crate) async fn resume_after_rate_limit(
+    app: &HostContext,
+    session_id: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<bool, BridgeError> {
+    use std::sync::atomic::Ordering;
+    if cancelled.load(Ordering::SeqCst) || !crate::rate_limit_resume::enabled(app) {
+        return Ok(false);
+    }
+    let router = ClaudeRuntimeRouter {
+        app: app.clone(),
+        sidecar: app.sidecar(),
+        codex: app.state::<CodexAppServerState>(),
+    };
+    let state = if router.codex.is_owned(session_id) {
+        if router.codex.is_resting(session_id) == Some(json!(true)) {
+            return Ok(false);
+        }
+        router.codex.get_session_state(session_id).unwrap_or(Value::Null)
+    } else {
+        let resting = router
+            .sidecar_call("claude.isResting", json!({ "sessionId": session_id }), DEFAULT_TIMEOUT)
+            .await?;
+        if resting == true {
+            return Ok(false);
+        }
+        router
+            .sidecar_call("claude.getSessionState", json!({ "sessionId": session_id }), DEFAULT_TIMEOUT)
+            .await?
+    };
+    if !rate_limit_resume_can_send(&state)
+        || cancelled.load(Ordering::SeqCst)
+        || !crate::rate_limit_resume::enabled(app)
+    {
+        return Ok(false);
+    }
+    let result = router
+        .send_message(
+            session_id.to_string(),
+            "Continue the interrupted task from where you stopped. (Automatically sent by BAT after the usage limit reset.)".to_string(),
+            None, None, None, None, None,
+        )
+        .await?;
+    Ok(result.get("ok").and_then(Value::as_bool) != Some(false))
+}
+
+fn rate_limit_resume_can_send(state: &Value) -> bool {
+    state["isStreaming"].as_bool() == Some(false)
+        && state["meta"]["isStreaming"] != true
+        && state["meta"]["runtimeStatus"].as_str().is_none_or(str::is_empty)
+        && state["pendingPermission"].is_null()
+        && state["pendingAskUser"].is_null()
 }
 
 /// The renderer-facing channel for "the active account set just changed".
@@ -1576,6 +1632,13 @@ struct ClaudeModelDef {
 /// Ordered newest-first — the picker renders the rows in this order.
 const CLAUDE_MODEL_TABLE: &[ClaudeModelDef] = &[
     ClaudeModelDef {
+        id: "claude-fable-5-2",
+        label: "Fable 5.2",
+        context_window: 1_000_000,
+        windows: &[Some(200_000), Some(300_000), None],
+        description: None,
+    },
+    ClaudeModelDef {
         id: "claude-opus-5-5",
         label: "Opus 5.5",
         context_window: 1_000_000,
@@ -1643,6 +1706,13 @@ const CLAUDE_MODEL_TABLE: &[ClaudeModelDef] = &[
         label: "Sonnet 4.6 (1M)",
         context_window: 1_000_000,
         windows: &[],
+        description: None,
+    },
+    ClaudeModelDef {
+        id: "claude-haiku-5-5",
+        label: "Haiku 5.5",
+        context_window: 1_000_000,
+        windows: &[Some(200_000), Some(300_000), None],
         description: None,
     },
     ClaudeModelDef {
@@ -2309,15 +2379,99 @@ pub(crate) fn archive_messages_in_dir(
     if items.is_empty() {
         return Ok(true);
     }
-    let archive_dir = data_dir.join("message-archives");
-    fs::create_dir_all(&archive_dir)?;
     let path = archive_file_path(data_dir, session_id);
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let _lock = lock_archive(&path)?;
+    let cache = archive_id_cache(&path);
+    let mut cache = cache.lock().unwrap_or_else(|err| err.into_inner());
+    let stamp = archive_stamp(&path);
+    if cache.stamp != stamp {
+        *cache = ArchiveIdCache::default();
+        if let Ok(file) = fs::File::open(&path) {
+            for line in BufReader::new(file).lines() {
+                if let Some(id) = archived_row_id(&line?) { cache.remember(id); }
+            }
+        }
+        cache.stamp = stamp;
+    }
+    let mut candidates = items.iter().filter_map(|item| item.get("id").and_then(Value::as_str))
+        .filter(|id| !cache.ids.contains(*id)).map(str::to_owned).collect::<HashSet<_>>();
+    // The small recent-ID cache handles ordinary flushes. Check evicted IDs
+    // against disk as well so old replays remain idempotent after 10,000 rows.
+    if cache.ids.len() >= ARCHIVE_SEEN_LIMIT && !candidates.is_empty() {
+        for line in BufReader::new(fs::File::open(&path)?).lines() {
+            if let Some(id) = archived_row_id(&line?) { candidates.remove(&id); }
+        }
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     for item in items {
+        let id = item.get("id").and_then(Value::as_str);
+        if let Some(id) = id {
+            if !candidates.remove(id) { continue; }
+        }
         serde_json::to_writer(&mut file, item)?;
         writeln!(file)?;
+        if let Some(id) = id { cache.remember(id.to_owned()); }
     }
+    cache.stamp = archive_stamp(&path);
     Ok(true)
+}
+
+const ARCHIVE_SEEN_LIMIT: usize = 10_000;
+const ARCHIVE_PAGE_MAX_BYTES: usize = crate::remote_core::REMOTE_RESPONSE_MAX_BYTES / 2 - 64 * 1024;
+
+#[derive(Default)]
+struct ArchiveIdCache {
+    stamp: Option<(u64, Option<SystemTime>)>,
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl ArchiveIdCache {
+    fn remember(&mut self, id: String) {
+        if !self.ids.insert(id.clone()) { return; }
+        self.order.push_back(id);
+        if self.order.len() > ARCHIVE_SEEN_LIMIT {
+            if let Some(oldest) = self.order.pop_front() { self.ids.remove(&oldest); }
+        }
+    }
+}
+
+fn archive_stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+    fs::metadata(path).ok().map(|metadata| (metadata.len(), metadata.modified().ok()))
+}
+
+fn archived_row_id(line: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Id { id: Option<String> }
+    serde_json::from_str::<Id>(line).ok()?.id
+}
+
+fn lock_archive(path: &Path) -> std::io::Result<fs::File> {
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    // A separate lock survives clearing/replacing the JSONL on Windows too.
+    let lock = OpenOptions::new().create(true).read(true).write(true).truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn archive_id_cache(path: &Path) -> Arc<Mutex<ArchiveIdCache>> {
+    static CACHES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<ArchiveIdCache>>>>> = OnceLock::new();
+    let mut caches = CACHES.get_or_init(Mutex::default).lock().unwrap_or_else(|err| err.into_inner());
+    if caches.len() >= 128 {
+        caches.retain(|_, cache| Arc::strong_count(cache) > 1);
+    }
+    Arc::clone(caches.entry(path.to_owned()).or_default())
+}
+
+fn bound_archived_row(item: Value, session_id: &str) -> Value {
+    let size = serde_json::to_vec(&item).map_or(usize::MAX, |bytes| bytes.len());
+    if size < ARCHIVE_PAGE_MAX_BYTES / 2 { return item; }
+    let id = item.get("id").and_then(Value::as_str).unwrap_or("hist-archive-gap")
+        .chars().take(256).collect::<String>();
+    json!({ "id": id, "sessionId": session_id, "role": "system", "timestamp": 0,
+        "content": format!("[History gap: oversized archived record omitted ({size} bytes; {id})]"),
+        "historyGap": { "id": id, "sizeBytes": size } })
 }
 
 pub(crate) fn load_archived_from_dir(
@@ -2364,23 +2518,37 @@ pub(crate) fn load_archived_from_dir(
         }
         return json!({ "messages": [], "total": total, "hasMore": total > offset as usize, "promptIds": prompt_ids });
     }
-    let (lines, total, has_more) = match crate::transcript_file::archive_page(
+    let (lines, total, _) = match crate::transcript_file::archive_page(
         &archive_file_path(data_dir, session_id), offset as usize, limit as usize,
     ) { Ok(page) => page, Err(_) => return archive_empty_page() };
     let end = total.saturating_sub(offset as usize);
-    let start = end.saturating_sub(lines.len());
-    let messages = lines.iter().filter_map(|line| serde_json::from_str::<Value>(line).ok()).collect::<Vec<_>>();
-    let mut page = json!({ "messages": messages, "total": total, "hasMore": has_more });
-    if start > end.saturating_sub(limit as usize) { page["start"] = json!(start); }
-    page
+    if end == 0 {
+        return json!({ "messages": [], "total": total, "hasMore": false });
+    }
+    let mut start = end.saturating_sub(lines.len());
+    let mut messages = lines.iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .map(|item| bound_archived_row(item, session_id))
+        .collect::<Vec<_>>();
+    while serde_json::to_vec(&messages).map_or(usize::MAX, |bytes| bytes.len()) >= ARCHIVE_PAGE_MAX_BYTES {
+        messages.remove(0);
+        start += 1;
+    }
+    json!({ "messages": messages, "total": total, "hasMore": start > 0, "start": start, "end": end })
 }
 
 pub(crate) fn clear_archive_in_dir(data_dir: &Path, session_id: &str) -> bool {
     if session_id.is_empty() {
         return false;
     }
-    let _ = fs::remove_file(archive_file_path(data_dir, session_id));
-    true
+    let path = archive_file_path(data_dir, session_id);
+    let Ok(_lock) = lock_archive(&path) else { return false; };
+    let cache = archive_id_cache(&path);
+    *cache.lock().unwrap_or_else(|err| err.into_inner()) = ArchiveIdCache::default();
+    match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 fn login_success(value: &Value) -> bool {
@@ -2630,6 +2798,7 @@ impl ClaudeRuntimeRouter {
         session_id: String,
         options: Option<Value>,
     ) -> Result<Value, BridgeError> {
+        crate::rate_limit_resume::cancel(&self.app, &session_id);
         if should_handle_codex(&options) {
             let codex = self.codex.clone();
             let codex_app = self.app.clone();
@@ -2690,6 +2859,7 @@ impl ClaudeRuntimeRouter {
         display_prompt: Option<String>,
         suppress_user_echo: Option<bool>,
     ) -> Result<Value, BridgeError> {
+        crate::rate_limit_resume::cancel(&self.app, &session_id);
         if self.codex.is_owned(&session_id) {
             claude_debug_log(
                 &self.app,
@@ -2728,6 +2898,7 @@ impl ClaudeRuntimeRouter {
     }
 
     async fn stop_session(&self, session_id: String) -> Result<Value, BridgeError> {
+        crate::rate_limit_resume::cancel(&self.app, &session_id);
         if self.codex.is_owned(&session_id) {
             return Ok(self.codex.stop_session(session_id));
         }
@@ -2740,6 +2911,7 @@ impl ClaudeRuntimeRouter {
     }
 
     async fn abort_session(&self, session_id: String) -> Result<Value, BridgeError> {
+        crate::rate_limit_resume::cancel(&self.app, &session_id);
         if self.codex.is_owned(&session_id) {
             claude_debug_log(
                 &self.app,
@@ -2768,6 +2940,7 @@ impl ClaudeRuntimeRouter {
     }
 
     async fn interrupt_turn(&self, session_id: String) -> Result<Value, BridgeError> {
+        crate::rate_limit_resume::cancel(&self.app, &session_id);
         // Soft interrupt (1× Esc): end the current turn but keep the
         // subprocess / session alive. For codex this is the app-server's
         // turn interrupt (abort_session), which already keeps the session;
@@ -2820,6 +2993,7 @@ impl ClaudeRuntimeRouter {
     }
 
     async fn reload_session(&self, session_id: String) -> Result<Value, BridgeError> {
+        crate::rate_limit_resume::cancel(&self.app, &session_id);
         if self.codex.is_owned(&session_id) {
             let codex = self.codex.clone();
             let app = self.app.clone();
@@ -2830,6 +3004,7 @@ impl ClaudeRuntimeRouter {
     }
 
     async fn reset_session(&self, session_id: String) -> Result<Value, BridgeError> {
+        crate::rate_limit_resume::cancel(&self.app, &session_id);
         if self.codex.is_owned(&session_id) {
             let codex = self.codex.clone();
             let codex_app = self.app.clone();
@@ -2856,6 +3031,7 @@ impl ClaudeRuntimeRouter {
         sdk_session_id: String,
         options: Option<Value>,
     ) -> Result<Value, BridgeError> {
+        crate::rate_limit_resume::cancel(&self.app, &session_id);
         let should_use_codex = should_handle_codex(&options);
         if should_use_codex || self.codex.is_owned(&session_id) {
             let codex = self.codex.clone();
@@ -5238,6 +5414,7 @@ pub async fn claude_rest_session(
         return result;
     }
     ensure_local_agent_session_access(&app, &window, &session_id)?;
+    crate::rate_limit_resume::cancel(&HostContext::from_app(app.clone()), &session_id);
     if let Some(value) = codex_state.rest_session(&HostContext::from_app(app.clone()), &session_id)
     {
         return Ok(value);
@@ -5671,6 +5848,22 @@ mod tests {
     use super::*;
     use std::env;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn rate_limit_resume_requires_a_live_idle_session_without_pending_input() {
+        assert!(rate_limit_resume_can_send(&json!({"isStreaming":false, "meta":{"runtimeStatus":null}})));
+        for snapshot in [
+            Value::Null,
+            json!({"meta":{}}),
+            json!({"isStreaming":true}),
+            json!({"isStreaming":false,"meta":{"runtimeStatus":"starting"}}),
+            json!({"isStreaming":false,"meta":{"isStreaming":true}}),
+            json!({"isStreaming":false,"pendingPermission":{"toolUseId":"p"}}),
+            json!({"isStreaming":false,"pendingAskUser":{"toolUseId":"q"}}),
+        ] {
+            assert!(!rate_limit_resume_can_send(&snapshot), "must not resume {snapshot}");
+        }
+    }
 
     // Mirrors node-sidecar/tests/harness-noise.test.mjs. Harness-injected
     // background-task updates arrive as role=user records, so a session preview
@@ -6239,7 +6432,10 @@ mod tests {
             .iter()
             .map(|model| model["value"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(values[0], "claude-opus-5-5:auto-compact-200k");
+        assert_eq!(values[0], "claude-fable-5-2:auto-compact-200k");
+        assert!(values.contains(&"claude-fable-5-2:auto-compact-300k"));
+        assert!(values.contains(&"claude-fable-5-2:1m"));
+        assert!(values.contains(&"claude-opus-5-5:auto-compact-200k"));
         assert!(values.contains(&"claude-opus-5-5:auto-compact-300k"));
         assert!(values.contains(&"claude-opus-5-5:1m"));
         assert!(values.contains(&"claude-fable-5-1:auto-compact-200k"));
@@ -6249,6 +6445,10 @@ mod tests {
         assert!(values.contains(&"claude-opus-4-8:auto-compact-200k"));
         assert!(values.contains(&"claude-opus-4-7:auto-compact-200k"));
         assert!(values.contains(&"claude-sonnet-4-6"));
+        assert!(values.contains(&"claude-sonnet-5-5:1m"));
+        assert!(values.contains(&"claude-haiku-5-5:auto-compact-200k"));
+        assert!(values.contains(&"claude-haiku-5-5:auto-compact-300k"));
+        assert!(values.contains(&"claude-haiku-5-5:1m"));
         assert!(models
             .as_array()
             .unwrap()
@@ -6588,6 +6788,65 @@ mod tests {
         assert_eq!(metadata["total"], 5);
         assert_eq!(load_archived_from_dir(&data_dir, "missing", 0, 0)["promptIds"], json!([]));
         fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn native_archive_serializes_replays_and_invalidates_external_writes() {
+        let dir = temp_data_dir("archive-concurrent");
+        let rows = json!([{ "id": "a" }, { "id": "a" }, { "id": "b" }]);
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                let dir = &dir;
+                let rows = &rows;
+                scope.spawn(move || archive_messages_in_dir(dir, "s", rows).unwrap());
+            }
+        });
+        assert_eq!(load_archived_from_dir(&dir, "s", 0, 20)["total"], 2);
+        let path = archive_file_path(&dir, "s");
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{{\"id\":\"external\"}}").unwrap();
+        drop(file);
+        archive_messages_in_dir(&dir, "s", &json!([{ "id": "external" }, { "id": "c" }])).unwrap();
+        assert_eq!(load_archived_from_dir(&dir, "s", 0, 20)["total"], 4);
+        assert!(clear_archive_in_dir(&dir, "s"));
+        archive_messages_in_dir(&dir, "s", &rows).unwrap();
+        assert_eq!(load_archived_from_dir(&dir, "s", 0, 20)["total"], 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_archive_dedupes_ids_evicted_from_its_cache() {
+        let dir = temp_data_dir("archive-evicted");
+        let rows = (0..ARCHIVE_SEEN_LIMIT + 5).map(|i| json!({ "id": format!("row-{i}") })).collect::<Vec<_>>();
+        archive_messages_in_dir(&dir, "s", &json!(rows)).unwrap();
+        archive_messages_in_dir(&dir, "s", &json!([rows[0], rows[rows.len() - 1], { "id": "new" }])).unwrap();
+        assert_eq!(load_archived_from_dir(&dir, "s", 0, 1)["total"], rows.len() + 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_archive_pages_stay_bounded_without_skipping_rows() {
+        let dir = temp_data_dir("archive-budget");
+        let mut rows = (0..12).map(|i| json!({ "id": format!("row-{i}"), "content": "x".repeat(600_000) })).collect::<Vec<_>>();
+        rows.push(json!({ "id": "oversized", "content": "z".repeat(4 * 1024 * 1024) }));
+        archive_messages_in_dir(&dir, "s", &json!(rows)).unwrap();
+        let mut offset = 0;
+        let mut ids = HashSet::new();
+        loop {
+            let page = load_archived_from_dir(&dir, "s", offset, 100);
+            assert!(serde_json::to_vec(&page).unwrap().len() < ARCHIVE_PAGE_MAX_BYTES + 1024);
+            for item in page["messages"].as_array().unwrap() {
+                assert!(ids.insert(item["id"].as_str().unwrap().to_owned()));
+                if item["id"] == "oversized" { assert!(item.get("historyGap").is_some()); }
+            }
+            let start = page["start"].as_u64().unwrap() as u32;
+            if start == 0 { break; }
+            let next = rows.len() as u32 - start;
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(ids.len(), rows.len());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

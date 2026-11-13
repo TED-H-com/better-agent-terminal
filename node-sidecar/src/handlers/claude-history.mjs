@@ -119,11 +119,21 @@ function historyItemsFromJsonl(raw, sessionId, start = 0) {
         for (const block of content) {
           if (block && block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
             const idx = toolIndexMap.get(block.tool_use_id)
+            const resultText = typeof block.content === 'string' ? block.content : JSON.stringify(block.content)
             if (idx !== undefined) {
               const tool = items[idx]
               tool.status = block.is_error ? 'error' : 'completed'
-              const resultText = typeof block.content === 'string' ? block.content : JSON.stringify(block.content)
               tool.result = (resultText || '').slice(0, 2000)
+            } else {
+              // The request may be on the preceding page. Keep its result now;
+              // the renderer merges request metadata when that page is loaded.
+              items.push({
+                id: block.tool_use_id, sessionId, toolName: 'Tool', input: {},
+                status: block.is_error ? 'error' : 'completed',
+                result: (resultText || '').slice(0, 2000), timestamp: ts,
+                historyToolResult: true,
+                ...(obj.parent_tool_use_id ? { parentToolUseId: obj.parent_tool_use_id } : {}),
+              })
             }
           }
         }
@@ -227,6 +237,7 @@ export async function loadSessionHistory(sessionId, sdkSessionId, cwd, opts = {}
     // inspect (GH #125).
     if (raw === null) {
       if (opts.before !== undefined) throw new Error('History transcript is no longer available')
+      if (session) session.historyBefore = null
       let remembered = boundHistoryItems(rememberedTranscript(sessionId), sessionId)
       while (Buffer.byteLength(JSON.stringify({ sessionId, items: remembered })) >= HISTORY_PAGE_MAX_BYTES) {
         const omitted = remembered.splice(0, Math.max(1, Math.floor(remembered.length / 2)))
@@ -258,7 +269,10 @@ export async function loadSessionHistory(sessionId, sdkSessionId, cwd, opts = {}
       resetSessionTranscript(session)
       session.messages = items.slice(-300)
     }
-    if (opts.before === undefined) sendEvent('claude:history', { sessionId, items, before: page.before, hasMore: page.hasMore })
+    if (opts.before === undefined) {
+      if (session) session.historyBefore = page.before
+      sendEvent('claude:history', { sessionId, items, before: page.before, hasMore: page.hasMore })
+    }
     return { ok: true, found: true, itemCount: items.length, items, before: page.before, hasMore: page.hasMore }
   } catch (err) {
     // Same reasoning as the not-found path: a read that blew up says nothing
@@ -658,16 +672,17 @@ async function archiveMessages(params) {
 }
 
 // Serialize per session: two clients may replay/flush the same window together.
-registerHandler('claude.archiveMessages', (params) => {
-  const sessionId = params?.sessionId
+function queueArchiveOperation(sessionId, operation) {
   const previous = archiveWrites.get(sessionId) || Promise.resolve()
-  const pending = previous.catch(() => {}).then(() => archiveMessages(params))
+  const pending = previous.catch(() => {}).then(operation)
   archiveWrites.set(sessionId, pending)
   void pending.finally(() => {
     if (archiveWrites.get(sessionId) === pending) archiveWrites.delete(sessionId)
   }).catch(() => {})
   return pending
-})
+}
+registerHandler('claude.archiveMessages', (params) =>
+  queueArchiveOperation(params?.sessionId, () => archiveMessages(params)))
 
 registerHandler('claude.loadArchived', async (params) => {
   const sessionId = params?.sessionId
@@ -702,6 +717,8 @@ registerHandler('claude.loadArchived', async (params) => {
   try { page = await readArchivePage(archiveFilePath(sessionId), offset, limit) }
   catch { return { messages: [], total: 0, hasMore: false } }
   const { lines: slice, total } = page
+  const end = total - offset
+  if (end <= 0) return { messages: [], total, hasMore: false }
   let start = page.start
   let messages = []
   for (const line of slice) {
@@ -712,11 +729,10 @@ registerHandler('claude.loadArchived', async (params) => {
     messages.shift()
     start++
   }
-  return { messages, total, hasMore: start > 0,
-    ...(start > Math.max(0, total - offset - limit) ? { start } : {}) }
+  return { messages, total, hasMore: start > 0, start, end }
 })
 
-registerHandler('claude.clearArchive', async (params) => {
+registerHandler('claude.clearArchive', (params) => queueArchiveOperation(params?.sessionId, async () => {
   const sessionId = params?.sessionId
   if (typeof sessionId !== 'string' || !sessionId) return false
   // Drop the id cache first. Leaving it behind would make the dedupe above
@@ -729,4 +745,4 @@ registerHandler('claude.clearArchive', async (params) => {
     // ENOENT is fine — already cleared.
   }
   return true
-})
+}))

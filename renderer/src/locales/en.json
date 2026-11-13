@@ -44,6 +44,8 @@
   },
 
   "settings": {
+    "autoResumeAfterRateLimit": "Automatically continue after 5H/7D usage limits reset",
+    "autoResumeAfterRateLimitHint": "Off by default. Claude and Codex Agent conversations interrupted by a usage limit continue after the reported reset time while the host is running. Sending a message, stopping the conversation, or disabling this setting cancels the wait. Configure this on the host for remote conversations.",
     "allowFastMode": "Allow Fast mode",
     "allowFastModeHint": "Fast may use more quota or incur additional charges. This only shows the checkbox beside the model; enable it separately for each conversation. Disabling this setting revokes previous selections for future turns. Remote sessions also require the host to allow Fast.",
     "title": "Settings",
@@ -159,7 +161,7 @@
     "accountSwitchingError": "Error: {{error}}",
     "notifications": "Notifications",
     "showDockBadge": "Show pending count on Dock icon",
-    "showDockBadgeHint": "Display a badge number on the Dock icon when workspaces have pending actions (permission requests, user questions).",
+    "showDockBadgeHint": "Display a badge number on the Dock icon when workspaces have pending actions (permission requests, user questions) or unread agent completions.",
     "notifyOnComplete": "Notify when Agent completes",
     "notifyOnCompleteHint": "Send a system notification when an Agent session finishes its task.",
     "notifySound": "Play notification sound",
@@ -271,6 +273,23 @@
     "wakeAgent": "Wake Agent",
     "restAgent": "Rest Agent",
     "closeWorkspace": "Close Workspace"
+  },
+
+  "projects": {
+    "title": "Projects",
+    "repoCount_one": "{{count}} repo",
+    "repoCount_other": "{{count}} repos",
+    "sessionCount_one": "{{count}} Claude session",
+    "sessionCount_other": "{{count}} Claude sessions",
+    "rescan": "Rescan",
+    "scanning": "Scanning…",
+    "empty": "No git repositories found next to your workspaces.",
+    "openFailed": "Could not open project: {{error}}",
+    "scanFailed": "Could not scan projects: {{error}}",
+    "startSession": "Start Claude session",
+    "startSessionInWorktree": "Start Claude session in worktree",
+    "detached": "(detached)",
+    "worktreeFallback": "worktree"
   },
 
   "profiles": {
@@ -556,7 +575,8 @@
 
   "claude": {
     "fastModeUnsupported": "This model does not support Fast mode.",
-    "fastModeBusy": "Wait for the current turn to finish before changing Fast.",
+    "fastModeBusy": "Fast changes apply from the next turn.",
+    "fastModeNextTurn": "next turn",
     "fastModeCooldown": "Fast is cooling down; the runtime is temporarily using standard speed.",
     "fastModePending": "Fast is requested for the next turn; availability depends on the account and runtime.",
     "fastModeHint": "Request Fast for this conversation. Higher usage or additional charges may apply.",
@@ -589,6 +609,10 @@
     "hideThinkingMessages": "Hide thinking messages",
     "showThinkingMessages": "Show thinking messages",
     "loadOlderMessages": "Load older messages ({{count}} archived)",
+    "loadOlderHistory": "Load older history",
+    "loadNewerHistory": "Load newer history",
+    "sessionResumeFailed": "Session resume failed; retrying: {{message}}",
+    "historyPageFailed": "Could not load history: {{message}}",
     "resumingHistory": "Loading session history…",
     "allowThisCall": "Allow this <strong>{{toolName}}</strong> call?",
     "yes": "Yes",

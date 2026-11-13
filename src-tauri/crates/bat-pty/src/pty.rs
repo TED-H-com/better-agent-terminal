@@ -718,6 +718,11 @@ fn configure_per_terminal_history(
 fn configure_terminal_env(cmd: &mut CommandBuilder) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // PowerShell 7 can fail fast before profiles run when a localized update
+    // notification computes negative padding (PowerShell/PowerShell#28131).
+    // Set this before spawn, including for PowerShell launched from another
+    // shell. Explicit per-terminal custom_env values still take precedence.
+    cmd.env("POWERSHELL_UPDATECHECK", "Off");
 }
 
 fn new_shell_command(shell: &str) -> CommandBuilder {
@@ -2532,6 +2537,22 @@ mod tests {
     }
 
     #[test]
+    fn build_command_disables_powershell_update_notifications_before_spawn() {
+        for program in [None, Some("pwsh")] {
+            let opts: CreatePtyOptions = serde_json::from_value(json!({
+                "id": "pwsh-notification", "cwd": ".", "type": "terminal",
+                "shell": "pwsh", "command": program,
+            })).unwrap();
+            let cmd = build_command(&opts, None);
+            assert_eq!(
+                cmd.get_env("POWERSHELL_UPDATECHECK").and_then(|value| value.to_str()),
+                Some("Off"),
+                "both interactive shells and direct programs must inherit the startup workaround",
+            );
+        }
+    }
+
+    #[test]
     fn custom_env_can_override_terminal_env() {
         let opts = CreatePtyOptions {
             id: "term-env".into(),
@@ -2546,6 +2567,7 @@ mod tests {
             custom_env: Some(HashMap::from([
                 ("TERM".into(), "ansi".into()),
                 ("COLORTERM".into(), "false".into()),
+                ("POWERSHELL_UPDATECHECK".into(), "Default".into()),
             ])),
             per_terminal_history: None,
             history_key: None,
@@ -2558,6 +2580,10 @@ mod tests {
         assert_eq!(
             cmd.get_env("COLORTERM").and_then(|value| value.to_str()),
             Some("false")
+        );
+        assert_eq!(
+            cmd.get_env("POWERSHELL_UPDATECHECK").and_then(|value| value.to_str()),
+            Some("Default")
         );
     }
 

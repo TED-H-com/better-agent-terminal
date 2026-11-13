@@ -3541,6 +3541,12 @@ async function inProcess() {
   // expectedContextWindowForModel: hits map; falls back to base id by
   // stripping [1m]; returns null for unknown.
   assert.equal(expectedContextWindowForModel('claude-opus-5[1m]'), 1000000)
+  assert.equal(expectedContextWindowForModel('claude-fable-5-2[1m]'), 1000000)
+  for (const [preset, budget] of [['auto-compact-200k', 200000], ['auto-compact-300k', 300000], ['1m', 1000000]]) {
+    const selection = `claude-fable-5-2:${preset}`
+    assert.equal(expectedContextWindowForModel(selection), budget)
+    assert.equal(mod.sdkModelForClaudeSelection(selection), 'claude-fable-5-2[1m]')
+  }
   assert.equal(expectedContextWindowForModel('claude-fable-5-1[1m]'), 1000000)
   assert.equal(expectedContextWindowForModel('claude-opus-4-8[1m]'), 1000000)
   assert.equal(expectedContextWindowForModel('claude-opus-4-7'), 1000000)
@@ -3713,11 +3719,14 @@ async function inProcess() {
       const messages = [
         { type: 'system', subtype: 'init', session_id: 's-rl', cwd: '/x' },
         // Full rate-limit event — should emit.
-        { type: 'rate_limit_event', rate_limit_info: { rateLimitType: 'primary', resetsAt: 1700000000, utilization: 0.92, isUsingOverage: false } },
+        { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'primary', resetsAt: 1700000000, utilization: 0.92, isUsingOverage: false } },
         // Missing resetsAt — must NOT emit.
         { type: 'rate_limit_event', rate_limit_info: { rateLimitType: 'primary', utilization: 0.5 } },
         // utilization optional — emit but utilization=null.
         { type: 'rate_limit_event', rate_limit_info: { rateLimitType: 'fallback', resetsAt: 1700001000, isUsingOverage: true } },
+        // Rejected events can omit the bucket name in newer SDKs.
+        { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 1700002000 } },
+        { type: 'assistant', error: 'rate_limit', message: { content: [{ type: 'text', text: "You've hit your limit" }] } },
         { type: 'result', subtype: 'success', session_id: 's-rl', result: 'ok', stop_reason: 'end_turn', total_cost_usd: 0, num_turns: 1 },
       ]
       return (async function*() { for (const m of messages) yield m })()
@@ -3729,17 +3738,23 @@ async function inProcess() {
     await dispatch({ jsonrpc: '2.0', id: 291, method: 'claude.sendMessage', params: { sessionId: 'rl-1', prompt: 'hi' } })
     await settleTurn(mod.sessions.get('rl-1'))
     const rl = rateLimitCaptured.filter(e => e.name === 'claude:rate-limit')
-    assert.equal(rl.length, 2, `expected 2 rate-limit emits (one full, one no-utilization), got ${rl.length}`)
+    assert.equal(rl.length, 3, `expected 3 valid rate-limit emits, got ${rl.length}`)
     // First emit — full info, resetsAt converted to ms.
     assert.equal(rl[0].payload.sessionId, 'rl-1')
     assert.equal(rl[0].payload.info.rateLimitType, 'primary')
     assert.equal(rl[0].payload.info.resetsAt, 1700000000 * 1000)
     assert.equal(rl[0].payload.info.utilization, 0.92)
     assert.equal(rl[0].payload.info.isUsingOverage, false)
+    assert.equal(rl[0].payload.info.status, 'rejected', 'host must distinguish rejection from a usage warning')
+    const limitReply = rateLimitCaptured.find(e => e.name === 'claude:message' && e.payload.message.role === 'assistant')
+    assert.equal(limitReply.payload.message.error, 'rate_limit', 'host must retain SDK limit errors even when the result ends successfully')
     // Second emit — utilization omitted → null, isUsingOverage=true.
     assert.equal(rl[1].payload.info.rateLimitType, 'fallback')
     assert.equal(rl[1].payload.info.utilization, null)
     assert.equal(rl[1].payload.info.isUsingOverage, true)
+    assert.equal(rl[2].payload.info.rateLimitType, 'unknown')
+    assert.equal(rl[2].payload.info.resetsAt, 1700002000 * 1000)
+    assert.equal(rl[2].payload.info.status, 'rejected')
   } finally {
     __setSdkOverrideForTests(undefined)
     restoreRateLimitEmit()

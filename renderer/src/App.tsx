@@ -926,6 +926,7 @@ export default function App() {
       const params = remoteConnParamsRef.current
       if (!params) return
       const state = reconnectRef.current
+      const backoff = state.retry
       if (state.inFlight) return
       if (Date.now() < state.nextAt) return
       state.inFlight = true
@@ -985,7 +986,10 @@ export default function App() {
         const status = await host.remote.clientStatus()
         if (disposed) return
         setRemoteClientConnected(status.connected)
-        if (status.connected) setRemoteEverConnected(true)
+        if (status.connected) {
+          setRemoteEverConnected(true)
+          reconnectRef.current.retry.connected()
+        }
         if (!status.connected) {
           nextDelay = REMOTE_DISCONNECTED_POLL_MS
           await attemptReconnect()
