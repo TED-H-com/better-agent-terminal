@@ -251,6 +251,10 @@
       "feature": "upstream maintenance"
     },
     {
+      "path": ".github/workflows/bac-differential.yml",
+      "feature": "wire compatibility tests"
+    },
+    {
       "path": ".github/workflows/dependency-checks.yml",
       "feature": "security patches"
     },

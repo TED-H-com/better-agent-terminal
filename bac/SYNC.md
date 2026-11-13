@@ -112,7 +112,19 @@ Use a dedicated sync branch and retain review evidence outside the repository. T
 
    The test runner derives every `test:*` invocation in `verify:tauri-pre-ci`, always includes `test:sidecar`, continues after failures and reports each script's exit code. `--list` previews the selection. `--wrapper EXECUTABLE` invokes that executable with each script name as its sole argument instead of `pnpm run NAME`; use it for an environment-isolating test launcher.
 
-   Run regression filters for behavior affected by the merge and the supported-platform packaging checks. Desktop and headless feature sets are separate gates. Namespace-dependent tests require a capable host; do not weaken their guards. Record failures and skips explicitly. `bac-ci.yml` covers inventory/floors, renderer, upstream script tests and Linux desktop checks; `pm-runtime-offline.yml` covers headless checks/tests, and `dependency-checks.yml` covers optimized GLib tests. Desktop CI has a provisional 30-minute timeout until hosted timing is measured.
+   Compare the merged tree's wire behavior with the new release. Step 5 has made `bac/UPSTREAM_BASE.json` name it, so the comparison builds that release's `bat-server` and ours from the committed merge and runs the same client script against both (it rejects uncommitted changes to runtime sources; `bac/tests/differential/README.md` describes scratch space and options):
+
+   ```sh
+   node bac/tests/differential/self-test.mjs
+   node bac/tests/differential/run.mjs --same-binary --repeat 3 \
+     --scratch "$HOME/.cache/bac-differential" --report "$sync_review/wire-stability"
+   node bac/tests/differential/run.mjs \
+     --scratch "$HOME/.cache/bac-differential" --report "$sync_review/wire-comparison"
+   ```
+
+   A difference the release introduces between upstream's behavior and ours is a regression in the merge, not a new allowance: `allowed-differences.json` records existing debt only. An allowance that upstream's change made unnecessary fails the run as stale; remove it in the sync PR. Scenarios cover the channels of the recorded base, so read the release's changes to `bat-remote/v2` and add scenarios for new channels, events or errors before trusting a clean result.
+
+   Run regression filters for behavior affected by the merge and the supported-platform packaging checks. Desktop and headless feature sets are separate gates. Namespace-dependent tests require a capable host; do not weaken their guards. Record failures and skips explicitly. `bac-ci.yml` covers inventory/floors, renderer, upstream script tests and Linux desktop checks; `bac-differential.yml` runs the wire comparison; `pm-runtime-offline.yml` covers headless checks/tests, and `dependency-checks.yml` covers optimized GLib tests. Desktop CI has a provisional 30-minute timeout until hosted timing is measured.
 
 7. **Review code scanning and prepare the PR.** Compare a flagged file with the new upstream tree:
 

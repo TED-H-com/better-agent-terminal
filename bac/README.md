@@ -27,6 +27,8 @@ The inventory rejects unlisted differences, stale entries, changed diff digests,
 
 The four basic rejection cases are an edit to an uninventoried upstream file, an inventoried file restored to upstream, an unacknowledged edit to an inventoried file, and a resolved dependency below its enforced floor. Tests cover each case; none can be accepted by silently adding an inventory reason.
 
+The wire comparison in `bac/tests/differential/` is the check for the first compatibility rule: it runs one client script against the recorded upstream release's `bat-server` and ours, and fails on any difference that `allowed-differences.json` does not explain and on any allowance that is no longer needed. Its README describes the run; it builds both servers, so it is slower than the checks above.
+
 Lock digests are not pinned. The inventory validates manifests with offline, frozen pnpm checks on scratch copies and `cargo metadata --locked --offline`; missing caches must be populated through the normal locked install/build. The floor reader checks every resolved version, rejects unsupported package-record formats, and enforces exact local backport provenance. The separate GLib verifier checks the patched source bytes. Open floor entries are reported explicitly.
 
 ## Add a hook
