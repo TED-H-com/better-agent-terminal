@@ -11,6 +11,8 @@ import {
   sdkModelForClaudeSelection,
 } from '../renderer/src/utils/claude-model-presets'
 import { clampToolOutputText, TOOL_OUTPUT_RENDER_LIMIT } from '../renderer/src/components/CodexAgentPanel.helpers'
+import { parseGeneratedImageResult, resolveToolImage } from '../renderer/src/utils/agent-tool-image'
+import { getClaudeModelPricing } from '../renderer/src/utils/claude-model-pricing'
 
 async function main() {
   const source = await readFile('renderer/src/components/CodexAgentPanel.tsx', 'utf8')
@@ -43,14 +45,15 @@ async function main() {
   assert.equal(contextWindowForClaudeSelection('claude-opus-5:1m'), 1000000)
   assert.equal(displayNameForClaudeSelection('claude-opus-5:1m'), 'Opus 5 · 1M')
   for (const panelSource of [source, claudeSource]) {
-    assert.match(panelSource, /'opus-5':\s+P\(5, 25\)/, 'Opus 5 pricing should be $5/$25 per MTok')
-    assert.ok(panelSource.includes("'opus-5-5': { ...P(4, 20), cacheRead: 0.20 }"),
-      'Opus 5.5 should use $4/$20 per MTok and $0.20 cache reads')
-    const opus55Match = panelSource.indexOf("if (model.includes('opus-5-5'))")
-    const opus5Match = panelSource.indexOf("if (model.includes('opus-5'))")
-    assert.ok(opus55Match >= 0 && opus55Match < opus5Match,
-      'Opus 5.5 must match before the overlapping Opus 5 prefix')
+    assert.ok(panelSource.includes("from '../utils/claude-model-pricing'"),
+      'both panels must use the shared model pricing table')
   }
+  assert.deepEqual(getClaudeModelPricing('claude-opus-5[1m]'), {
+    input: 5, output: 25, cacheRead: 0.50, cacheWrite5m: 6.25, cacheWrite1h: 10,
+  })
+  assert.deepEqual(getClaudeModelPricing('claude-opus-5-5[1m]'), {
+    input: 4, output: 20, cacheRead: 0.20, cacheWrite5m: 5, cacheWrite1h: 8,
+  }, 'Opus 5.5 must not inherit the overlapping Opus 5 price')
 
   assert.equal(
     source.includes('!isCodexSession && showResumeList'),
@@ -398,11 +401,47 @@ async function main() {
     assert.ok(inCompleted, `${itemType} should close its tool row in handle_item_completed`)
   }
 
-  assert.match(
-    source,
-    /typeof parsed\.path === 'string' && parsed\.path/,
-    'the panel should accept a generated image delivered as a path',
+  const viewedPath = 'E:\\SSIR開工區(Hermes)\\Mermaid_桌面PNG連結測試.png'
+  for (const toolName of ['image_view', 'view_image']) {
+    for (const emptyResult of [undefined, null, '', 'Image displayed.']) {
+      assert.deepEqual(
+        resolveToolImage(toolName, { path: viewedPath }, emptyResult, 'completed'),
+        { path: viewedPath },
+        'viewed-image cards must load the input path when older live/history results have no image payload',
+      )
+    }
+    for (const status of ['running', 'error']) {
+      assert.equal(resolveToolImage(toolName, { path: viewedPath }, null, status), null,
+        'a failed or unfinished image view must not be presented as a successful image')
+    }
+  }
+  assert.deepEqual(
+    resolveToolImage('image_view', { path: encodeURI('file:///E:/SSIR開工區(Hermes)/Mermaid_桌面PNG連結測試.png') }, null, 'completed'),
+    { path: viewedPath },
+    'rollout file URLs must be decoded before the host reads the image',
   )
+  assert.deepEqual(
+    parseGeneratedImageResult(JSON.stringify({ type: 'image_generation', path: viewedPath })),
+    { path: viewedPath, revisedPrompt: undefined },
+    'generated images delivered as paths must still work',
+  )
+  assert.deepEqual(
+    parseGeneratedImageResult({ type: 'image_generation', path: 'file:///tmp/image%20with%20spaces.png' }),
+    { path: '/tmp/image with spaces.png', revisedPrompt: undefined },
+  )
+  assert.deepEqual(
+    resolveToolImage('image_view', { path: 'E:\\literal%20name.png' }, null, 'completed'),
+    { path: 'E:\\literal%20name.png' },
+    'native file paths must not be URL-decoded',
+  )
+  const inlineImage = 'data:image/png;base64,AAAA'
+  assert.deepEqual(
+    resolveToolImage('image_gen', {}, JSON.stringify({ type: 'image_generation', dataUrl: inlineImage, revisedPrompt: 'diagram' }), 'completed'),
+    { dataUrl: inlineImage, revisedPrompt: 'diagram' },
+  )
+  assert.equal(resolveToolImage('image_gen', { path: viewedPath }, null, 'completed'), null,
+    'image generation must wait for its output instead of treating an input as generated output')
+  assert.equal(resolveToolImage('Read', { path: viewedPath }, null, 'completed'), null)
   assert.match(
     source,
     /item\.toolName === 'image_gen' \|\| item\.toolName === 'image_view'/,
@@ -477,7 +516,9 @@ async function main() {
     )
     assert.match(
       panelSource,
-      /dedupeMessagesById\(\[\.\.\.loadedArchive, \.\.\.messages\]\)/,
+      panel === 'ClaudeAgentPanel'
+        ? /mergeHistoryMessages\(\[\.\.\.historyPageItems, \.\.\.loadedArchive, \.\.\.messages\]\)/
+        : /dedupeMessagesById\(\[\.\.\.loadedArchive, \.\.\.messages\]\)/,
       `${panel} should dedupe the archived+live merge`,
     )
     // The dep is what resyncs streaming state and metadata after a reconnect.

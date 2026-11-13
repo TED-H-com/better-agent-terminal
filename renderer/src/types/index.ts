@@ -271,6 +271,7 @@ export interface AppSettings {
   createDefaultAgentTerminal: boolean;  // 是否預設建立 Agent Terminal
   allowBypassPermissions: boolean;  // 允許切換 bypassPermissions 模式不再確認；同時讓 Codex 以 danger-full-access 啟動
   allowFastMode?: boolean; // Unlocks per-session Fast controls; never enables Fast itself.
+  autoResumeAfterRateLimit?: boolean; // Resume quota-interrupted Agent turns after reset (opt-in).
   fastModeEpoch?: number; // Revokes previous per-session opt-ins when the setting is disabled.
   defaultModel?: string;     // Legacy Claude 預設模型（保留用於遷移）
   defaultClaudeModel?: string;  // Claude 預設模型（空 = 使用 Agent 自己的預設）

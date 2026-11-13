@@ -526,6 +526,7 @@ struct CodexSession {
     effort: String,
     fast_mode: bool,
     fast_mode_epoch: u64,
+    turn_fast_mode: bool,
     fast_mode_data_dir: Option<PathBuf>,
     context_window: u64,
     start_time: Instant,
@@ -639,7 +640,15 @@ impl CodexSession {
         // protocol, so adding it again would double-count context usage.
         // `last`, not lifetime `total`, represents the active context window.
         let context_tokens = self.last_input_tokens + self.last_output_tokens;
-        let fast_mode = self.effective_fast_mode();
+        let (fast_mode_allowed, fast_mode_epoch) = crate::commands::settings::fast_mode_policy(self.fast_mode_data_dir.as_deref());
+        let fast_mode = self.fast_mode && fast_mode_allowed && self.fast_mode_epoch == fast_mode_epoch && supports_codex_fast_mode(&self.model);
+        let fast_mode_disabled_reason = if !crate::commands::settings::fast_mode_debug_enabled() {
+            Some("Fast mode requires BAT_DEBUG=1 on the host.")
+        } else if !fast_mode_allowed {
+            Some("Enable Fast mode in host settings first.")
+        } else {
+            None
+        };
         json!({
             "model": self.model,
             "contextWindowOverride": codex_context_window_override(&self.model),
@@ -663,7 +672,10 @@ impl CodexSession {
             "codexApprovalPolicy": self.approval_policy,
             "effort": self.effort,
             "fastMode": fast_mode,
+            "fastModePending": fast_mode != self.turn_fast_mode,
             "supportsFastMode": supports_codex_fast_mode(&self.model),
+            "fastModeAllowed": fast_mode_allowed,
+            "fastModeDisabledReason": fast_mode_disabled_reason,
             "fastModeState": if fast_mode { "pending" } else { "off" },
             "lastTurnFirstTokenMs": self.last_turn_first_token_ms,
             "lastTurnDurationMs": self.last_turn_duration_ms,
@@ -720,6 +732,12 @@ fn remember_ignored_turn(session: &mut CodexSession, turn_id: String) {
         let drop_count = session.ignored_turn_ids.len() - 16;
         session.ignored_turn_ids.drain(0..drop_count);
     }
+}
+
+fn turn_is_stale_for_session(session: &CodexSession, method: &str, turn_id: &str) -> bool {
+    session.ignored_turn_ids.iter().any(|id| id == turn_id)
+        || (method != "turn/started"
+            && session.active_turn_id.as_deref().is_some_and(|active| active != turn_id))
 }
 
 fn remember_warned_stale_turn(session: &mut CodexSession, turn_id: &str) -> bool {
@@ -1885,7 +1903,7 @@ fn parse_fixed_digits(text: &str, start: usize, len: usize) -> Option<u32> {
     text.get(start..start + len)?.parse::<u32>().ok()
 }
 
-fn parse_rfc3339_timestamp_millis(text: &str) -> Option<u128> {
+pub(crate) fn parse_rfc3339_timestamp_millis(text: &str) -> Option<u128> {
     if text.len() < 20 {
         return None;
     }
@@ -3036,6 +3054,13 @@ fn image_generation_result(item: &Value) -> Option<String> {
     serde_json::to_string(&payload).ok()
 }
 
+// A viewed image reports `path`, not the `savedPath` of image generation.
+// Reuse the existing image-card envelope so older renderers can display it.
+fn image_view_result(item: &Value) -> Option<String> {
+    let path = first_str(item, &["path"])?;
+    serde_json::to_string(&json!({ "type": "image_generation", "path": path })).ok()
+}
+
 fn first_str<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| item.get(*key).and_then(Value::as_str))
@@ -3293,8 +3318,8 @@ impl CodexAppServerState {
             json!({ "value": "gpt-5.6-sol", "displayName": "GPT-5.6 Sol", "description": "Older generation - upgrade path is GPT-6 Sol", "source": "builtin" }),
             json!({ "value": "gpt-5.6-terra", "displayName": "GPT-5.6 Terra", "description": "Older generation - balanced workhorse", "source": "builtin" }),
             json!({ "value": "gpt-5.6-luna", "displayName": "GPT-5.6 Luna", "description": "Older generation - fast, repeatable work", "source": "builtin" }),
-            json!({ "value": "gpt-5.3-codex-spark", "displayName": "GPT-5.3 Codex Spark", "description": "Research preview - near-instant coding", "source": "builtin" }),
-            json!({ "value": "gpt-5.5", "displayName": "GPT-5.5", "description": "Previous frontier GPT-5.5", "source": "builtin" }),
+            json!({ "value": "gpt-5.3-codex-spark", "displayName": "GPT-5.3 Codex Spark", "description": "Retired from Codex on 2026-09-14", "source": "builtin" }),
+            json!({ "value": "gpt-5.5", "displayName": "GPT-5.5", "description": "Legacy - API-key authentication only", "source": "builtin" }),
             json!({ "value": "gpt-5.4", "displayName": "GPT-5.4", "description": "Legacy - API-key authentication only", "source": "builtin" }),
             json!({ "value": "gpt-5.4-mini", "displayName": "GPT-5.4 Mini", "description": "Legacy - API-key authentication only", "source": "builtin" }),
             json!({ "value": "gpt-5.3-codex", "displayName": "GPT-5.3 Codex", "description": "Legacy - API-key authentication only", "source": "builtin" }),
@@ -4662,15 +4687,8 @@ impl CodexAppServerState {
         let turn_id = turn_id_from_params(params)?;
         let sessions = self.inner.sessions.lock().expect("codex sessions lock");
         let session = sessions.get(session_id)?;
-        if session.ignored_turn_ids.iter().any(|id| id == &turn_id) {
+        if turn_is_stale_for_session(session, method, &turn_id) {
             return Some((turn_id, session.active_turn_id.clone()));
-        }
-        if method != "turn/started" {
-            if let Some(active_turn_id) = &session.active_turn_id {
-                if active_turn_id != &turn_id {
-                    return Some((turn_id, Some(active_turn_id.clone())));
-                }
-            }
         }
         None
     }
@@ -5315,6 +5333,7 @@ impl CodexAppServerState {
             effort,
             fast_mode: false,
             fast_mode_epoch: 0,
+            turn_fast_mode: false,
             fast_mode_data_dir: app.data_dir_opt(),
             context_window: codex_context_window_for_model(&model),
             start_time: Instant::now(),
@@ -5656,6 +5675,7 @@ impl CodexAppServerState {
             effort: normalize_effort(options.get("effort").and_then(Value::as_str)),
             fast_mode: false,
             fast_mode_epoch: 0,
+            turn_fast_mode: false,
             fast_mode_data_dir: app.data_dir_opt(),
             context_window,
             start_time: Instant::now(),
@@ -5834,6 +5854,15 @@ impl CodexAppServerState {
             || self.inner.reloading_sessions.lock().expect("codex reload lock").contains(&session_id) {
             return Ok(json!({ "ok": false, "cancelled": true, "error": "Agent restarted; queued message cancelled" }));
         }
+        // Freeze the preference before thread/process startup can block. A
+        // checkbox change during startup still belongs to the following turn.
+        let (fast_mode, fast_mode_epoch) = {
+            let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
+            let session = sessions.get_mut(&session_id)
+                .ok_or_else(|| bridge_error("Codex session not started"))?;
+            session.turn_fast_mode = session.effective_fast_mode();
+            (session.turn_fast_mode, session.fast_mode_epoch)
+        };
         let (input, mut temp_image_paths) = match build_turn_input(&prompt, images) {
             Ok(input) => input,
             Err(err) => {
@@ -6037,6 +6066,12 @@ impl CodexAppServerState {
             );
             local_turn_key
         };
+        // Keep the turn's tier through retries. A new preference affects the
+        // next turn, while host policy revocation still applies immediately.
+        let fast_mode_for_turn = || {
+            let (allowed, epoch) = crate::commands::settings::fast_mode_policy(app.data_dir_opt().as_deref());
+            fast_mode && allowed && fast_mode_epoch == epoch
+        };
         log_codex(
             app,
             &session_id,
@@ -6056,7 +6091,7 @@ impl CodexAppServerState {
                 &effort,
                 &approval_policy,
                 &sandbox_mode,
-                self.fast_mode_for_session(&session_id),
+                fast_mode_for_turn(),
             ),
             TURN_START_TIMEOUT,
         ) {
@@ -6117,7 +6152,7 @@ impl CodexAppServerState {
                                     &effort,
                                     &approval_policy,
                                     &sandbox_mode,
-                                    self.fast_mode_for_session(&session_id),
+                                    fast_mode_for_turn(),
                                 ),
                                 TURN_START_TIMEOUT,
                             ) {
@@ -6192,7 +6227,7 @@ impl CodexAppServerState {
                                         &effort,
                                         &approval_policy,
                                         &sandbox_mode,
-                                        self.fast_mode_for_session(&session_id),
+                                        fast_mode_for_turn(),
                                     ),
                                     TURN_START_TIMEOUT,
                                 ) {
@@ -6738,7 +6773,8 @@ impl CodexAppServerState {
 
     /// The approval this session is blocked on, if any, in the same shape the
     /// one-shot `claude:permission-request` carried. Taken before the sessions
-    /// lock, never while holding it, so the two locks are never nested.
+    /// lock; release the approvals lock before acquiring the sessions lock.
+    /// Turn completion takes them in the other order to claim its cleanup.
     fn pending_approval_data(&self, session_id: &str) -> Option<Value> {
         self.inner
             .pending_approvals
@@ -6808,11 +6844,6 @@ impl CodexAppServerState {
         Some(json!(true))
     }
 
-    fn fast_mode_for_session(&self, session_id: &str) -> bool {
-        self.inner.sessions.lock().expect("codex sessions lock")
-            .get(session_id).is_some_and(CodexSession::effective_fast_mode)
-    }
-
     pub fn set_fast_mode(&self, app: &HostContext, session_id: &str, enabled: bool) -> Option<Result<Value, BridgeError>> {
         if self.pm_state(&session_id).is_some() { return Some(Err(bridge_error("PM_RUNTIME_IMMUTABLE"))); }
         let mut sessions = self.inner.sessions.lock().expect("codex sessions lock");
@@ -6823,7 +6854,6 @@ impl CodexAppServerState {
         let (allowed, epoch) = crate::commands::settings::fast_mode_policy(app.data_dir_opt().as_deref());
         if enabled && !allowed { return Some(Err(bridge_error("Enable Fast mode in host settings first."))); }
         if enabled && !supports_codex_fast_mode(&session.model) { return Some(Err(bridge_error("This model does not support Fast mode."))); }
-        if session.is_running { return Some(Err(bridge_error("Wait for the current turn to finish before changing Fast mode."))); }
         session.fast_mode = enabled;
         session.fast_mode_epoch = epoch;
         let meta = session.metadata();
@@ -7163,25 +7193,29 @@ impl CodexAppServerState {
     // Cancel any approvals still waiting on a session whose turn ended or was
     // aborted: answer codex with "cancel" and dismiss the renderer prompts.
     fn cancel_pending_approvals(&self, app: &HostContext, session_id: &str) {
-        let drained: Vec<(String, PendingApproval)> = {
-            let mut approvals = self
-                .inner
-                .pending_approvals
-                .lock()
-                .expect("codex approvals lock");
-            let keys: Vec<String> = approvals
-                .iter()
-                .filter(|(_, entry)| entry.session_id == session_id)
-                .map(|(key, _)| key.clone())
-                .collect();
-            keys.into_iter()
-                .filter_map(|key| approvals.remove(&key).map(|entry| (key, entry)))
-                .collect()
-        };
+        let drained = self.take_pending_approvals(session_id);
+        Self::cancel_approvals(app, drained);
+    }
+
+    fn take_pending_approvals(&self, session_id: &str) -> Vec<(String, PendingApproval)> {
+        // When both locks are needed, take sessions before approvals. Responses
+        // and events are dispatched only after releasing both locks.
+        let mut approvals = self.inner.pending_approvals.lock().expect("codex approvals lock");
+        let keys: Vec<String> = approvals
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| approvals.remove(&key).map(|entry| (key, entry)))
+            .collect()
+    }
+
+    fn cancel_approvals(app: &HostContext, drained: Vec<(String, PendingApproval)>) {
         for (tool_use_id, pending) in drained {
             log_codex(
                 app,
-                session_id,
+                &pending.session_id,
                 format!("approval {tool_use_id} cancelled (turn ended)"),
             );
             if let Some(connection) = pending.connection.upgrade() {
@@ -7191,7 +7225,7 @@ impl CodexAppServerState {
             emit(
                 app,
                 "claude:permission-resolved",
-                session_id,
+                &pending.session_id,
                 "toolUseId",
                 json!(tool_use_id),
             );
@@ -8194,7 +8228,7 @@ fn handle_item_completed(
                 json!({
                     "id": item_id(item),
                     "status": completed_tool_status(item),
-                    "result": image_generation_result(item),
+                    "result": image_view_result(item).map(Value::String).or_else(|| tool_result_value(item)),
                 }),
             );
         }
@@ -8374,12 +8408,25 @@ fn handle_turn_completed(
     params: &Value,
 ) {
     state.touch_connection_activity();
-    state.cancel_pending_approvals(app, session_id);
-    let (reason, result, meta, error_message, turn_id, thread_id) = {
+    let (reason, result, meta, error_message, turn_id, thread_id, approvals) = {
         let mut sessions = state.inner.sessions.lock().expect("codex sessions lock");
         let Some(session) = sessions.get_mut(session_id) else {
             return;
         };
+        // The early notification filter runs before logging and other work.
+        // A replacement can install its images in that gap. Recheck under the
+        // same lock that protects the state transition and file cleanup.
+        if let Some(id) = turn_id_from_params(params) {
+            if turn_is_stale_for_session(session, "turn/completed", &id) {
+                drop(sessions);
+                log_codex(app, session_id, format!("late completion ignored at state update turn={id}"));
+                return;
+            }
+        }
+        // Capture only this turn's approvals before another send can start.
+        // Answer them after releasing the sessions lock, so an IPC response
+        // or event callback never runs while that lock is held.
+        let approvals = state.take_pending_approvals(session_id);
         let turn = params.get("turn").unwrap_or(params);
         let turn_id = turn_id_from_params(params)
             .or_else(|| session.active_turn_id.clone())
@@ -8431,8 +8478,10 @@ fn handle_turn_completed(
             error_message,
             turn_id,
             thread_id,
+            approvals,
         )
     };
+    CodexAppServerState::cancel_approvals(app, approvals);
     emit(app, "claude:status", session_id, "meta", meta);
     if reason == "completed" {
         state.mark_shared_auth_valid(app, "turn-completed");
@@ -8626,6 +8675,7 @@ mod tests {
             effort: "high".to_string(),
             fast_mode: false,
             fast_mode_epoch: 0,
+            turn_fast_mode: false,
             fast_mode_data_dir: None,
             context_window: GPT_5_6_CONTEXT_WINDOW_FALLBACK,
             start_time: Instant::now(),
@@ -9069,6 +9119,69 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn replaced_turn_completion_cannot_delete_new_image() {
+        let (app, events) = session_sync_test_host();
+        let state = CodexAppServerState::default();
+        state.inner.sessions.lock().unwrap().insert("session-1".into(), test_codex_session());
+        let old_completion = json!({
+            "threadId": "thread-1",
+            "turn": { "id": "turn-1", "status": "interrupted" },
+        });
+        // The reader passed the early stale-event check before send_message
+        // installed the replacement turn. Its completion handler runs later.
+        assert!(state.stale_turn_notification("session-1", "turn/completed", &old_completion).is_none());
+        let (_, images) = build_turn_input("new image", vec![
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jz1sAAAAASUVORK5CYII=".into(),
+        ]).unwrap();
+        let image_path = images[0].clone();
+        {
+            let mut sessions = state.inner.sessions.lock().unwrap();
+            let session = sessions.get_mut("session-1").unwrap();
+            remember_ignored_turn(session, "turn-1".into());
+            session.active_turn_id = None;
+            session.active_turn_key = Some("local-session-1-2".into());
+            session.active_turn_started = false;
+            session.temporary_image_paths = images;
+            session.assistant_text = "new turn output".into();
+        }
+        state.inner.pending_approvals.lock().unwrap().insert("new-approval".into(), PendingApproval {
+            request_id: json!(42),
+            session_id: "session-1".into(),
+            connection: Weak::new(),
+            request_data: json!({ "toolUseId": "new-approval" }),
+        });
+
+        handle_turn_completed(&app, &state, "session-1", &old_completion);
+        assert!(image_path.is_file(), "late old completion must not unlink the new upload");
+        {
+            let mut sessions = state.inner.sessions.lock().unwrap();
+            let session = sessions.get_mut("session-1").unwrap();
+            assert!(session.is_running);
+            assert_eq!(session.active_turn_key.as_deref(), Some("local-session-1-2"));
+            assert_eq!(session.assistant_text, "new turn output");
+            assert!(apply_turn_start_response(session, "local-session-1-2", "turn-2"));
+            session.ignored_turn_ids.clear();
+        }
+        // Once the server id is known, ownership also rejects older ids even
+        // if they are no longer in the bounded ignored-turn history.
+        handle_turn_completed(&app, &state, "session-1", &old_completion);
+        assert!(image_path.is_file());
+        assert!(state.inner.pending_approvals.lock().unwrap().contains_key("new-approval"));
+        assert!(events.lock().unwrap().is_empty(), "old completion must not end the new turn in the UI");
+
+        handle_turn_completed(&app, &state, "session-1", &json!({
+            "threadId": "thread-1",
+            "turn": { "id": "turn-2", "status": "completed" },
+        }));
+        assert!(!image_path.exists(), "the owning turn still cleans up its own upload");
+        assert!(!state.inner.sessions.lock().unwrap()["session-1"].is_running);
+        assert!(state.inner.pending_approvals.lock().unwrap().is_empty());
+        assert!(events.lock().unwrap().iter().any(|(topic, event)|
+            topic == "claude:turn-end" && event["payload"]["turnId"] == "turn-2"));
+    }
+
+    #[test]
     fn codex_turn_start_params_request_reasoning_summary() {
         let params = build_turn_start_params(
             "thread-1",
@@ -9105,6 +9218,48 @@ mod tests {
         let mut session = test_codex_session();
         session.fast_mode = true;
         assert_eq!(session.metadata()["fastMode"], false, "an in-memory opt-in cannot bypass the host policy");
+        assert_eq!(session.metadata()["fastModeAllowed"], false, "remote clients must see the host policy rather than their local opt-in");
+        assert!(session.metadata()["fastModeDisabledReason"].as_str().is_some());
+    }
+
+    #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn codex_fast_change_during_turn_preserves_the_active_request() {
+        for running in [true, false] {
+            let (app, events) = session_sync_test_host();
+            let state = CodexAppServerState::default();
+            let mut session = test_codex_session();
+            session.fast_mode = true;
+            session.turn_fast_mode = true;
+            session.is_running = running;
+            set_runtime_status(&mut session, if running { "waiting_for_api" } else { "starting" }, "Preparing request");
+            let active_turn = session.active_turn_id.clone();
+            let transcript = session.messages.clone();
+            state.inner.sessions.lock().unwrap().insert("session-1".into(), session);
+
+            let meta = state.set_fast_mode(&app, "session-1", false).unwrap().unwrap();
+            assert_eq!(meta["fastMode"], false);
+            assert_eq!(meta["fastModePending"], true);
+            let mut sessions = state.inner.sessions.lock().unwrap();
+            let session = sessions.get_mut("session-1").unwrap();
+            assert_eq!(session.is_running, running);
+            assert_eq!(session.active_turn_id, active_turn);
+            assert_eq!(session.messages, transcript);
+            assert!(!session.abort_requested);
+            let current = build_turn_start_params("thread-1", json!([]), &session.model, &session.effort,
+                &session.approval_policy, &session.sandbox_mode, session.turn_fast_mode);
+            assert_eq!(current["serviceTier"], "fast", "the admitted turn and its retries retain their tier");
+            // Admit the next turn using the host-owned preference, as send_message does.
+            session.turn_fast_mode = session.effective_fast_mode();
+            let next = build_turn_start_params("thread-1", json!([]), &session.model, &session.effort,
+                &session.approval_policy, &session.sandbox_mode, session.turn_fast_mode);
+            assert_eq!(next["serviceTier"], "default");
+            assert_eq!(session.metadata()["fastModePending"], false);
+            let events = events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].0, "claude:status");
+            assert_eq!(events[0].1["meta"]["fastModePending"], true);
+        }
     }
 
     #[test]
@@ -9476,6 +9631,7 @@ mod tests {
             effort: "high".to_string(),
             fast_mode: false,
             fast_mode_epoch: 0,
+            turn_fast_mode: false,
             fast_mode_data_dir: None,
             context_window: codex_context_window_for_model("gpt-5.6-sol"),
             start_time: Instant::now(),
@@ -9529,6 +9685,7 @@ mod tests {
             effort: "high".to_string(),
             fast_mode: false,
             fast_mode_epoch: 0,
+            turn_fast_mode: false,
             fast_mode_data_dir: None,
             context_window: DEFAULT_CODEX_CONTEXT_WINDOW,
             start_time: Instant::now(),
@@ -9590,6 +9747,7 @@ mod tests {
             effort: "high".to_string(),
             fast_mode: false,
             fast_mode_epoch: 0,
+            turn_fast_mode: false,
             fast_mode_data_dir: None,
             context_window: DEFAULT_CODEX_CONTEXT_WINDOW,
             start_time: Instant::now(),
@@ -9983,6 +10141,38 @@ invalid json
         // No path means nothing to show; the caller falls back to the raw item.
         assert!(image_generation_result(&json!({"savedPath": ""})).is_none());
         assert!(image_generation_result(&json!({"status": "failed"})).is_none());
+    }
+
+    #[test]
+    fn codex_image_view_result_reads_the_viewed_path() {
+        let path = r"E:\SSIR開工區(Hermes)\Mermaid_桌面PNG連結測試.png";
+        let item = json!({"type":"imageView", "id":"view-1", "path":path});
+        let result = image_view_result(&item).expect("viewed images use path, not savedPath");
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result, json!({"type":"image_generation", "path":path}));
+        assert!(image_view_result(&json!({"type":"imageView"})).is_none());
+    }
+
+    #[test]
+    #[cfg(not(feature = "desktop"))]
+    fn codex_image_view_completion_emits_a_renderable_image_result() {
+        let (app, events) = session_sync_test_host();
+        let state = CodexAppServerState::default();
+        state.inner.sessions.lock().unwrap().insert("session-1".into(), test_codex_session());
+        let path = r"E:\SSIR開工區(Hermes)\Mermaid_桌面PNG連結測試.png";
+        let item = json!({"type":"imageView", "id":"view-1", "path":path});
+        handle_item_started(&app, &state, "session-1", &item);
+        handle_item_completed(&app, &state, "session-1", &item);
+        let snapshot = state.get_session_state("session-1").unwrap();
+        let tool = snapshot["messages"].as_array().unwrap().iter().find(|item| item["id"] == "view-1").unwrap();
+        assert_eq!(tool["toolName"], "image_view");
+        assert_eq!(tool["input"]["path"], path);
+        assert_eq!(tool["status"], "completed");
+        let result: Value = serde_json::from_str(tool["result"].as_str().expect("image result must survive session snapshots")).unwrap();
+        assert_eq!(result, json!({"type":"image_generation", "path":path}));
+        let events = events.lock().unwrap();
+        let (_, event) = events.iter().find(|(topic, _)| topic == "claude:tool-result").unwrap();
+        assert_eq!(event["result"]["result"], tool["result"]);
     }
 
     #[test]

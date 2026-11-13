@@ -223,7 +223,14 @@ impl HostContext {
     }
 
     pub fn sidecar_emit_sink(&self) -> EventSink {
-        self.inner.emit_sink.clone()
+        let ctx = self.clone();
+        std::sync::Arc::new(move |topic, payload| {
+            if let Some(hub) = ctx.try_state::<crate::event_hub::RuntimeEventHubState>() {
+                hub.publish(&ctx, topic, payload.clone(), "node-sidecar");
+            } else {
+                ctx.emit(topic, payload.clone());
+            }
+        })
     }
 }
 

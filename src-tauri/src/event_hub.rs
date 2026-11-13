@@ -22,6 +22,7 @@ use crate::remote_server::RustRemoteServerState;
 #[derive(Clone, Default)]
 pub struct RuntimeEventHubState {
     next_seq: Arc<AtomicU64>,
+    pub(crate) rate_limit_resume: crate::rate_limit_resume::RateLimitResumeState,
 }
 
 enum LocalEventTargets<'a> {
@@ -111,6 +112,7 @@ impl RuntimeEventHubState {
         crate::window_registry::persist_agent_runtime_meta(app.app(), topic, &payload);
         notification::update_agent_session_worktree_from_event(app, topic, &payload);
         notification::add_agent_completion_from_event(app, topic, &payload);
+        self.rate_limit_resume.observe(app, topic, &payload, origin);
         #[cfg(feature = "desktop")]
         if origin != "node-sidecar"
             && origin != "rust-remote-client"

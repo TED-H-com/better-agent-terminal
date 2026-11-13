@@ -49,6 +49,16 @@ async function check(name, fn) {
 }
 
 try {
+  await check('clear runs between queued writes and does not resurrect the old archive', async () => {
+    const sid = 'archive-clear-queued'
+    const pending = send('claude.archiveMessages', { sessionId: sid, messages: [msg('old', 'old')] })
+    const cleared = send('claude.clearArchive', { sessionId: sid })
+    const replacement = send('claude.archiveMessages', { sessionId: sid, messages: [msg('new', 'new')] })
+    const results = await Promise.all([pending, cleared, replacement])
+    assert.ok(results.every(result => result.result === true))
+    assert.deepEqual(archivedRows(sid).map(row => row.id), ['new'])
+  })
+
   await check('concurrent resume windows are serialized before appending', async () => {
     const sid = 'archive-concurrent'
     const messages = [msg('a', 'first'), msg('b', 'second')]

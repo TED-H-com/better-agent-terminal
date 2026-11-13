@@ -20,7 +20,7 @@ import {
 import { normalizeClaudeEffortMode, isUltracodeMode, runtimeEffortForMode } from '../lib/claude-effort.mjs'
 import { autoCompactWindowForClaudeSelection, expectedContextWindowForModel, sdkModelForClaudeSelection } from '../lib/models.mjs'
 import { closeLiveQuery, reloadClaudeSession } from './claude-send.mjs'
-import { readFastModePolicy, supportsClaudeFastMode, refreshFastMode, isFastModeDebugEnabled } from '../lib/fast-mode.mjs'
+import { readFastModePolicy, supportsClaudeFastMode, refreshFastMode, effectiveFastMode, isFastModeDebugEnabled } from '../lib/fast-mode.mjs'
 
 function applyEffortOptions(session, options) {
   const mode = normalizeClaudeEffortMode(options?.effort, options?.ultracode === true)
@@ -587,11 +587,13 @@ registerHandler('claude.setFastMode', async (params) => {
   const policy = readFastModePolicy()
   if (params.enabled && !policy.allowed) throw new Error('Enable Fast mode in host settings first.')
   if (params.enabled && !supportsClaudeFastMode(s.model)) throw new Error('This model does not support Fast mode.')
-  if (s.streaming || s.runtimeStatus) throw new Error('Wait for the current turn to finish before changing Fast mode.')
-  // SDK noninteractive Fast requires startup opt-in; rebuild the idle query
-  // with resume, retaining the transcript, rather than pretending a flag worked.
-  closeLiveQuery(s)
+  const busy = s.streaming || !!s.runtimeStatus
+  const currentFastMode = s.turnFastMode ?? s.liveQueryFastMode ?? effectiveFastMode(s)
+  // The running query keeps its startup settings. The next send rebuilds it
+  // with resume if its Fast preference changed, retaining the transcript.
+  if (!busy) closeLiveQuery(s)
   s.fastMode = params.enabled
+  s.fastModePending = busy && params.enabled !== currentFastMode
   s.fastModeEpoch = policy.epoch
   s.fastModeState = params.enabled ? 'pending' : 'off'
   s.fastModeDisabledReason = null
@@ -648,6 +650,7 @@ registerHandler('claude.getSessionState', async (params) => {
     codexSandboxMode: s.codexSandboxMode,
     codexApprovalPolicy: s.codexApprovalPolicy,
     messages: Array.isArray(s.messages) ? s.messages : [],
+    ...(s.historyBefore !== undefined ? { historyBefore: s.historyBefore } : {}),
     isStreaming: s.streaming === true,
     // Include current turn/phase metadata, not only the transcript. Clients
     // need an explicit idle snapshot to clear a pre-restart turn, and must

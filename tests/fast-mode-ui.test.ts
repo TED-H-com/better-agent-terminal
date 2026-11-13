@@ -25,9 +25,11 @@ const calls: Array<{ command: string; args?: Record<string, unknown> }> = []
 const { settingsStore } = await import('../renderer/src/stores/settings-store')
 const { AgentFastModeCheckbox } = await import('../renderer/src/components/AgentFastModeCheckbox')
 const i18n = i18next.createInstance()
-await i18n.init({ lng: 'en', resources: { en: { translation: { claude: { fastModeHint: 'Higher usage or additional charges may apply.' } } } } })
-const render = () => renderToStaticMarkup(createElement(I18nextProvider, { i18n },
-  createElement(AgentFastModeCheckbox, { sessionId: 'fresh-session', disabled: false,
+await i18n.init({ lng: 'en', resources: { en: { translation: { claude: {
+  fastModeHint: 'Higher usage or additional charges may apply.', fastModeBusy: 'Changes apply from the next turn.',
+} } } } })
+const render = (isStreaming = false) => renderToStaticMarkup(createElement(I18nextProvider, { i18n },
+  createElement(AgentFastModeCheckbox, { sessionId: 'fresh-session', isStreaming,
     ensureSessionStarted: async () => assert.fail('Rendering must not start a session') })))
 
 assert.equal(settingsStore.getSettings().allowFastMode, false)
@@ -45,6 +47,9 @@ assert.match(html, /type="checkbox"/)
 assert.match(html, /Fast/)
 assert.doesNotMatch(html, /checked=""/, 'global opt-in must not select Fast for a fresh session')
 assert.match(html, /additional charges/)
+const runningHtml = render(true)
+assert.match(runningHtml, /next turn/)
+assert.doesNotMatch(runningHtml, /disabled=""/, 'a running turn must still allow an explicit Fast preference change')
 debug = false
 assert.equal(render(), '', 'persisted opt-in cannot bypass the debug UI gate')
 await settingsStore.setAllowFastMode(false)

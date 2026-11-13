@@ -41,6 +41,8 @@
     "noMatches": "一致するターミナルの種類がありません"
   },
   "settings": {
+    "autoResumeAfterRateLimit": "5H/7D利用制限のリセット後に自動で続行",
+    "autoResumeAfterRateLimitHint": "初期設定はオフです。利用制限で中断した Claude・Codex Agent の会話を、ホストが起動中であれば報告されたリセット時刻後に自動で続行します。メッセージの送信、会話の停止、設定の無効化で待機を解除します。リモートの会話はホスト側で設定してください。",
     "allowFastMode": "Fast モードを許可",
     "allowFastModeHint": "Fast は使用枠の消費や追加料金が増える場合があります。この設定はモデルの横にチェックボックスを表示するだけです。会話ごとに手動で有効にしてください。無効にすると以前の選択が取り消され、次のターンから Fast が無効になります。リモートの場合はホスト側の許可も必要です。",
     "title": "設定",
@@ -156,7 +158,7 @@
     "accountSwitchingError": "エラー: {{error}}",
     "notifications": "通知",
     "showDockBadge": "Dock アイコンに保留中の件数を表示する",
-    "showDockBadgeHint": "ワークスペースに保留中のアクション（許可リクエスト、ユーザーへの質問）がある場合に、Dock アイコンにバッジ番号を表示します。",
+    "showDockBadgeHint": "ワークスペースに保留中のアクション（許可リクエスト、ユーザーへの質問）や未読のエージェント完了通知がある場合に、Dock アイコンにバッジ番号を表示します。",
     "notifyOnComplete": "エージェントの完了時に通知する",
     "notifyOnCompleteHint": "エージェントセッションがタスクを完了したときにシステム通知を送信します。",
     "notifySound": "通知音を再生する",
@@ -266,6 +268,22 @@
     "wakeAgent": "エージェントを起動",
     "restAgent": "エージェントを休止",
     "closeWorkspace": "ワークスペースを閉じる"
+  },
+  "projects": {
+    "title": "プロジェクト",
+    "repoCount_one": "{{count}} 件のリポジトリ",
+    "repoCount_other": "{{count}} 件のリポジトリ",
+    "sessionCount_one": "Claude セッション {{count}} 件",
+    "sessionCount_other": "Claude セッション {{count}} 件",
+    "rescan": "再スキャン",
+    "scanning": "スキャン中…",
+    "empty": "ワークスペースと同じ階層に Git リポジトリが見つかりません。",
+    "openFailed": "プロジェクトを開けませんでした：{{error}}",
+    "scanFailed": "プロジェクトをスキャンできませんでした: {{error}}",
+    "startSession": "Claude セッションを開始",
+    "startSessionInWorktree": "この worktree で Claude セッションを開始",
+    "detached": "（HEAD 切り離し）",
+    "worktreeFallback": "worktree"
   },
   "profiles": {
     "title": "プロファイル",
@@ -537,7 +555,8 @@
   },
   "claude": {
     "fastModeUnsupported": "このモデルは Fast に対応していません。",
-    "fastModeBusy": "現在のターンが終了してから Fast を変更してください。",
+    "fastModeBusy": "Fast の変更は次のターンから適用されます。",
+    "fastModeNextTurn": "次のターンから",
     "fastModeCooldown": "Fast はクールダウン中で、現在は通常速度を使用しています。",
     "fastModePending": "次のターンで Fast を要求します。利用可否はアカウントと実行環境に依存します。",
     "fastModeHint": "この会話で Fast を要求します。使用枠の消費や追加料金が増える場合があります。",
@@ -570,6 +589,10 @@
     "hideThinkingMessages": "思考メッセージを非表示",
     "showThinkingMessages": "思考メッセージを表示",
     "loadOlderMessages": "古いメッセージを読み込む（{{count}}件アーカイブ済み）",
+    "loadOlderHistory": "以前の履歴を読み込む",
+    "loadNewerHistory": "新しい履歴を読み込む",
+    "sessionResumeFailed": "セッションの復元に失敗しました。再試行中：{{message}}",
+    "historyPageFailed": "履歴を読み込めませんでした：{{message}}",
     "resumingHistory": "セッション履歴を読み込み中…",
     "allowThisCall": "この <strong>{{toolName}}</strong> の呼び出しを許可しますか？",
     "yes": "はい",

@@ -3,7 +3,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { expectedContextWindowForModel } from './models.mjs'
-import { effectiveFastMode, supportsClaudeFastMode } from './fast-mode.mjs'
+import { effectiveFastMode, isFastModeDebugEnabled, readFastModePolicy, supportsClaudeFastMode } from './fast-mode.mjs'
 
 export const sessions = new Map()
 
@@ -77,6 +77,8 @@ export function ensureSession(sessionId) {
       fastMode: false,
       fastModeEpoch: 0,
       fastModeState: 'off',
+      fastModePending: false,
+      turnFastMode: null,
       fastModeDisabledReason: null,
       permissionMode: 'default',
       codexSandboxMode: undefined,
@@ -211,7 +213,11 @@ export function buildSessionMeta(s) {
   const cacheCreationTokens = u?.cache_creation_input_tokens ?? 0
   const contextTokens = inputTokens + cacheReadTokens + cacheCreationTokens
   const contextWindow = expectedContextWindowForModel(u?.model || s.model) || 0
-  const fastMode = effectiveFastMode(s)
+  const fastModePolicy = readFastModePolicy()
+  const fastMode = effectiveFastMode(s, fastModePolicy)
+  const fastModeDisabledReason = !isFastModeDebugEnabled()
+    ? 'Fast mode requires BAT_DEBUG=1 on the host.'
+    : !fastModePolicy.allowed ? 'Enable Fast mode in host settings first.' : s.fastModeDisabledReason ?? null
   return {
     permissionMode: s.permissionMode ?? 'default',
     model: s.model ?? null,
@@ -219,8 +225,11 @@ export function buildSessionMeta(s) {
     ultracode: s.ultracode === true,
     fastMode,
     supportsFastMode: supportsClaudeFastMode(s.model),
+    fastModeAllowed: fastModePolicy.allowed,
     fastModeState: fastMode ? s.fastModeState : 'off',
-    fastModeDisabledReason: s.fastModeDisabledReason ?? null,
+    fastModePending: s.fastModePending === true && fastModePolicy.allowed
+      && s.fastModeEpoch === fastModePolicy.epoch && supportsClaudeFastMode(s.model),
+    fastModeDisabledReason,
     autoCompactWindow: s.autoCompactWindow ?? null,
     sdkSessionId: s.sdkSessionId ?? null,
     cwd: (s.options && typeof s.options === 'object' && typeof s.options.cwd === 'string') ? s.options.cwd : null,

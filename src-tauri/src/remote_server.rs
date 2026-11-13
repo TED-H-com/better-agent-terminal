@@ -2560,6 +2560,7 @@ fn invoke_sidecar_for_remote(
     // natively by invoke_rust_for_remote, Claude is forwarded to the sidecar,
     // and locally both are registered by the same claude_start_session call.
     register_remote_agent_session(ctx, channel, &params)?;
+    crate::rate_limit_resume::cancel_for_command(ctx, channel, &params);
     if let Some(result) = invoke_rust_for_remote(ctx, channel, &params) {
         return result;
     }
@@ -3445,6 +3446,7 @@ fn invoke_rust_for_remote(
         "settings:save" => string_param(params, "data", channel).and_then(|data| {
             let dir = remote_app_data_dir(ctx, channel)?;
             settings_cmd::settings_save_impl(&dir, data).map_err(|err| err.to_string())?;
+            crate::rate_limit_resume::settings_changed(ctx);
             Ok(Value::Bool(true))
         }),
         "settings:get-shell-path" => string_param(params, "shellType", channel)

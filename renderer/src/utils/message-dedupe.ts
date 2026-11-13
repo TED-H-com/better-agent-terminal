@@ -1,3 +1,5 @@
+import { isToolCall } from '../types/claude-agent'
+
 // Deduping the archived + live message merge.
 //
 // Both panels render `[...loadedArchive, ...messages]`, and neither list is
@@ -39,6 +41,24 @@ export function dedupeMessagesById<T extends { id: string }>(items: T[]): T[] {
   }
   kept.reverse()
   return kept
+}
+
+/** Join tool requests and results split across pages, keeping current live rows. */
+export function mergeHistoryMessages<T extends { id: string }>(items: T[]): T[] {
+  const combined = new Map<string, T>()
+  for (const item of items) {
+    const previous = combined.get(item.id)
+    if (isToolCall(previous) && isToolCall(item)
+      && previous.historyToolResult !== item.historyToolResult
+      && (previous.historyToolResult || item.historyToolResult)) {
+      const request = previous.historyToolResult ? item : previous
+      const result = previous.historyToolResult ? previous : item
+      combined.set(item.id, { ...request, status: result.status, result: result.result, historyToolResult: false } as T)
+    } else {
+      combined.set(item.id, item)
+    }
+  }
+  return dedupeMessagesById(items).map(item => combined.get(item.id)!)
 }
 
 /** Per-panel/session replay memory survives live-window archiving, with bounded retention. */

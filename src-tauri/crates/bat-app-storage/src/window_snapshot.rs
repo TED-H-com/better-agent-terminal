@@ -38,7 +38,7 @@ pub struct WindowEntry {
     pub last_active_at: i64,
 }
 
-/// Persist only host-owned identity and Codex permissions, leaving layout and
+/// Persist only host-owned identity and Codex settings, leaving layout and
 /// other agent parameters untouched. Partial status events must not erase them.
 pub fn terminal_runtime_meta(meta: &Value) -> Value {
     let mut result = serde_json::Map::new();
@@ -55,6 +55,10 @@ pub fn terminal_runtime_meta(meta: &Value) -> Value {
         (
             "codexApprovalPolicy",
             &["untrusted", "on-request", "never"][..],
+        ),
+        (
+            "effort",
+            &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"][..],
         ),
     ] {
         if let Some(value) = meta.get(key).and_then(Value::as_str) {
@@ -90,7 +94,14 @@ pub fn apply_terminal_runtime_meta(terminals: &mut Value, session_id: &str, meta
         for (source, target) in [
             ("codexSandboxMode", "sandboxMode"),
             ("codexApprovalPolicy", "approvalPolicy"),
+            ("effort", "effortLevel"),
         ] {
+            if source == "effort" && !matches!(
+                terminal.get("agentPreset").and_then(Value::as_str),
+                Some("codex-agent" | "codex-agent-worktree")
+            ) {
+                continue;
+            }
             if let Some(value) = meta.get(source) {
                 let params = terminal.entry("agentParams").or_insert_with(|| json!({}));
                 if !params.is_object() {
@@ -720,13 +731,13 @@ mod tests {
             "workspaces": [{ "id": "ws", "name": "Project" }],
             "activeWorkspaceId": "ws",
             "terminals": [
-                { "id": "phone-panel", "workspaceId": "ws", "sdkSessionId": "old-thread",
+                { "id": "phone-panel", "workspaceId": "ws", "sdkSessionId": "old-thread", "agentPreset": "codex-agent",
                   "agentParams": { "sandboxMode": "workspace-write", "approvalPolicy": "on-request", "effortLevel": "high" } },
                 { "id": "other-panel", "sdkSessionId": "other-thread" }
             ]
         }));
         let unrelated = snapshot.terminals[1].clone();
-        let host_meta = json!({ "sdkSessionId": "phone-thread", "codexSandboxMode": "danger-full-access", "codexApprovalPolicy": "never", "inputTokens": 42 });
+        let host_meta = json!({ "sdkSessionId": "phone-thread", "codexSandboxMode": "danger-full-access", "codexApprovalPolicy": "never", "effort": "xhigh", "inputTokens": 42 });
         assert!(apply_terminal_runtime_meta(
             &mut snapshot.terminals,
             "phone-panel",
@@ -744,7 +755,7 @@ mod tests {
         assert_eq!(terminal["sdkSessionId"], "phone-thread");
         assert_eq!(terminal["agentParams"]["sandboxMode"], "danger-full-access");
         assert_eq!(terminal["agentParams"]["approvalPolicy"], "never");
-        assert_eq!(terminal["agentParams"]["effortLevel"], "high");
+        assert_eq!(terminal["agentParams"]["effortLevel"], "xhigh");
         assert!(terminal.get("inputTokens").is_none());
         assert_eq!(restored[0].terminals[1], unrelated);
         assert_eq!(restored[0].active_workspace_id.as_deref(), Some("ws"));
@@ -767,6 +778,22 @@ mod tests {
         ));
         assert!(terminals[0].get("sdkSessionId").is_none());
         assert_eq!(terminals[0]["agentParams"], original[0]["agentParams"]);
+    }
+
+    #[test]
+    fn host_effort_updates_only_codex_presets_and_ignores_invalid_values() {
+        let mut terminals = json!([
+            { "id": "codex", "agentPreset": "codex-agent-worktree", "agentParams": { "effortLevel": "medium" } },
+            { "id": "claude", "agentPreset": "claude-code", "agentParams": { "other": "keep" } }
+        ]);
+        assert!(apply_terminal_runtime_meta(&mut terminals, "codex", &json!({ "effort": "ultra" })));
+        assert_eq!(terminals[0]["agentParams"]["effortLevel"], "ultra");
+        let confirmed = terminals.clone();
+        for effort in [json!("invalid"), Value::Null, json!({ "value": "high" })] {
+            assert!(!apply_terminal_runtime_meta(&mut terminals, "codex", &json!({ "effort": effort })));
+        }
+        assert!(!apply_terminal_runtime_meta(&mut terminals, "claude", &json!({ "effort": "high" })));
+        assert_eq!(terminals, confirmed);
     }
 
     #[test]

@@ -1528,6 +1528,7 @@ fn pm_session(id: &str, cwd: &str, model: &str) -> CodexSession {
         effort: "medium".into(),
         fast_mode: false,
         fast_mode_epoch: 0,
+        turn_fast_mode: false,
         fast_mode_data_dir: None,
         context_window: codex_context_window_for_model(model),
         start_time: Instant::now(),

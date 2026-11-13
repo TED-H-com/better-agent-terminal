@@ -13,7 +13,12 @@ use crate::remote_client::RustRemoteClientState;
 use crate::window_registry;
 use serde::Serialize;
 use serde_json::Value;
+#[cfg(feature = "desktop")]
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::atomic::AtomicI64;
+#[cfg(feature = "desktop")]
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(feature = "desktop")]
@@ -51,6 +56,54 @@ static ACTIVE_PROFILE_RESTORE_DONE: OnceLock<Mutex<bool>> = OnceLock::new();
 static PROFILE_CLOSE_PROMPTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static PROFILE_CLOSE_ALLOWED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 const REMOTE_APP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(feature = "desktop")]
+#[derive(Default)]
+pub(crate) struct WindowOpenState {
+    // Serialize the check/reserve/queue sequence for profile-open requests.
+    requests: Mutex<()>,
+    // A queued webview is already owned even before Tauri exposes it as live.
+    pending: Mutex<HashMap<String, String>>,
+}
+
+#[cfg(feature = "desktop")]
+impl WindowOpenState {
+    fn queue(&self, window_id: &str, profile_id: &str) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.contains_key(window_id) {
+            return false;
+        }
+        pending.insert(window_id.into(), profile_id.into());
+        true
+    }
+
+    fn finish(&self, window_id: &str) {
+        self.pending.lock().unwrap().remove(window_id);
+    }
+
+    fn reusable_window_ids(
+        &self,
+        profile_id: &str,
+        live_ids: impl FnOnce() -> Vec<String>,
+    ) -> Vec<String> {
+        // Snapshot reservations BEFORE querying live webviews. Otherwise a build
+        // finishing between those two reads could be missed by both checks.
+        let mut ids = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == profile_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in live_ids() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+}
 
 fn active_profile_restore_done() -> &'static Mutex<bool> {
     ACTIVE_PROFILE_RESTORE_DONE.get_or_init(|| Mutex::new(false))
@@ -147,6 +200,7 @@ pub(crate) fn renderer_url(path: &str) -> WebviewUrl {
 }
 
 pub(crate) fn log_tauri(app: &HostContext, message: &str) {
+    let message = crate::connection_diagnostics::redact(message);
     eprintln!("[tauri] {message}");
     let Some(path) = app
         .data_dir_opt()
@@ -154,7 +208,7 @@ pub(crate) fn log_tauri(app: &HostContext, message: &str) {
     else {
         return;
     };
-    let line = tauri_log_line(message);
+    let line = tauri_log_line(&message);
     // Synchronous single-line append (like the pty debug loggers): a fire-and-
     // forget tokio spawn_blocking would panic on the headless server's plain
     // OS threads, which run outside any tokio runtime.
@@ -191,10 +245,13 @@ fn raise_window(win: &WebviewWindow) {
 }
 
 #[cfg(feature = "desktop")]
-fn build_window(app: &AppHandle, window_id: &str) -> Result<(), String> {
+fn build_window(app: &AppHandle, window_id: &str, profile_id: &str) -> Result<(), String> {
     if let Some(win) = app.get_webview_window(window_id) {
         window_registry::mark_window_active(app, window_id);
         raise_window(&win);
+        return Ok(());
+    }
+    if !app.state::<WindowOpenState>().queue(window_id, profile_id) {
         return Ok(());
     }
     let build_app = app.clone();
@@ -208,7 +265,11 @@ fn build_window(app: &AppHandle, window_id: &str) -> Result<(), String> {
         let schedule_app = build_app.clone();
         let schedule_window_id = build_window_id.clone();
         if let Err(error) = build_app.run_on_main_thread(move || {
-            if let Err(error) = build_window_now(&schedule_app, &schedule_window_id) {
+            let result = build_window_now(&schedule_app, &schedule_window_id);
+            schedule_app
+                .state::<WindowOpenState>()
+                .finish(&schedule_window_id);
+            if let Err(error) = result {
                 log_tauri(
                     &HostContext::from_app(schedule_app.clone()),
                     &format!(
@@ -217,6 +278,9 @@ fn build_window(app: &AppHandle, window_id: &str) -> Result<(), String> {
                 );
             }
         }) {
+            build_app
+                .state::<WindowOpenState>()
+                .finish(&build_window_id);
             log_tauri(
                 &HostContext::from_app(build_app.clone()),
                 &format!("[window] queue-schedule-failed label={build_window_id} error={error}"),
@@ -298,6 +362,35 @@ fn active_webview_window(app: &AppHandle) -> Option<WebviewWindow> {
         })
         .or_else(|| app.get_webview_window("main"))
         .or_else(|| windows.values().next().cloned())
+}
+
+#[cfg(feature = "desktop")]
+pub(crate) fn handle_second_instance(app: &AppHandle, args: Vec<String>, _cwd: String) {
+    let profile_id = parse_launch_profile_args(args);
+    let handle = app.clone();
+    // Dispatch outside the native plugin callback; Windows delivers it through
+    // WM_COPYDATA and must be able to return promptly to the second process.
+    std::thread::spawn(move || {
+        log_tauri(
+            &HostContext::from_app(handle.clone()),
+            &format!(
+                "[app] second-instance profile={}",
+                profile_id.as_deref().unwrap_or("none")
+            ),
+        );
+        if let Some(profile_id) = profile_id {
+            if profile_cmd::profile_get(handle.clone(), profile_id.clone()).is_some() {
+                app_open_new_instance(handle, profile_id);
+                return;
+            }
+        }
+        let focus_app = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            if let Some(window) = active_webview_window(&focus_app) {
+                raise_window(&window);
+            }
+        });
+    });
 }
 
 /// Ask the focused window to open the response-time statistics page.
@@ -497,7 +590,7 @@ pub fn app_new_window(app: AppHandle, window: WebviewWindow) -> String {
     if let Some(id) = remote_app_new_window(&app, window.label(), &current.profile_id) {
         let _ =
             window_registry::create_empty_entry_with_id_for_profile(&app, &id, &current.profile_id);
-        let _ = build_window(&app, &id);
+        let _ = build_window(&app, &id, &current.profile_id);
         return id;
     }
     app_new_window_for_profile(&app, &current.profile_id)
@@ -507,7 +600,7 @@ pub fn app_new_window(app: AppHandle, window: WebviewWindow) -> String {
 pub(crate) fn app_new_window_for_profile(app: &AppHandle, profile_id: &str) -> String {
     let entry = window_registry::create_empty_entry_for_profile(app, profile_id);
     let id = entry.id;
-    let _ = build_window(app, &id);
+    let _ = build_window(app, &id, profile_id);
     id
 }
 
@@ -594,18 +687,30 @@ pub fn app_focus_next_window(app: AppHandle, window: WebviewWindow) -> bool {
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn app_open_new_instance(app: AppHandle, profile_id: String) -> OpenNewInstanceResult {
+    let state = app.state::<WindowOpenState>();
+    let _request = state.requests.lock().unwrap();
     let _ = profile_cmd::activate_profile_id(&HostContext::from_app(app.clone()), &profile_id);
-    let live = window_registry::entries_for_profile(&app, &profile_id)
-        .into_iter()
-        .filter(|entry| app.get_webview_window(&entry.id).is_some())
-        .collect::<Vec<_>>();
-    if let Some(entry) = live.iter().max_by_key(|entry| entry.last_active_at) {
-        if let Some(win) = app.get_webview_window(&entry.id) {
-            raise_window(&win);
+    let entries = window_registry::entries_for_profile(&app, &profile_id);
+    let reusable_ids = state.reusable_window_ids(&profile_id, || {
+        entries
+            .iter()
+            .filter(|entry| app.get_webview_window(&entry.id).is_some())
+            .map(|entry| entry.id.clone())
+            .collect()
+    });
+    if !reusable_ids.is_empty() {
+        if let Some(entry) = entries
+            .iter()
+            .filter(|entry| app.get_webview_window(&entry.id).is_some())
+            .max_by_key(|entry| entry.last_active_at)
+        {
+            if let Some(win) = app.get_webview_window(&entry.id) {
+                raise_window(&win);
+            }
         }
         return OpenNewInstanceResult {
             already_open: true,
-            window_ids: live.into_iter().map(|entry| entry.id).collect(),
+            window_ids: reusable_ids,
             error: None,
         };
     }
@@ -613,7 +718,7 @@ pub fn app_open_new_instance(app: AppHandle, profile_id: String) -> OpenNewInsta
     let created = window_registry::create_entries_for_profile(&app, &profile_id);
     let mut ids = Vec::new();
     for entry in &created {
-        if let Err(error) = build_window(&app, &entry.id) {
+        if let Err(error) = build_window(&app, &entry.id, &profile_id) {
             return OpenNewInstanceResult {
                 already_open: false,
                 window_ids: ids,
@@ -665,13 +770,55 @@ fn badge_count_value(count: i64) -> Option<i64> {
     }
 }
 
+// The Dock badge has two sources: pending actions (permission requests,
+// questions) that the renderer reports through `app_set_dock_badge`, and
+// unread agent completions that the host tracks in its notification list.
+// The host combines them so a completion reaches the badge even while the
+// window is in the background and its webview is throttled.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+static DOCK_BADGE_PENDING: AtomicI64 = AtomicI64::new(0);
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+static DOCK_BADGE_COMPLETIONS: AtomicI64 = AtomicI64::new(0);
+
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn dock_badge_total(pending: i64, completions: i64, settings: &Value) -> i64 {
+    if settings.get("showDockBadge").and_then(Value::as_bool) == Some(false) {
+        return 0;
+    }
+    pending.max(0).saturating_add(completions.max(0))
+}
+
 #[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn app_set_dock_badge(app: AppHandle, count: i64) {
-    let badge = badge_count_value(count);
+pub(crate) fn apply_dock_badge(app: &AppHandle) {
+    let settings = HostContext::from_app(app.clone())
+        .data_dir_opt()
+        .and_then(|dir| crate::commands::settings::settings_load_impl(&dir).ok().flatten())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let total = dock_badge_total(
+        DOCK_BADGE_PENDING.load(Ordering::SeqCst),
+        DOCK_BADGE_COMPLETIONS.load(Ordering::SeqCst),
+        &settings,
+    );
+    let badge = badge_count_value(total);
     for window in app.webview_windows().values() {
         let _ = window.set_badge_count(badge);
     }
+}
+
+/// Called by the notification list whenever it changes.
+#[cfg(feature = "desktop")]
+pub(crate) fn set_dock_badge_completions(app: &AppHandle, count: i64) {
+    if DOCK_BADGE_COMPLETIONS.swap(count, Ordering::SeqCst) != count {
+        apply_dock_badge(app);
+    }
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn app_set_dock_badge(app: AppHandle, count: i64) {
+    DOCK_BADGE_PENDING.store(count, Ordering::SeqCst);
+    apply_dock_badge(&app);
 }
 
 /// OS toast for an agent completion. The renderer decides *whether* to notify
@@ -696,7 +843,14 @@ pub fn app_notify(
     let body = body.filter(|b| !b.trim().is_empty());
     #[cfg(windows)]
     {
-        notify_windows_toast(app, window.label().to_string(), title, body, workspace_id, true);
+        notify_windows_toast(
+            app,
+            window.label().to_string(),
+            title,
+            body,
+            workspace_id,
+            true,
+        );
     }
     #[cfg(not(windows))]
     {
@@ -705,6 +859,48 @@ pub fn app_notify(
         let mut builder = app.notification().builder().title(title);
         if let Some(body) = body {
             builder = builder.body(body);
+        }
+        if let Err(err) = builder.show() {
+            log_tauri(
+                &HostContext::from_app(app.clone()),
+                &format!("[notify] OS notification failed: {err}"),
+            );
+        }
+    }
+}
+
+// Sound names understood by the notification backends: macOS maps this one to
+// the system's default notification sound; Linux uses the freedesktop sound
+// theme name for an incoming message.
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+const COMPLETION_TOAST_SOUND: &str = "NSUserNotificationDefaultSoundName";
+#[cfg(all(feature = "desktop", not(windows), not(target_os = "macos")))]
+const COMPLETION_TOAST_SOUND: &str = "message-new-instant";
+
+/// Host-side completion toast (see notification::add_entry). Windows uses the
+/// WinRT path so a click can refocus the window and workspace; elsewhere the
+/// notification plugin delivers it.
+#[cfg(feature = "desktop")]
+pub(crate) fn notify_completion_toast(
+    app: AppHandle,
+    window_label: String,
+    title: String,
+    body: Option<String>,
+    workspace_id: Option<String>,
+    sound: bool,
+) {
+    #[cfg(windows)]
+    notify_windows_toast(app, window_label, title, body, workspace_id, sound);
+    #[cfg(not(windows))]
+    {
+        let _ = (window_label, workspace_id);
+        use tauri_plugin_notification::NotificationExt;
+        let mut builder = app.notification().builder().title(title);
+        if let Some(body) = body.filter(|b| !b.trim().is_empty()) {
+            builder = builder.body(body);
+        }
+        if sound {
+            builder = builder.sound(COMPLETION_TOAST_SOUND);
         }
         if let Err(err) = builder.show() {
             log_tauri(&HostContext::from_app(app.clone()), &format!("[notify] OS notification failed: {err}"));
@@ -763,7 +959,10 @@ pub(crate) fn notify_windows_toast(
             toast = toast.icon(icon, tauri_winrt_notification::IconCrop::Square, "");
         }
         if let Err(err) = toast.show() {
-            log_tauri(&HostContext::from_app(app), &format!("[notify] OS notification failed: {err}"));
+            log_tauri(
+                &HostContext::from_app(app),
+                &format!("[notify] OS notification failed: {err}"),
+            );
         }
     });
 }
@@ -864,6 +1063,18 @@ mod tests {
     }
 
     #[test]
+    fn dock_badge_adds_unread_completions_to_pending_actions() {
+        let defaults = serde_json::json!({});
+        assert_eq!(dock_badge_total(0, 0, &defaults), 0);
+        assert_eq!(dock_badge_total(0, 2, &defaults), 2, "completions alone must light the badge");
+        assert_eq!(dock_badge_total(1, 2, &defaults), 3);
+        assert_eq!(dock_badge_total(-1, 1, &defaults), 1);
+        assert_eq!(dock_badge_total(i64::MAX, 1, &defaults), i64::MAX);
+        assert_eq!(dock_badge_total(0, 2, &serde_json::json!({ "showDockBadge": true })), 2);
+        assert_eq!(dock_badge_total(1, 2, &serde_json::json!({ "showDockBadge": false })), 0);
+    }
+
+    #[test]
     fn parse_launch_profile_supports_equals_and_split_args() {
         assert_eq!(
             parse_launch_profile_args(["bat", "--profile=remote-1"]),
@@ -874,6 +1085,62 @@ mod tests {
             Some("local-2".into())
         );
         assert_eq!(parse_launch_profile_args(["bat", "--profile="]), None);
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn profile_open_reuses_a_queued_window_before_webview_creation() {
+        let state = WindowOpenState::default();
+        assert!(state.queue("bat-first", "bat"));
+        // The startup anchor has returned, but there is no live webview yet.
+        // Active-profile restoration must reuse the reservation for that profile.
+        assert_eq!(
+            state.reusable_window_ids("bat", Vec::new),
+            vec!["bat-first"]
+        );
+        assert!(state.reusable_window_ids("game", Vec::new).is_empty());
+        // During the transition to live, the same window is returned only once.
+        assert_eq!(
+            state.reusable_window_ids("bat", || {
+                state.finish("bat-first");
+                vec!["bat-first".into()]
+            }),
+            vec!["bat-first"]
+        );
+        state.finish("bat-first");
+        assert_eq!(
+            state.reusable_window_ids("bat", || vec!["bat-first".into()]),
+            vec!["bat-first"]
+        );
+        assert!(state.reusable_window_ids("bat", Vec::new).is_empty());
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn queued_window_can_be_retried_after_build_or_schedule_failure() {
+        let state = WindowOpenState::default();
+        assert!(state.queue("bat-first", "bat"));
+        assert!(!state.queue("bat-first", "bat"));
+        state.finish("bat-first");
+        assert!(state.reusable_window_ids("bat", Vec::new).is_empty());
+        assert!(state.queue("bat-first", "bat"));
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn concurrent_window_build_requests_reserve_the_label_once() {
+        let state = WindowOpenState::default();
+        let reservations = std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| scope.spawn(|| state.queue("bat-first", "bat")))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|queued| *queued)
+                .count()
+        });
+        assert_eq!(reservations, 1);
     }
 
     #[test]
@@ -976,6 +1243,41 @@ mod tests {
         assert!(line.contains(" [tauri] hello\n"));
     }
 
+    #[cfg(not(feature = "desktop"))]
+    #[test]
+    fn diagnostic_file_redacts_connection_credentials() {
+        use crate::host_context::HeadlessHost;
+        use std::sync::Arc;
+        let dir =
+            std::env::temp_dir().join(format!("bat-log-redaction-{:032x}", rand::random::<u128>()));
+        let ctx = HostContext::from_headless(Arc::new(HeadlessHost::new(
+            Some(dir.clone()),
+            Arc::new(|_, _| {}),
+        )));
+        log_tauri(
+            &ctx,
+            "upgrade failed wss://example.invalid?token=fixture-secret&fp=AA",
+        );
+        log_tauri(
+            &ctx,
+            r#"auth {"token":"fixture-secret","remoteToken":"second-secret"}"#,
+        );
+        // The shared log writer batches asynchronously; wait for both queued
+        // lines before checking the durable file or removing its directory.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let text = loop {
+            let text = std::fs::read_to_string(dir.join("logs/debug.log")).unwrap_or_default();
+            if text.lines().count() >= 2 || std::time::Instant::now() >= deadline {
+                break text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(!text.contains("fixture-secret") && !text.contains("second-secret"));
+        assert!(text.contains("?token=[REDACTED]&fp=AA"));
+        assert!(text.contains(r#""remoteToken":"[REDACTED]""#));
+    }
+
     #[cfg(feature = "desktop")]
     #[test]
     fn system_version_string_is_well_formed_on_windows() {
@@ -997,7 +1299,10 @@ mod tests {
             // A manifest-shimmed API (GetVersionExW style) reports builds like
             // 9200/9600; any real Windows 10+ machine is >= 10240 (Win10 RTM).
             let build: u32 = parts[2].parse().expect("numeric build segment");
-            assert!(build >= 10240, "expected Windows build >= 10240, got {build}");
+            assert!(
+                build >= 10240,
+                "expected Windows build >= 10240, got {build}"
+            );
         }
         #[cfg(not(target_os = "windows"))]
         {
