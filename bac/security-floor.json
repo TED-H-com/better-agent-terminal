@@ -1,0 +1,1449 @@
+{
+  "schema": 1,
+  "source": "Lead dependency-alerts.json export supplied for inv round 1; 150 alert records",
+  "packages": [
+    {
+      "package": "@hono/node-server",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "node-sidecar/pnpm-lock.yaml",
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "2.1.6",
+      "status": "open",
+      "advisories": [
+        {
+          "id": "GHSA-frvp-7c67-39w9",
+          "severity": "medium",
+          "alerts": [
+            25,
+            104
+          ],
+          "firstPatched": "1.19.15",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-jpvv-r467-5p4w",
+          "severity": "medium",
+          "alerts": [
+            147,
+            148
+          ],
+          "firstPatched": "2.1.6",
+          "seedStates": [
+            "open"
+          ]
+        },
+        {
+          "id": "GHSA-qv5m-9pm6-hqp3",
+          "severity": "medium",
+          "alerts": [
+            149,
+            150
+          ],
+          "firstPatched": "2.1.6",
+          "seedStates": [
+            "open"
+          ]
+        }
+      ],
+      "reason": "Seed alerts 147\u2013150 remain open, but both current locks resolve 2.1.8 >= 2.1.6 after the documented v3.2.18 targeted updates; retain exported open status pending owner reconciliation, not an assertion that the current version is vulnerable."
+    },
+    {
+      "package": "@modelcontextprotocol/sdk",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "node-sidecar/pnpm-lock.yaml",
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "1.32.0",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-22jm-h49p-29qw",
+          "severity": "high",
+          "alerts": [
+            136,
+            137
+          ],
+          "firstPatched": "1.32.0",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-46jr-4wx8-v453",
+          "severity": "high",
+          "alerts": [
+            142,
+            143
+          ],
+          "firstPatched": "1.32.0",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-6prh-2h8m-c8cw",
+          "severity": "medium",
+          "alerts": [
+            138,
+            139
+          ],
+          "firstPatched": "1.32.0",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-6qxp-vccf-f47h",
+          "severity": "high",
+          "alerts": [
+            42,
+            126
+          ],
+          "firstPatched": "1.31.0",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-rvq5-wwqv-78pq",
+          "severity": "medium",
+          "alerts": [
+            140,
+            141
+          ],
+          "firstPatched": "1.32.0",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "body-parser",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "node-sidecar/pnpm-lock.yaml",
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "2.3.0",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-v422-hmwv-36x6",
+          "severity": "low",
+          "alerts": [
+            11,
+            78
+          ],
+          "firstPatched": "2.3.0",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "dompurify",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "3.4.16",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-55q2-fjhq-7xh7",
+          "severity": "medium",
+          "alerts": [
+            97
+          ],
+          "firstPatched": "3.4.13",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-6688-9rhm-gjv2",
+          "severity": "low",
+          "alerts": [
+            124
+          ],
+          "firstPatched": "3.4.16",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-76mc-f452-cxcm",
+          "severity": "medium",
+          "alerts": [
+            67
+          ],
+          "firstPatched": "3.4.7",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-c2j3-45gr-mqc4",
+          "severity": "low",
+          "alerts": [
+            83
+          ],
+          "firstPatched": "3.4.12",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-cmwh-pvxp-8882",
+          "severity": "medium",
+          "alerts": [
+            77
+          ],
+          "firstPatched": "3.4.11",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-gvmj-g25r-r7wr",
+          "severity": "low",
+          "alerts": [
+            70
+          ],
+          "firstPatched": "3.4.8",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-hpcv-96wg-7vj8",
+          "severity": "medium",
+          "alerts": [
+            66
+          ],
+          "firstPatched": "3.4.6",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-r47g-fvhr-h676",
+          "severity": "medium",
+          "alerts": [
+            65
+          ],
+          "firstPatched": "3.4.6",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-rp9w-3fw7-7cwq",
+          "severity": "medium",
+          "alerts": [
+            69
+          ],
+          "firstPatched": "3.4.7",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-vxr8-fq34-vvx9",
+          "severity": "low",
+          "alerts": [
+            71
+          ],
+          "firstPatched": "3.4.9",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-x4vx-rjvf-j5p4",
+          "severity": "low",
+          "alerts": [
+            68
+          ],
+          "firstPatched": null,
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ],
+      "reason": "One fixed seed advisory has no firstPatched value; retain that advisory and use the highest non-null firstPatched value (3.4.16), as resolved 3.4.17 exceeds it."
+    },
+    {
+      "package": "esbuild",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "0.28.1",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-g7r4-m6w7-qqqr",
+          "severity": "low",
+          "alerts": [
+            62
+          ],
+          "firstPatched": "0.28.1",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "fast-uri",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "node-sidecar/pnpm-lock.yaml",
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "3.1.8",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-4c8g-83qw-93j6",
+          "severity": "high",
+          "alerts": [
+            15,
+            82
+          ],
+          "firstPatched": "3.1.3",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-7p8r-x3mc-p8w7",
+          "severity": "high",
+          "alerts": [
+            17,
+            89
+          ],
+          "firstPatched": "3.1.5",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-f65p-4m7j-42xc",
+          "severity": "high",
+          "alerts": [
+            30,
+            110
+          ],
+          "firstPatched": "3.1.6",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-fph4-wmhf-6fwf",
+          "severity": "high",
+          "alerts": [
+            29
+          ],
+          "firstPatched": "3.1.6",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-hrr3-gc8f-f4qj",
+          "severity": "medium",
+          "alerts": [
+            39,
+            119
+          ],
+          "firstPatched": "3.1.8",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-jqff-g426-hqxp",
+          "severity": "high",
+          "alerts": [
+            28,
+            109
+          ],
+          "firstPatched": "3.1.6",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-q3j6-qgpj-74h6",
+          "severity": "high",
+          "alerts": [
+            103
+          ],
+          "firstPatched": "3.1.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-qw65-cvwx-89v3",
+          "severity": "high",
+          "alerts": [
+            36,
+            116
+          ],
+          "firstPatched": "3.1.7",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-v2hh-gcrm-f6hx",
+          "severity": "high",
+          "alerts": [
+            16,
+            85
+          ],
+          "firstPatched": "3.1.4",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-v39h-62p7-jpjc",
+          "severity": "high",
+          "alerts": [
+            102
+          ],
+          "firstPatched": "3.1.2",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "hono",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "node-sidecar/pnpm-lock.yaml",
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "4.13.11",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-2gcr-mfcq-wcc3",
+          "severity": "medium",
+          "alerts": [
+            5,
+            61
+          ],
+          "firstPatched": "4.12.21",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-3hrh-pfw6-9m5x",
+          "severity": "medium",
+          "alerts": [
+            3,
+            59
+          ],
+          "firstPatched": "4.12.21",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-54fx-42gc-7vw4",
+          "severity": "medium",
+          "alerts": [
+            22,
+            98
+          ],
+          "firstPatched": "4.12.34",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-5r4p-p66f-jhc7",
+          "severity": "medium",
+          "alerts": [
+            132,
+            131
+          ],
+          "firstPatched": "4.13.11",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-69xw-7hcm-h432",
+          "severity": "medium",
+          "alerts": [
+            47
+          ],
+          "firstPatched": "4.12.16",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-79qm-7rj5-m7r9",
+          "severity": "low",
+          "alerts": [
+            23,
+            99
+          ],
+          "firstPatched": "4.12.34",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-88fw-hqm2-52qc",
+          "severity": "high",
+          "alerts": [
+            8,
+            74
+          ],
+          "firstPatched": "4.12.25",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-8j4g-w8fx-2239",
+          "severity": "medium",
+          "alerts": [
+            21,
+            91
+          ],
+          "firstPatched": "4.12.34",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-9vqf-7f2p-gf9v",
+          "severity": "medium",
+          "alerts": [
+            48
+          ],
+          "firstPatched": "4.12.16",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-crvj-82cr-hjcx",
+          "severity": "medium",
+          "alerts": [
+            31,
+            111
+          ],
+          "firstPatched": "4.13.5",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-f23p-vx2j-j53r",
+          "severity": "medium",
+          "alerts": [
+            24,
+            100
+          ],
+          "firstPatched": "4.12.34",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-f577-qrjj-4474",
+          "severity": "medium",
+          "alerts": [
+            2,
+            58
+          ],
+          "firstPatched": "4.12.21",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-g6gw-c38x-mqfc",
+          "severity": "medium",
+          "alerts": [
+            32,
+            112
+          ],
+          "firstPatched": "4.13.5",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-gqvv-2mrq-wpjv",
+          "severity": "medium",
+          "alerts": [
+            33,
+            113
+          ],
+          "firstPatched": "4.13.5",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-hm8q-7f3q-5f36",
+          "severity": "low",
+          "alerts": [
+            50
+          ],
+          "firstPatched": "4.12.18",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-hvrm-45r6-mjfj",
+          "severity": "medium",
+          "alerts": [
+            14,
+            81
+          ],
+          "firstPatched": "4.12.27",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-hxh3-vqpv-xpqv",
+          "severity": "medium",
+          "alerts": [
+            40,
+            120
+          ],
+          "firstPatched": "4.13.7",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-j6c9-x7qj-28xf",
+          "severity": "medium",
+          "alerts": [
+            6,
+            72
+          ],
+          "firstPatched": "4.12.25",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-p77w-8qqv-26rm",
+          "severity": "medium",
+          "alerts": [
+            49
+          ],
+          "firstPatched": "4.12.18",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-qp7p-654g-cw7p",
+          "severity": "medium",
+          "alerts": [
+            51
+          ],
+          "firstPatched": "4.12.18",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-rv63-4mwf-qqc2",
+          "severity": "medium",
+          "alerts": [
+            10,
+            76
+          ],
+          "firstPatched": "4.12.25",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-w62v-xxxg-mg59",
+          "severity": "medium",
+          "alerts": [
+            13,
+            80
+          ],
+          "firstPatched": "4.12.27",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-wgpf-jwqj-8h8p",
+          "severity": "medium",
+          "alerts": [
+            9,
+            75
+          ],
+          "firstPatched": "4.12.25",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-wwfh-h76j-fc44",
+          "severity": "medium",
+          "alerts": [
+            7,
+            73
+          ],
+          "firstPatched": "4.12.25",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-xgm2-5f3f-mvvc",
+          "severity": "medium",
+          "alerts": [
+            12,
+            79
+          ],
+          "firstPatched": "4.12.27",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-xrhx-7g5j-rcj5",
+          "severity": "medium",
+          "alerts": [
+            4,
+            60
+          ],
+          "firstPatched": "4.12.21",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "ip-address",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "node-sidecar/pnpm-lock.yaml",
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "10.7.1",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-22jq-vg5j-6vgg",
+          "severity": "medium",
+          "alerts": [
+            18
+          ],
+          "firstPatched": "10.2.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-2vr4-cq9g-pvrc",
+          "severity": "medium",
+          "alerts": [
+            34
+          ],
+          "firstPatched": "10.5.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-4xrf-jv44-h6hh",
+          "severity": "medium",
+          "alerts": [
+            19
+          ],
+          "firstPatched": "10.2.2",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-h3mg-xc3c-68pw",
+          "severity": "medium",
+          "alerts": [
+            37,
+            117
+          ],
+          "firstPatched": "10.7.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-j6r3-76f7-8jcv",
+          "severity": "medium",
+          "alerts": [
+            38,
+            118
+          ],
+          "firstPatched": "10.7.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-mwp4-54f8-5fhr",
+          "severity": "high",
+          "alerts": [
+            20,
+            90
+          ],
+          "firstPatched": "10.3.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-rpw4-54j3-4h4q",
+          "severity": "medium",
+          "alerts": [
+            35,
+            115
+          ],
+          "firstPatched": "10.5.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-v2v4-37r5-5v8g",
+          "severity": "medium",
+          "alerts": [
+            46
+          ],
+          "firstPatched": "10.1.1",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "katex",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "0.18.2",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-238p-pmpm-9mq7",
+          "severity": "low",
+          "alerts": [
+            123
+          ],
+          "firstPatched": "0.18.2",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "mermaid",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "11.16.1",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-2v8p-3f2j-5mp7",
+          "severity": "medium",
+          "alerts": [
+            92
+          ],
+          "firstPatched": "11.16.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-3rrr-jr9j-h3q3",
+          "severity": "medium",
+          "alerts": [
+            93
+          ],
+          "firstPatched": "11.16.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-6m6c-36f7-fhxh",
+          "severity": "medium",
+          "alerts": [
+            54
+          ],
+          "firstPatched": "11.15.0",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-6x64-9x62-f2gx",
+          "severity": "medium",
+          "alerts": [
+            94
+          ],
+          "firstPatched": "11.16.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-87f9-hvmw-gh4p",
+          "severity": "medium",
+          "alerts": [
+            55
+          ],
+          "firstPatched": "11.15.0",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-c4c3-pg64-4m4v",
+          "severity": "low",
+          "alerts": [
+            95
+          ],
+          "firstPatched": "11.16.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-ghcm-xqfw-q4vr",
+          "severity": "medium",
+          "alerts": [
+            53
+          ],
+          "firstPatched": "11.15.0",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-rhh3-jpg6-66xh",
+          "severity": "medium",
+          "alerts": [
+            96
+          ],
+          "firstPatched": "11.16.1",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-xcj9-5m2h-648r",
+          "severity": "medium",
+          "alerts": [
+            52
+          ],
+          "firstPatched": "11.15.0",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "nanoid",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "3.3.18",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-28wg-ghj8-5hjv",
+          "severity": "high",
+          "alerts": [
+            101
+          ],
+          "firstPatched": "3.3.16",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-2v37-7h3g-55p8",
+          "severity": "high",
+          "alerts": [
+            105
+          ],
+          "firstPatched": "3.3.18",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-xwg4-73v4-xw9w",
+          "severity": "high",
+          "alerts": [
+            106
+          ],
+          "firstPatched": "3.3.12",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "postcss",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "8.5.23",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-6g55-p6wh-862q",
+          "severity": "high",
+          "alerts": [
+            86
+          ],
+          "firstPatched": "8.5.12",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-fxqj-rqcc-2cmp",
+          "severity": "medium",
+          "alerts": [
+            88
+          ],
+          "firstPatched": "8.5.23",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-r28c-9q8g-f849",
+          "severity": "high",
+          "alerts": [
+            87
+          ],
+          "firstPatched": "8.5.18",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "proxy-addr",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "node-sidecar/pnpm-lock.yaml",
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "2.0.8",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-jqcg-44mw-7w3h",
+          "severity": "critical",
+          "alerts": [
+            41,
+            121
+          ],
+          "firstPatched": "2.0.8",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "qs",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "node-sidecar/pnpm-lock.yaml",
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "6.16.0",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-4mjr-xmp4-gh2g",
+          "severity": "medium",
+          "alerts": [
+            26,
+            107
+          ],
+          "firstPatched": "6.16.0",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-q8mj-m7cp-5q26",
+          "severity": "medium",
+          "alerts": [
+            1,
+            57
+          ],
+          "firstPatched": "6.15.2",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-x5fp-wj9c-mxmx",
+          "severity": "medium",
+          "alerts": [
+            27,
+            108
+          ],
+          "firstPatched": "6.16.0",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "sharp",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "0.35.5",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-f88m-g3jw-g9cj",
+          "severity": "high",
+          "alerts": [
+            43,
+            84
+          ],
+          "firstPatched": "0.35.0",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-rgj7-g3m4-5g8c",
+          "severity": "high",
+          "alerts": [
+            44,
+            114
+          ],
+          "firstPatched": "0.35.4",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-wq5f-xc86-pv6w",
+          "severity": "high",
+          "alerts": [
+            45,
+            125
+          ],
+          "firstPatched": "0.35.5",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ],
+      "reason": "Seed alerts 43\u201345 name package.json; root manifest advisories apply to pnpm-lock.yaml, alongside the lockfile alerts for the same package."
+    },
+    {
+      "package": "source-map-js",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "1.2.2",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-68fv-2mgg-jv7q",
+          "severity": "high",
+          "alerts": [
+            122
+          ],
+          "firstPatched": "1.2.2",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "uuid",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "11.1.1",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-w5hq-g745-h8pq",
+          "severity": "medium",
+          "alerts": [
+            56
+          ],
+          "firstPatched": "11.1.1",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "vite",
+      "ecosystem": "npm",
+      "lockfiles": [
+        "pnpm-lock.yaml"
+      ],
+      "minimum": "8.1.6",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-587h-7wmj-h5pm",
+          "severity": "high",
+          "alerts": [
+            134
+          ],
+          "firstPatched": "8.1.6",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-698v-4r3x-3vcv",
+          "severity": "medium",
+          "alerts": [
+            133
+          ],
+          "firstPatched": "8.1.6",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-fx2h-pf6j-xcff",
+          "severity": "medium",
+          "alerts": [
+            63
+          ],
+          "firstPatched": "8.0.16",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-r825-w8mm-5pxw",
+          "severity": "medium",
+          "alerts": [
+            135
+          ],
+          "firstPatched": "8.1.6",
+          "seedStates": [
+            "fixed"
+          ]
+        },
+        {
+          "id": "GHSA-v6wh-96g9-6wx3",
+          "severity": "medium",
+          "alerts": [
+            64
+          ],
+          "firstPatched": "8.0.16",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "glib",
+      "ecosystem": "rust",
+      "lockfiles": [
+        "src-tauri/Cargo.lock"
+      ],
+      "minimum": "0.20.0",
+      "status": "backported",
+      "advisories": [
+        {
+          "id": "GHSA-wrw7-89jp-8q8g",
+          "severity": "medium",
+          "alerts": [
+            127
+          ],
+          "firstPatched": "0.20.0",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ],
+      "reason": "GTK3 requires glib 0.18; the documented gtk-rs-core#1343 backport closes GHSA-wrw7-89jp-8q8g without changing its API/ABI.",
+      "backport": {
+        "version": "0.18.5",
+        "manifest": "src-tauri/Cargo.toml",
+        "path": "vendor/glib-0.18.5",
+        "source": "local path; Cargo.lock must contain neither source nor checksum",
+        "verifier": "python3 scripts/verify-vendored-glib.py"
+      }
+    },
+    {
+      "package": "quinn-proto",
+      "ecosystem": "rust",
+      "lockfiles": [
+        "src-tauri/Cargo.lock"
+      ],
+      "minimum": "0.11.15",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-4w2j-m93h-cj5j",
+          "severity": "high",
+          "alerts": [
+            128
+          ],
+          "firstPatched": "0.11.15",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "rustls",
+      "ecosystem": "rust",
+      "lockfiles": [
+        "src-tauri/Cargo.lock"
+      ],
+      "minimum": "0.23.45",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-2mjx-qc3c-rqvc",
+          "severity": "medium",
+          "alerts": [
+            130
+          ],
+          "firstPatched": "0.23.45",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "serde_with",
+      "ecosystem": "rust",
+      "lockfiles": [
+        "src-tauri/Cargo.lock"
+      ],
+      "minimum": "3.21.0",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-7gcf-g7xr-8hxj",
+          "severity": "medium",
+          "alerts": [
+            129
+          ],
+          "firstPatched": "3.21.0",
+          "seedStates": [
+            "fixed"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "zip",
+      "ecosystem": "rust",
+      "lockfiles": [
+        "src-tauri/Cargo.lock"
+      ],
+      "minimum": "9.0.5",
+      "status": "open",
+      "advisories": [
+        {
+          "id": "GHSA-8hxf-qr8p-62x4",
+          "severity": "medium",
+          "alerts": [
+            146
+          ],
+          "firstPatched": "9.0.0",
+          "seedStates": [
+            "open"
+          ]
+        },
+        {
+          "id": "GHSA-m665-v7pm-7grj",
+          "severity": "critical",
+          "alerts": [
+            144
+          ],
+          "firstPatched": "9.0.5",
+          "seedStates": [
+            "open"
+          ]
+        },
+        {
+          "id": "GHSA-q7v9-x93c-xqv3",
+          "severity": "high",
+          "alerts": [
+            145
+          ],
+          "firstPatched": "9.0.0",
+          "seedStates": [
+            "open"
+          ]
+        }
+      ],
+      "reason": "The desktop dependency graph resolves zip 4.6.1; patched zip 9.0.5 requires a major migration, deferred in the v3.2.18 merge record."
+    }
+  ]
+}
