@@ -627,8 +627,6 @@ fn storage_reason_names_are_unique_bounded_and_the_only_client_detail() {
         Reason::TempWrite,
         Reason::TempSync,
         Reason::Publish,
-        Reason::TempRemove,
-        Reason::CachePoisoned,
     ];
     let mut seen = std::collections::HashSet::new();
     for reason in reasons {
@@ -726,4 +724,20 @@ fn linked_entries_keep_type_reasons_and_are_not_replaced() {
         assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 1);
         assert_eq!(load_or_create(&root).unwrap(), id);
     }
+}
+
+#[test]
+fn internal_cache_failure_has_no_client_reason() {
+    let failure = StorageError {
+        error: Error::Internal,
+        reason: Reason::CachePoisoned,
+        path: PathBuf::from("private-path"),
+    };
+    assert_eq!(failure.reason.name(), "cache_poisoned");
+    assert_eq!(
+        failure.wire_error().reply(),
+        json!({"ok":false,"error":{
+        "code":"INTERNAL_ERROR","message":"BAC request failed",
+        "retryable":false,"details":{}}})
+    );
 }

@@ -51,7 +51,6 @@ pub enum Reason {
     TempWrite,
     TempSync,
     Publish,
-    TempRemove,
     CachePoisoned,
 }
 impl Reason {
@@ -79,7 +78,6 @@ impl Reason {
             Self::TempWrite => "temp_write",
             Self::TempSync => "temp_sync",
             Self::Publish => "publish",
-            Self::TempRemove => "temp_remove",
             Self::CachePoisoned => "cache_poisoned",
         }
     }

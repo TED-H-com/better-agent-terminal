@@ -62,7 +62,9 @@ spool and stderr, at most once per reason per process. Desktop has no installed
 spool and receives stderr only. This diagnostic never opens a file under the
 data directory, regardless of BAT_DEBUG. The host's other diagnostics are separate.
 
-Reason names:
+Client-visible reason names:
+
+```text
 data_directory_unavailable
 data_directory_type
 directory_metadata
@@ -85,8 +87,10 @@ temp_create
 temp_write
 temp_sync
 publish
-temp_remove
-cache_poisoned
+```
+
+`cache_poisoned` exists only in the host diagnostic for an `INTERNAL_ERROR`;
+that reply has empty `details` and exposes no reason.
 
 ## Build and compatibility limits
 
