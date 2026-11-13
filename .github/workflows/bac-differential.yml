@@ -1,0 +1,89 @@
+name: BAC upstream wire differential
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: bac-differential-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+jobs:
+  differential:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: '10.33.2'
+          run_install: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: '1.98.1'
+      - name: Read immutable upstream reference
+        id: base
+        run: |
+          node --input-type=module <<'JS' >> "$GITHUB_OUTPUT"
+          import fs from 'node:fs'
+          const base = JSON.parse(fs.readFileSync('bac/UPSTREAM_BASE.json'))
+          if (!/^[0-9a-f]{40}$/.test(base.commit)) throw new Error('Invalid commit')
+          if (!/^https:\/\/github.com\/[\w-]+\/[\w-]+$/.test(base.repository)) throw new Error('Invalid repository')
+          console.log(`commit=${base.commit}`)
+          console.log(`repository=${base.repository.replace('https://github.com/', '')}`)
+          JS
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.base.outputs.repository }}
+          ref: ${{ steps.base.outputs.commit }}
+          path: .bac-upstream
+          persist-credentials: false
+      - name: Install locked sidecar dependencies in each checkout
+        run: |
+          pnpm --dir node-sidecar install --frozen-lockfile
+          pnpm --dir .bac-upstream/node-sidecar install --frozen-lockfile
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/bac-differential/upstream-*
+          key: bac-upstream-${{ runner.os }}-rust-1.98.1-${{ hashFiles('bac/UPSTREAM_BASE.json') }}-v1
+      - name: Comparator negative controls
+        run: node bac/tests/differential/self-test.mjs
+      - name: Build both archived sources with release version stamping
+        run: >-
+          node bac/tests/differential/run.mjs --build-only
+          --upstream-source .bac-upstream
+          --scratch "$HOME/.cache/bac-differential"
+          --report "$RUNNER_TEMP/bac-differential/build"
+      - name: Require three stable upstream-versus-upstream comparisons
+        run: >-
+          node bac/tests/differential/run.mjs --same-binary --repeat 3
+          --upstream-source .bac-upstream
+          --scratch "$HOME/.cache/bac-differential"
+          --report "$RUNNER_TEMP/bac-differential/stability"
+      - name: Compare upstream and fork
+        run: >-
+          node bac/tests/differential/run.mjs
+          --upstream-source .bac-upstream
+          --scratch "$HOME/.cache/bac-differential"
+          --report "$RUNNER_TEMP/bac-differential/comparison"
+      - name: Upload differential evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: bac-differential-${{ github.sha }}
+          path: ${{ runner.temp }}/bac-differential/
+          if-no-files-found: error
+          retention-days: 14
