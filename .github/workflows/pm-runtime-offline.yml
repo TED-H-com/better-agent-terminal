@@ -25,7 +25,7 @@ jobs:
         include:
           - source: upstream-baseline
             repository: tony1223/better-agent-terminal
-            ref: b7419892fbc9946799b64cca24c2ec8c7fa15c42
+            ref: 07e80f56275075195d05d58cf67a208934874557
           - source: feature
             repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
             ref: ${{ github.event.pull_request.head.sha || github.sha }}

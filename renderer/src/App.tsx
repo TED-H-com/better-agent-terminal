@@ -917,7 +917,6 @@ export default function App() {
     if (!activeProfileIsRemote) return
     let timer: ReturnType<typeof setTimeout> | null = null
     let disposed = false
-    const backoff = reconnectRef.current.retry
 
     const attemptReconnect = async () => {
       // Only drive reconnection for a remote profile that is still wanted.
