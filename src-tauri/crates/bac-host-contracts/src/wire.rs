@@ -24,10 +24,16 @@ pub enum Error {
     StorageUnavailable,
     StorageCorrupt,
     Internal,
+    StorageReason(Box<Error>, &'static str),
 }
 
 impl Error {
     pub fn reply(&self) -> Value {
+        if let Self::StorageReason(error, reason) = self {
+            let mut reply = error.reply();
+            reply["error"]["details"] = json!({"reason":reason});
+            return reply;
+        }
         let (code, message, details) = match self {
             Self::NotOptedIn => ("NOT_OPTED_IN", "Call bac:hello first", json!({})),
             Self::InvalidRequest(field) => (
@@ -76,6 +82,7 @@ impl Error {
                 "BAC identity storage is invalid",
                 json!({}),
             ),
+            Self::StorageReason(_, _) => unreachable!(),
             Self::Internal => ("INTERNAL_ERROR", "BAC request failed", json!({})),
         };
         json!({"ok":false,"error":{"code":code,"message":message,"retryable":false,"details":details}})

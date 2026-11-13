@@ -305,7 +305,7 @@ fn failed_identity_initialization_can_be_retried_after_repair() {
 }
 
 // Compare public wire categories in the publication fault tests; detailed reasons
-// are separately asserted below and are never serialized to clients.
+// are separately asserted below; only fixed names are serialized to clients.
 fn load_or_create(path: &Path) -> std::result::Result<String, Error> {
     super::load_or_create(path).map_err(|e| e.error)
 }
@@ -393,6 +393,250 @@ fn windows_symbolic_links_are_refused() {
     fs::remove_file(target(&root)).unwrap();
     let linked_root = scratch.0.join("linked-root");
     symlink_dir(&root, &linked_root).unwrap();
-    assert_eq!(load_or_create(&linked_root), Err(Error::StorageCorrupt));
+    assert_eq!(
+        load_or_create(&linked_root).unwrap(),
+        load_or_create(&root).unwrap()
+    );
     fs::remove_dir(linked_root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_verified_directory_never_redirects_or_adopts() {
+    for link in [true, false] {
+        let scratch = Scratch::new();
+        let root = scratch.store();
+        let outside = scratch.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let saved = root.join("saved-bac");
+        let error = super::initialize(&root, |p| {
+            if p == Point::DirectoryReady {
+                fs::rename(root.join("bac"), &saved).unwrap();
+                if link {
+                    symlink(&outside, root.join("bac")).unwrap();
+                } else {
+                    fs::create_dir(root.join("bac")).unwrap();
+                    fs::set_permissions(root.join("bac"), fs::Permissions::from_mode(0o777))
+                        .unwrap();
+                }
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.error, Error::StorageUnavailable);
+        assert_eq!(error.reason, Reason::IdentityChanged);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 0);
+        let bytes = fs::read(saved.join("host.json")).unwrap();
+        if link {
+            fs::remove_file(root.join("bac")).unwrap();
+        } else {
+            fs::remove_dir(root.join("bac")).unwrap();
+        }
+        fs::rename(saved, root.join("bac")).unwrap();
+        let id = load_or_create(&root).unwrap();
+        assert_eq!(load_or_create(&root).unwrap(), id);
+        assert_eq!(fs::read(target(&root)).unwrap(), bytes);
+        assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 1);
+    }
+}
+#[cfg(unix)]
+#[test]
+fn linked_data_root_works_and_fifo_identity_is_refused() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let scratch = Scratch::new();
+    let alias = scratch.0.join("alias");
+    symlink(scratch.store(), &alias).unwrap();
+    let id = load_or_create(&alias).unwrap();
+    assert_eq!(load_or_create(&scratch.store()).unwrap(), id);
+    fs::remove_file(target(&alias)).unwrap();
+    let name = CString::new(target(&alias).as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is NUL terminated and mode is a valid permission mask.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    assert_eq!(load_or_create(&alias), Err(Error::StorageCorrupt));
+}
+#[test]
+fn cleanup_failure_after_publication_does_not_refuse_identity() {
+    let scratch = Scratch::new();
+    let root = scratch.store();
+    let id = initialize(&root, |p| {
+        if p == Point::Published {
+            // A removed candidate makes the store's unlink fail with NotFound.
+            let temp = fs::read_dir(root.join("bac"))
+                .unwrap()
+                .flatten()
+                .find(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("host.json.tmp-")
+                })
+                .unwrap();
+            fs::remove_file(temp.path()).unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(load_or_create(&root).unwrap(), id);
+}
+#[cfg(windows)]
+#[test]
+fn held_identity_reader_allows_publisher_cleanup_and_initialization() {
+    let scratch = Scratch::new();
+    let root = scratch.store();
+    let mut reader = None;
+    let id = initialize(&root, |p| {
+        if p == Point::Published {
+            reader = Some(options().read(true).open(target(&root)).unwrap());
+            assert!(load_or_create(&root).is_ok());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(load_or_create(&root).unwrap(), id);
+    assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 1);
+    drop(reader);
+}
+#[test]
+fn process_worker() {
+    let Some(root) = std::env::var_os("BAC_IDENTITY_PROCESS_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let crash = std::env::var_os("BAC_IDENTITY_PROCESS_CRASH").is_some();
+    let id = initialize(&root, |p| {
+        if crash && p == Point::PartialWritten {
+            std::process::exit(73);
+        }
+        if p == Point::FileSynced {
+            println!("CANDIDATE_READY");
+            std::io::stdout().flush().unwrap();
+            std::io::stdin().read_exact(&mut [0u8]).unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+    fs::write(
+        root.join(format!(
+            "result-{}",
+            std::env::var("BAC_IDENTITY_PROCESS_INDEX").unwrap()
+        )),
+        id,
+    )
+    .unwrap();
+}
+#[test]
+fn separate_processes_publish_once_and_aborted_partial_write_recovers() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let scratch = Scratch::new();
+    let root = scratch.store();
+    let spawn = |index: &str, crash: bool| {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "identity::tests::process_worker", "--nocapture"])
+            .env("BAC_IDENTITY_PROCESS_ROOT", &root)
+            .env("BAC_IDENTITY_PROCESS_INDEX", index)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if crash {
+            cmd.env("BAC_IDENTITY_PROCESS_CRASH", "1");
+        }
+        Child(cmd.spawn().unwrap())
+    };
+    let mut jobs = [spawn("0", false), spawn("1", false)];
+    let mut readers = Vec::new();
+    for job in &mut jobs {
+        let mut reader = BufReader::new(job.0.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            if line.contains("CANDIDATE_READY") {
+                break;
+            }
+        }
+        readers.push(reader);
+    }
+    for job in &mut jobs {
+        job.0.stdin.take().unwrap().write_all(b"x").unwrap();
+    }
+    for reader in &mut readers {
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).unwrap();
+    }
+    for job in &mut jobs {
+        assert!(job.0.wait().unwrap().success());
+    }
+    assert_eq!(
+        fs::read(root.join("result-0")).unwrap(),
+        fs::read(root.join("result-1")).unwrap()
+    );
+    assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 1);
+    fs::remove_file(target(&root)).unwrap();
+    let mut crash = spawn("crash", true);
+    assert_eq!(crash.0.wait().unwrap().code(), Some(73));
+    assert!(!target(&root).exists());
+    let temp = fs::read_dir(root.join("bac"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let partial = fs::read(&temp).unwrap();
+    assert!(serde_json::from_slice::<Value>(&partial).is_err());
+    let id = load_or_create(&root).unwrap();
+    assert_eq!(load_or_create(&root).unwrap(), id);
+    assert_eq!(fs::read(&temp).unwrap(), partial);
+}
+
+#[test]
+fn storage_reason_names_are_unique_bounded_and_the_only_client_detail() {
+    let reasons = [
+        Reason::DataDirectoryUnavailable,
+        Reason::DataDirectoryType,
+        Reason::DirectoryMetadata,
+        Reason::DirectoryType,
+        Reason::DirectoryIntegrity,
+        Reason::DirectoryReadOnly,
+        Reason::DirectoryCreate,
+        Reason::DirectorySync,
+        Reason::IdentityMetadata,
+        Reason::IdentityType,
+        Reason::IdentityIntegrity,
+        Reason::IdentitySize,
+        Reason::IdentityContents,
+        Reason::IdentityChanged,
+        Reason::IdentityOpen,
+        Reason::IdentityRead,
+        Reason::Random,
+        Reason::TempCreate,
+        Reason::TempWrite,
+        Reason::TempSync,
+        Reason::Publish,
+        Reason::TempRemove,
+        Reason::CachePoisoned,
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for reason in reasons {
+        let name = reason.name();
+        assert!(name.len() <= 64 && name.as_bytes()[0].is_ascii_lowercase());
+        assert!(name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
+        assert!(seen.insert(name));
+        for error in [
+            StorageError::unavailable(reason, Path::new("private-path")),
+            StorageError::corrupt(reason, Path::new("private-path")),
+        ] {
+            let mut expected = error.error.reply();
+            expected["error"]["details"] = json!({"reason":name});
+            assert_eq!(error.wire_error().reply(), expected);
+        }
+    }
 }
