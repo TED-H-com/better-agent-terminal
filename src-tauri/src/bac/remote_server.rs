@@ -1,4 +1,6 @@
 //! BAC is intercepted before upstream profile routing or sidecar fallback.
+//! Storage diagnostics use the host error spool (headless) and redacted stderr,
+//! once per reason. They never open a file below the host data directory.
 use super::{ContextSink, HostContext, ProfileContexts, RemoteProtocol, SidecarState};
 pub(super) use bac_host_contracts::wire::reply_id;
 use bac_host_contracts::{
@@ -100,33 +102,11 @@ fn storage_error(ctx: &HostContext, error: &StorageError) -> Error {
         .log_once(error, |line| {
             log_storage_refusal(ctx, line);
         });
-    error.error.clone()
+    error.wire_error()
 }
-fn log_storage_refusal(ctx: &HostContext, line: &str) {
-    // log_tauri creates its parent directories. Do not let diagnosis create a
-    // missing data directory or follow a refused data-directory symlink.
-    let usable = ctx
-        .data_dir_opt()
-        .and_then(|p| std::fs::symlink_metadata(p).ok())
-        .is_some_and(|m| {
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                m.is_dir() && m.file_attributes() & 0x400 == 0
-            }
-            #[cfg(not(windows))]
-            {
-                m.is_dir() && !m.file_type().is_symlink()
-            }
-        });
-    if usable {
-        crate::commands::app::log_tauri(ctx, line);
-    } else {
-        // Existing headless error spool, plus the same redacted stderr fallback
-        // used by log_tauri, which remains available when storage is absent.
-        bat_error_log::log("warn", "bac.identity.refused", line);
-        eprintln!("[tauri] {}", crate::connection_diagnostics::redact(line));
-    }
+fn log_storage_refusal(_ctx: &HostContext, line: &str) {
+    bat_error_log::log("warn", "bac.identity.refused", line);
+    eprintln!("[tauri] {}", crate::connection_diagnostics::redact(line));
 }
 #[cfg(test)]
 mod bac_tests {
@@ -182,7 +162,10 @@ mod bac_tests {
             Some(path.clone()),
             Arc::new(|_, _| {}),
         )));
-        assert_eq!(identity(&ctx), Err(Error::StorageUnavailable));
+        assert_eq!(
+            identity(&ctx).unwrap_err().reply()["error"]["code"],
+            "STORAGE_UNAVAILABLE"
+        );
         assert!(!path.exists());
     }
 }

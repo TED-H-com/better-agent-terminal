@@ -33,6 +33,9 @@ mod bac_tests {
         }
     }
     fn connect(host: &TestHost, v2: bool) -> (Socket, String, Value) {
+        connect_id(host, v2, "auth")
+    }
+    fn connect_id(host: &TestHost, v2: bool, id: &str) -> (Socket, String, Value) {
         let cert = ensure_remote_certificate(&host.dir).unwrap();
         let mut roots = RootCertStore::empty();
         roots.add(CertificateDer::from(cert.cert_der)).unwrap();
@@ -53,7 +56,7 @@ mod bac_tests {
         let mut ws = tungstenite::client(format!("wss://localhost:{}/", host.info["port"]), tls)
             .unwrap()
             .0;
-        let mut auth = json!({"type":"auth","id":"auth","token":host.info["token"]});
+        let mut auth = json!({"type":"auth","id":id,"token":host.info["token"]});
         if v2 {
             auth["protocol"] = json!("bat-remote/v2");
         }
@@ -61,7 +64,7 @@ mod bac_tests {
         loop {
             let text = ws.read().unwrap().into_text().unwrap().to_string();
             let value = decode_remote_text_frame(&text).unwrap();
-            if value["type"] == "auth-result" {
+            if value["type"] == "auth-result" || value["type"] == "invoke-error" {
                 return (ws, text, value);
             }
         }
@@ -378,12 +381,21 @@ mod bac_tests {
             auth["capabilities"]["bac"],
             json!({"protocol":"bac/1","minor":0})
         );
-        assert_eq!(error(hello(&mut ws)), "STORAGE_CORRUPT");
+        let reply = hello(&mut ws);
+        assert_eq!(
+            reply["error"]["details"],
+            json!({"reason":"identity_contents"})
+        );
+        assert_eq!(error(reply), "STORAGE_CORRUPT");
         assert_eq!(fs::read(&path).unwrap(), b"partial");
         fs::remove_file(&path).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
         let reply = hello(&mut ws);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            reply["error"]["details"],
+            json!({"reason":"directory_read_only"})
+        );
         assert_eq!(error(reply), "STORAGE_UNAVAILABLE");
         assert_eq!(hello(&mut ws)["ok"], true);
         ws.close(None).unwrap();
@@ -412,5 +424,92 @@ mod bac_tests {
             break;
         }
         ws.close(None).unwrap();
+    }
+
+    #[test]
+    fn advertisement_crosses_fork_auth_size_cap_by_exactly_37_bytes() {
+        // This cap is the fork's own; upstream has none for auth results. Remove
+        // this test when the cap no longer applies to authentication results.
+        let host = TestHost::new();
+        let mut baseline = json!({"type":"auth-result","id":"","result":true,
+            "protocol":"bat-remote/v2","compression":"none","serverVersion":host.ctx.version(),
+            "capabilities":remote_capabilities()});
+        let cap = crate::remote_core::REMOTE_RESPONSE_MAX_BYTES;
+        let id = "x".repeat(cap - 1 - serde_json::to_vec(&baseline).unwrap().len());
+        baseline["id"] = json!(id);
+        assert_eq!(serde_json::to_vec(&baseline).unwrap().len(), cap - 1);
+        let mut advertised = baseline.clone();
+        advertised["capabilities"]["bac"] = bac_host_contracts::wire::advertisement();
+        let member_bytes =
+            serde_json::to_vec(&json!({"bac":bac_host_contracts::wire::advertisement()}))
+                .unwrap()
+                .len()
+                - 1;
+        assert_eq!(member_bytes, 37);
+        assert_eq!(
+            serde_json::to_vec(&advertised).unwrap().len(),
+            cap - 1 + member_bytes
+        );
+        let (mut ws, _, reply) = connect_id(&host, true, &id);
+        assert_eq!(reply["type"], "invoke-error");
+        assert_eq!(reply["code"], "REMOTE_RESPONSE_TOO_LARGE");
+        assert!(!host.dir.join("bac").exists());
+        ws.close(None).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn storage_refusal_never_uses_data_directory_logger() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+        if std::env::var_os("BAC_LOG_REGRESSION_CHILD").is_none() {
+            let name = format!(
+                "{}::storage_refusal_never_uses_data_directory_logger",
+                module_path!().split_once("::").unwrap().1
+            );
+            for debug in [false, true] {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                    .env("BAC_LOG_REGRESSION_CHILD", "1");
+                if debug {
+                    command.env("BAT_DEBUG", "1");
+                } else {
+                    command.env_remove("BAT_DEBUG");
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert_eq!(stderr.matches("[bac.identity] refusal").count(), 1);
+            }
+            return;
+        }
+        let debug = std::env::var("BAT_DEBUG").as_deref() == Ok("1");
+        for planted in [true, false] {
+            let host = TestHost::new();
+            let (mut ws, _, _) = connect(&host, true);
+            let outside = host.dir.join("log-target");
+            fs::create_dir(&outside).unwrap();
+            symlink(&outside, host.dir.join("bac")).unwrap();
+            if planted {
+                if host.dir.join("logs").exists() {
+                    fs::remove_dir_all(host.dir.join("logs")).unwrap();
+                }
+                symlink(&outside, host.dir.join("logs")).unwrap();
+            }
+            assert_eq!(error(hello(&mut ws)), "STORAGE_CORRUPT");
+            assert_eq!(error(hello(&mut ws)), "STORAGE_CORRUPT");
+            if debug {
+                if let Ok(text) = fs::read_to_string(host.dir.join("logs/debug.log")) {
+                    assert!(!text.contains("[bac.identity]"));
+                }
+            } else {
+                assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+                assert!(!host.dir.join("debug.log").exists());
+                if !planted {
+                    assert!(!host.dir.join("logs").exists());
+                }
+            }
+            ws.close(None).unwrap();
+        }
     }
 }
