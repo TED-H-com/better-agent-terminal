@@ -67,6 +67,7 @@ data_directory_unavailable
 data_directory_type
 directory_metadata
 directory_type
+directory_open
 directory_integrity
 directory_read_only
 directory_create

@@ -57,11 +57,16 @@ fn unlink_at(parent: &File, name: &CStr) -> io::Result<()> {
         Err(io::Error::last_os_error())
     }
 }
-fn entry_error(error: io::Error, reason: Reason, path: &Path) -> StorageError {
+fn entry_error(
+    error: io::Error,
+    type_reason: Reason,
+    open_reason: Reason,
+    path: &Path,
+) -> StorageError {
     if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
-        StorageError::corrupt(reason, path)
+        StorageError::corrupt(type_reason, path)
     } else {
-        StorageError::unavailable(reason, path)
+        StorageError::unavailable(open_reason, path)
     }
 }
 fn unsupported_sync(error: &io::Error) -> bool {
@@ -117,10 +122,18 @@ impl Store {
                     }
                 }
                 sync_handle(&data, data_dir)?;
-                open_at(&data, c"bac", flags, 0)
-                    .map_err(|e| entry_error(e, Reason::DirectoryType, &path))?
+                open_at(&data, c"bac", flags, 0).map_err(|e| {
+                    entry_error(e, Reason::DirectoryType, Reason::DirectoryOpen, &path)
+                })?
             }
-            Err(e) => return Err(entry_error(e, Reason::DirectoryType, &path)),
+            Err(e) => {
+                return Err(entry_error(
+                    e,
+                    Reason::DirectoryType,
+                    Reason::DirectoryOpen,
+                    &path,
+                ))
+            }
         };
         let meta = bac
             .metadata()
@@ -142,7 +155,14 @@ impl Store {
         ) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(entry_error(e, Reason::IdentityType, &path)),
+            Err(e) => {
+                return Err(entry_error(
+                    e,
+                    Reason::IdentityType,
+                    Reason::IdentityOpen,
+                    &path,
+                ))
+            }
         };
         read_file(file, &path).map(Some)
     }

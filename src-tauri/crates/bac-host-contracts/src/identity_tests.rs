@@ -609,6 +609,7 @@ fn storage_reason_names_are_unique_bounded_and_the_only_client_detail() {
         Reason::DataDirectoryType,
         Reason::DirectoryMetadata,
         Reason::DirectoryType,
+        Reason::DirectoryOpen,
         Reason::DirectoryIntegrity,
         Reason::DirectoryReadOnly,
         Reason::DirectoryCreate,
@@ -657,4 +658,72 @@ fn writable_data_root_has_no_integrity_mode_policy() {
     let id = load_or_create(&root).unwrap();
     assert_eq!(load_or_create(&root).unwrap(), id);
     assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o777);
+}
+
+#[cfg(unix)]
+#[test]
+fn denied_opens_report_open_reasons_without_mutating_storage() {
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("SKIP: privileged users bypass the kernel permission refusal");
+        return;
+    }
+    let scratch = Scratch::new();
+    let root = scratch.store();
+    let id = load_or_create(&root).unwrap();
+    let bytes = fs::read(target(&root)).unwrap();
+    for (path, restore, reason) in [
+        (root.join("bac"), 0o700, Reason::DirectoryOpen),
+        (target(&root), 0o600, Reason::IdentityOpen),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = super::load_or_create(&root);
+        let mode = fs::symlink_metadata(&path).unwrap().mode() & 0o777;
+        fs::set_permissions(&path, fs::Permissions::from_mode(restore)).unwrap();
+        let failure = result.unwrap_err();
+        assert_eq!(mode, 0o000);
+        assert_eq!(failure.error, Error::StorageUnavailable);
+        assert_eq!(failure.reason, reason);
+        assert_eq!(
+            failure.wire_error().reply(),
+            json!({"ok":false,"error":{
+            "code":"STORAGE_UNAVAILABLE","message":"BAC identity storage is unavailable",
+            "retryable":false,"details":{"reason":reason.name()}}})
+        );
+        assert_eq!(fs::read(target(&root)).unwrap(), bytes);
+        assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(load_or_create(&root).unwrap(), id);
+    }
+}
+#[cfg(unix)]
+#[test]
+fn linked_entries_keep_type_reasons_and_are_not_replaced() {
+    let scratch = Scratch::new();
+    let root = scratch.store();
+    let id = load_or_create(&root).unwrap();
+    let bytes = fs::read(target(&root)).unwrap();
+    for (path, reason) in [
+        (root.join("bac"), Reason::DirectoryType),
+        (target(&root), Reason::IdentityType),
+    ] {
+        let saved = scratch.0.join("saved-entry");
+        fs::rename(&path, &saved).unwrap();
+        symlink(&saved, &path).unwrap();
+        let failure = super::load_or_create(&root).unwrap_err();
+        assert_eq!(failure.error, Error::StorageCorrupt);
+        assert_eq!(failure.reason, reason);
+        assert_eq!(
+            failure.wire_error().reply(),
+            json!({"ok":false,"error":{
+            "code":"STORAGE_CORRUPT","message":"BAC identity storage is invalid",
+            "retryable":false,"details":{"reason":reason.name()}}})
+        );
+        assert_eq!(fs::read_link(&path).unwrap(), saved);
+        assert_eq!(fs::read(target(&root)).unwrap(), bytes);
+        fs::remove_file(&path).unwrap();
+        fs::rename(saved, &path).unwrap();
+        assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 1);
+        assert_eq!(load_or_create(&root).unwrap(), id);
+    }
 }
