@@ -51,6 +51,10 @@ Directory handles are synced on Unix. Unsupported directory sync (EINVAL,
 ENOTSUP/EOPNOTSUPP, EBADF) is tolerated; real I/O errors refuse. Windows standard
 library cannot sync directories. On these filesystems/platforms a power loss can
 require a new identity, detected through expectedHostId by Connector.
+Temporary-file `File::sync_all` is strict (full sync on Apple), so a filesystem
+without that support refuses creation with `STORAGE_UNAVAILABLE` and
+`details.reason: "temp_sync"`; existing identities remain readable.
+Only unsupported directory sync is tolerated as described above.
 
 ## Refusal reasons and diagnostics
 

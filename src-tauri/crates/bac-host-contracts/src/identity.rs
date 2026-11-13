@@ -12,6 +12,9 @@
 //! be a link/junction on either platform. Unsupported Unix directory sync has the
 //! same power-loss durability limit as Windows. No file inode comparison is needed
 //! on Unix: metadata and contents come from the same no-follow opened handle.
+//! Temporary-file sync_all is strict (full sync on Apple): an unsupported file
+//! sync refuses creation with STORAGE_UNAVAILABLE/temp_sync; existing identities
+//! remain readable. Only unsupported directory sync is tolerated as above.
 use crate::wire::{valid_host_id, Error};
 use serde_json::{json, Value};
 #[cfg(not(unix))]
