@@ -32,10 +32,10 @@ export function checkFloor(floor, locks, read = path => readFileSync(path, 'utf8
       } else {
         if (!found.length) notes.push(`ABSENT ${name} in ${lock}; keep floor to catch reintroduction`);
         for (const pkg of found) if (compareVersions(pkg.version, minimum) < 0) {
-          const command = lock.endsWith('Cargo.lock')
-            ? `cargo update --manifest-path src-tauri/Cargo.toml -p ${name}@${pkg.version} --precise ${minimum}`
-            : `pnpm ${lock.startsWith('node-sidecar/') ? '--dir node-sidecar ' : ''}update ${name} --depth Infinity --lockfile-only`;
-          errors.push(`${lock}: ${name} ${pkg.version} is below floor ${minimum} (${ids}); run ${command}, review manifest constraints if necessary, then recheck; never edit the lock by hand.`);
+          const remediation = lock.endsWith('Cargo.lock')
+            ? 'follow bac/SYNC.md#raise-a-rust-dependency-floor, then recheck'
+            : `run pnpm ${lock.startsWith('node-sidecar/') ? '--dir node-sidecar ' : ''}update ${name} --depth Infinity --lockfile-only, review manifest constraints if necessary, then recheck`;
+          errors.push(`${lock}: ${name} ${pkg.version} is below floor ${minimum} (${ids}); ${remediation}; never edit the lock by hand.`);
         }
       }
     }

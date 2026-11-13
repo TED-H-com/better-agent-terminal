@@ -1401,6 +1401,22 @@
       ]
     },
     {
+      "package": "tauri",
+      "ecosystem": "rust",
+      "lockfiles": [
+        "src-tauri/Cargo.lock"
+      ],
+      "minimum": "2.11.6",
+      "status": "enforced",
+      "advisories": [
+        {
+          "id": "GHSA-w28w-mhc8-qvjv",
+          "severity": "high",
+          "firstPatched": "2.11.6"
+        }
+      ]
+    },
+    {
       "package": "zip",
       "ecosystem": "rust",
       "lockfiles": [
