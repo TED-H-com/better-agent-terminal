@@ -37,7 +37,7 @@ Use a dedicated sync branch and retain review evidence outside the repository. T
    # For each reviewed package or crate that fell below its floor:
    pnpm update PACKAGE --depth Infinity --lockfile-only
    pnpm --dir node-sidecar update PACKAGE --depth Infinity --lockfile-only
-   cargo update --manifest-path src-tauri/Cargo.toml -p CRATE --precise VERSION
+   # For Rust crates, follow "Raise a Rust dependency floor" below.
    pnpm install --frozen-lockfile
    pnpm --dir node-sidecar install --frozen-lockfile
    node bac/tools/check-security-floor.mjs
@@ -45,6 +45,8 @@ Use a dedicated sync branch and retain review evidence outside the repository. T
    ```
 
    Substitute actual names/versions only where an update is needed. Both backport checks are required: the floor validates the exact version, local source and patch table, while the verifier validates source bytes. Never lower an advisory floor to represent a backport. Review every open entry and record its disposition.
+
+   For Rust updates, follow [Raise a Rust dependency floor](#raise-a-rust-dependency-floor): compare the lock by parsed records, allow only the intended packages to differ, then require `--locked` resolution to pass.
 
 4. **Commit the merge and audit what it carries.** Stage only reviewed resolutions and verify there are no unresolved paths, then create the merge commit. Run both audits again after any integration follow-up commits.
 
@@ -146,6 +148,21 @@ Use a dedicated sync branch and retain review evidence outside the repository. T
    ```
 
    Record exit 0 in the merge record. A clean content comparison cannot replace ancestry verification. Retain the review directory securely, then remove temporary copies when no longer needed.
+
+## Raise a Rust dependency floor
+
+Choose the advisory's fixed version and the lowest companion versions its packaged manifests require, retaining the current minor lines unless a requirement forces a reviewed exception. Record the starting manifests and lock outside the repository, along with the intended package changes. Update `security-floor.json` with the advisory and enforced minimum after resolving the lock.
+
+A targeted `cargo update --manifest-path src-tauri/Cargo.toml -p CRATE --precise VERSION` is a reasonable first attempt when the crate's dependants use exact or caret requirements. The parsed comparison decides whether to accept it, not the command: Cargo can unlock transitive dependencies and reattach other packages' edges to different already-locked versions when wide ranges admit several choices, without changing those packages' own versions. Caret requirements can also select newer companion minor releases. Cargo's update summary does not list every edge change.
+
+If that attempt changes anything outside the intended records, discard only its generated lock changes using the recorded starting state. To constrain resolution together:
+
+1. Temporarily replace the affected existing normal and build requirements with exact `=VERSION` requirements, preserving their other settings. Add each required companion as an exact, optional dependency without enabling it in the application's features.
+2. Resolve once with an ordinary command, for example `cargo tree --manifest-path src-tauri/Cargo.toml --target x86_64-unknown-linux-gnu -e normal --depth 0`.
+3. Restore the original manifest byte-for-byte, then run the same command again to remove the temporary root edges. Do not hand-edit the lock or retain temporary pins in a lock-only update.
+4. Parse both locks and compare complete package records, including dependency lists, sources and checksums. Only the intended packages may differ; explain every intended change and reject unrelated edge changes, additions or removals. Require `cargo tree --manifest-path src-tauri/Cargo.toml --locked --target TARGET` to pass on every supported target, then run the floor, inventory, lock-consistency and relevant build/test checks. Review the lock record refreshed by `node bac/tools/check-upstream-inventory.mjs --update` before committing.
+
+This procedure preserves the reviewed graph only when those checks agree; a small text diff or a successful resolver invocation is not sufficient evidence.
 
 ## Record of the v3.2.18 merge
 

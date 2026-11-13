@@ -184,6 +184,19 @@ test('floor: below, at floor, multiple versions, absent package, open', () => {
   const open = floorResult(['1.0.0'], { ...floorEntry, status: 'open', reason: 'Major migration required' });
   assert.deepEqual(open.errors, []); assert.match(open.notes[0], /OPEN.*Major migration/);
 });
+test('floor: Rust remediation preserves context and links to the constrained update procedure', () => {
+  const entry = { ...floorEntry, lockfiles: ['src-tauri/Cargo.lock'] };
+  assert.deepEqual(floorResult(['1.1.0'], entry).errors, [
+    'src-tauri/Cargo.lock: sample 1.1.0 is below floor 1.2.0 (GHSA-fixture); follow bac/SYNC.md#raise-a-rust-dependency-floor, then recheck; never edit the lock by hand.',
+  ]);
+});
+for (const lock of ['pnpm-lock.yaml', 'node-sidecar/pnpm-lock.yaml']) test(`floor: pnpm remediation remains unchanged for ${lock}`, () => {
+  const entry = { ...floorEntry, lockfiles: [lock] };
+  const directory = lock.startsWith('node-sidecar/') ? '--dir node-sidecar ' : '';
+  assert.deepEqual(floorResult(['1.1.0'], entry).errors, [
+    `${lock}: sample 1.1.0 is below floor 1.2.0 (GHSA-fixture); run pnpm ${directory}update sample --depth Infinity --lockfile-only, review manifest constraints if necessary, then recheck; never edit the lock by hand.`,
+  ]);
+});
 const backport = { ...floorEntry, package: 'glib', minimum: '0.20.0', status: 'backported', lockfiles: ['src-tauri/Cargo.lock'], backport: { version: '0.18.5', path: 'vendor/glib-0.18.5', manifest: 'src-tauri/Cargo.toml', verifier: 'python3 scripts/verify-vendored-glib.py' } };
 const patchTable = () => '[patch.crates-io]\nglib = { path = "vendor/glib-0.18.5" }\n';
 test('floor: exact local backport present', () => assert.deepEqual(floorResult(['0.18.5'], backport, patchTable).errors, []));

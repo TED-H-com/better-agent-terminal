@@ -129,9 +129,9 @@
       "feature": "security patches, PM producer and error log",
       "reason": "Derived graph includes restored Rust security versions, local GLib, PM libc and bat-error-log.",
       "plan": "keep",
-      "planReason": "Regenerate via targeted cargo update --precise and validate --locked resolution, floors and the exact backport source.",
-      "added": 154,
-      "removed": 70,
+      "planReason": "Follow bac/SYNC.md#raise-a-rust-dependency-floor; compare parsed lock records so only intended packages differ, then require --locked resolution, floors and the exact backport source.",
+      "added": 170,
+      "removed": 86,
       "digest": null
     },
     {
