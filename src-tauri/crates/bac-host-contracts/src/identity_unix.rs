@@ -59,11 +59,34 @@ fn unlink_at(parent: &File, name: &CStr) -> io::Result<()> {
 }
 fn entry_error(
     error: io::Error,
+    parent: &File,
+    name: &CStr,
+    expected_type: libc::mode_t,
     type_reason: Reason,
     open_reason: Reason,
     path: &Path,
 ) -> StorageError {
-    if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+    // This no-follow inspection only classifies a refusal; it never authorizes I/O.
+    // A concurrent entry replacement can only exchange one refusal for the other.
+    let wrong_type = || {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: parent is live, name is NUL terminated, and stat is writable.
+        let result = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return false;
+        }
+        // SAFETY: successful fstatat initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        stat.st_mode & libc::S_IFMT != expected_type
+    };
+    if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) || wrong_type() {
         StorageError::corrupt(type_reason, path)
     } else {
         StorageError::unavailable(open_reason, path)
@@ -123,12 +146,23 @@ impl Store {
                 }
                 sync_handle(&data, data_dir)?;
                 open_at(&data, c"bac", flags, 0).map_err(|e| {
-                    entry_error(e, Reason::DirectoryType, Reason::DirectoryOpen, &path)
+                    entry_error(
+                        e,
+                        &data,
+                        c"bac",
+                        libc::S_IFDIR,
+                        Reason::DirectoryType,
+                        Reason::DirectoryOpen,
+                        &path,
+                    )
                 })?
             }
             Err(e) => {
                 return Err(entry_error(
                     e,
+                    &data,
+                    c"bac",
+                    libc::S_IFDIR,
                     Reason::DirectoryType,
                     Reason::DirectoryOpen,
                     &path,
@@ -158,6 +192,9 @@ impl Store {
             Err(e) => {
                 return Err(entry_error(
                     e,
+                    &self.bac,
+                    c"host.json",
+                    libc::S_IFREG,
                     Reason::IdentityType,
                     Reason::IdentityOpen,
                     &path,

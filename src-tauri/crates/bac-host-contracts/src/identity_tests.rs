@@ -114,7 +114,9 @@ fn symlinks_and_nonregular_identity_are_rejected() {
     assert_eq!(load_or_create(&root), Err(Error::StorageCorrupt));
     fs::remove_file(target(&root)).unwrap();
     fs::create_dir(target(&root)).unwrap();
-    assert_eq!(load_or_create(&root), Err(Error::StorageCorrupt));
+    let failure = super::load_or_create(&root).unwrap_err();
+    assert_eq!(failure.error, Error::StorageCorrupt);
+    assert_eq!(failure.reason, Reason::IdentityType);
     fs::remove_dir(target(&root)).unwrap();
     fs::remove_dir(root.join("bac")).unwrap();
     symlink(&scratch.0, root.join("bac")).unwrap();
@@ -461,7 +463,9 @@ fn linked_data_root_works_and_fifo_identity_is_refused() {
     let name = CString::new(target(&alias).as_os_str().as_bytes()).unwrap();
     // SAFETY: name is NUL terminated and mode is a valid permission mask.
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-    assert_eq!(load_or_create(&alias), Err(Error::StorageCorrupt));
+    let failure = super::load_or_create(&alias).unwrap_err();
+    assert_eq!(failure.error, Error::StorageCorrupt);
+    assert_eq!(failure.reason, Reason::IdentityType);
 }
 #[test]
 fn cleanup_failure_after_publication_does_not_refuse_identity() {
@@ -740,4 +744,44 @@ fn internal_cache_failure_has_no_client_reason() {
         "code":"INTERNAL_ERROR","message":"BAC request failed",
         "retryable":false,"details":{}}})
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn socket_identity_is_invalid_unchanged_and_repairable() {
+    use std::os::unix::{fs::FileTypeExt, net::UnixListener};
+    let mut scratch = Scratch::new();
+    // Darwin socket addresses are shorter than Linux's. Use a short temporary
+    // base rather than skipping when the runner's usual temp path is too long.
+    if target(&scratch.store()).as_os_str().len() >= 104 {
+        let base = std::env::var_os("BAC_TEST_SOCKET_BASE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let path = base.join(format!("bs-{}", &random_id(&base).unwrap()[2..14]));
+        fs::create_dir(&path).unwrap();
+        fs::create_dir(path.join("store")).unwrap();
+        scratch = Scratch(path);
+    }
+    let root = scratch.store();
+    fs::create_dir(root.join("bac")).unwrap();
+    fs::set_permissions(root.join("bac"), fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = UnixListener::bind(target(&root)).unwrap();
+    let before = fs::symlink_metadata(target(&root)).unwrap();
+    let failure = super::load_or_create(&root).unwrap_err();
+    assert_eq!(
+        failure.wire_error().reply(),
+        json!({"ok":false,"error":{
+        "code":"STORAGE_CORRUPT","message":"BAC identity storage is invalid",
+        "retryable":false,"details":{"reason":"identity_type"}}})
+    );
+    let after = fs::symlink_metadata(target(&root)).unwrap();
+    assert!(after.file_type().is_socket());
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 1);
+    drop(socket);
+    fs::remove_file(target(&root)).unwrap();
+    let id = load_or_create(&root).unwrap();
+    assert_eq!(load_or_create(&root).unwrap(), id);
+    assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 1);
 }
