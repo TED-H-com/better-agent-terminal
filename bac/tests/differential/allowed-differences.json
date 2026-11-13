@@ -1,0 +1,1072 @@
+[
+  {
+    "id": "native-input-state-01",
+    "path": "/claude-fake/clients/0/received/9/args/1/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 1,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-02",
+    "path": "/claude-fake/clients/0/received/9/params/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 1,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-03",
+    "path": "/claude-fake/clients/0/received/11/args/1/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 1,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-04",
+    "path": "/claude-fake/clients/0/received/11/params/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 1,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-05",
+    "path": "/claude-fake/clients/0/received/15/args/1/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 1,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-06",
+    "path": "/claude-fake/clients/0/received/15/params/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 1,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-07",
+    "path": "/claude-fake/clients/0/received/21/result/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 1,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-08",
+    "path": "/claude-fake/clients/0/received/24/result/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-09",
+    "path": "/codex-fake/clients/0/received/2/args/1/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 0,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-10",
+    "path": "/codex-fake/clients/0/received/2/params/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 0,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-11",
+    "path": "/codex-fake/clients/0/received/4/result/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 0,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-12",
+    "path": "/codex-fake/clients/0/received/6/args/1/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 1,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-13",
+    "path": "/codex-fake/clients/0/received/6/params/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 1,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-14",
+    "path": "/codex-fake/clients/0/received/8/args/1/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-15",
+    "path": "/codex-fake/clients/0/received/8/params/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-16",
+    "path": "/codex-fake/clients/0/received/10/args/1/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-17",
+    "path": "/codex-fake/clients/0/received/10/params/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-18",
+    "path": "/codex-fake/clients/0/received/14/result/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-19",
+    "path": "/codex-fake/clients/0/received/15/result/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-20",
+    "path": "/codex-fake/clients/0/received/17/args/1/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "native-input-state-21",
+    "path": "/codex-fake/clients/0/received/17/params/meta/inputState",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": {
+      "epoch": "<input-epoch-0>",
+      "pending": 0,
+      "received": 1,
+      "schema": "bat_input_state_v1"
+    },
+    "reason": "Compatibility debt: fork exposes its native input identity and acceptance counters in upstream session metadata; upstream v3.2.18 omits inputState."
+  },
+  {
+    "id": "codex-history-cursor-01",
+    "path": "/codex-fake/clients/0/received/18/result/before",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": null,
+    "reason": "Compatibility debt: fork adds before and hasMore to the ordinary Codex client-resume result, even with no disk history."
+  },
+  {
+    "id": "codex-history-cursor-02",
+    "path": "/codex-fake/clients/0/received/18/result/hasMore",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": false,
+    "reason": "Compatibility debt: fork adds before and hasMore to the ordinary Codex client-resume result, even with no disk history."
+  },
+  {
+    "id": "outbound-event-cap-01",
+    "path": "/oversize-outbound/clients/0/received/2/args/0",
+    "upstream": {
+      "data": {
+        "$string": {
+          "length": 5243012,
+          "sha256": "4c8abcadf11ed506f3f65e9b9bdfd9b4cc2788f199f2311c2c6fe0cb7f65af16"
+        }
+      },
+      "profileId": "default"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-02",
+    "path": "/oversize-outbound/clients/0/received/2/channel",
+    "upstream": "workspace:reload",
+    "fork": "remote:payload-too-large",
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-03",
+    "path": "/oversize-outbound/clients/0/received/2/params/data",
+    "upstream": {
+      "$string": {
+        "length": 5243012,
+        "sha256": "4c8abcadf11ed506f3f65e9b9bdfd9b4cc2788f199f2311c2c6fe0cb7f65af16"
+      }
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-04",
+    "path": "/oversize-outbound/clients/0/received/2/params/profileId",
+    "upstream": "default",
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-05",
+    "path": "/oversize-outbound/clients/0/received/2/params/channel",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "workspace:reload",
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-06",
+    "path": "/oversize-outbound/clients/0/received/2/params/maxBytes",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": 4194304,
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-07",
+    "path": "/oversize-outbound/clients/1/received/2/args/0",
+    "upstream": {
+      "data": {
+        "$string": {
+          "length": 5243012,
+          "sha256": "4c8abcadf11ed506f3f65e9b9bdfd9b4cc2788f199f2311c2c6fe0cb7f65af16"
+        }
+      },
+      "profileId": "default"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-08",
+    "path": "/oversize-outbound/clients/1/received/2/channel",
+    "upstream": "workspace:reload",
+    "fork": "remote:payload-too-large",
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-09",
+    "path": "/oversize-outbound/clients/1/received/2/params/data",
+    "upstream": {
+      "$string": {
+        "length": 5243012,
+        "sha256": "4c8abcadf11ed506f3f65e9b9bdfd9b4cc2788f199f2311c2c6fe0cb7f65af16"
+      }
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-10",
+    "path": "/oversize-outbound/clients/1/received/2/params/profileId",
+    "upstream": "default",
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-11",
+    "path": "/oversize-outbound/clients/1/received/2/params/channel",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "workspace:reload",
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "outbound-event-cap-12",
+    "path": "/oversize-outbound/clients/1/received/2/params/maxBytes",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": 4194304,
+    "reason": "Compatibility debt: fork final outbound guard replaces a 5 MiB workspace:reload event with remote:payload-too-large; upstream delivers the event. Both already cap the invoke result."
+  },
+  {
+    "id": "pm-runtime-channel-01",
+    "path": "/pm-runtime/clients/0/received/1/args",
+    "upstream": [
+      {
+        "elapsedMs": "<duration>",
+        "ok": true,
+        "phase": "spawnProcess"
+      }
+    ],
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork handles claude:get-pm-runtime in Rust and returns PM_RUNTIME_RECEIPT_UNAVAILABLE; upstream sends sidecar startup/call metrics then method-not-found."
+  },
+  {
+    "id": "pm-runtime-channel-02",
+    "path": "/pm-runtime/clients/0/received/1/channel",
+    "upstream": "sidecar:metric",
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork handles claude:get-pm-runtime in Rust and returns PM_RUNTIME_RECEIPT_UNAVAILABLE; upstream sends sidecar startup/call metrics then method-not-found."
+  },
+  {
+    "id": "pm-runtime-channel-03",
+    "path": "/pm-runtime/clients/0/received/1/params",
+    "upstream": {
+      "elapsedMs": "<duration>",
+      "ok": true,
+      "phase": "spawnProcess"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork handles claude:get-pm-runtime in Rust and returns PM_RUNTIME_RECEIPT_UNAVAILABLE; upstream sends sidecar startup/call metrics then method-not-found."
+  },
+  {
+    "id": "pm-runtime-channel-04",
+    "path": "/pm-runtime/clients/0/received/1/type",
+    "upstream": "event",
+    "fork": "invoke-error",
+    "reason": "Compatibility debt: fork handles claude:get-pm-runtime in Rust and returns PM_RUNTIME_RECEIPT_UNAVAILABLE; upstream sends sidecar startup/call metrics then method-not-found."
+  },
+  {
+    "id": "pm-runtime-channel-05",
+    "path": "/pm-runtime/clients/0/received/1/error",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "PM_RUNTIME_RECEIPT_UNAVAILABLE",
+    "reason": "Compatibility debt: fork handles claude:get-pm-runtime in Rust and returns PM_RUNTIME_RECEIPT_UNAVAILABLE; upstream sends sidecar startup/call metrics then method-not-found."
+  },
+  {
+    "id": "pm-runtime-channel-06",
+    "path": "/pm-runtime/clients/0/received/1/id",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "pm-runtime",
+    "reason": "Compatibility debt: fork handles claude:get-pm-runtime in Rust and returns PM_RUNTIME_RECEIPT_UNAVAILABLE; upstream sends sidecar startup/call metrics then method-not-found."
+  },
+  {
+    "id": "pm-runtime-channel-07",
+    "path": "/pm-runtime/clients/0/received/2",
+    "upstream": {
+      "args": [
+        {
+          "elapsedMs": "<duration>",
+          "method": "claude.getPmRuntime",
+          "ok": true,
+          "phase": "ensureSpawned"
+        }
+      ],
+      "channel": "sidecar:metric",
+      "params": {
+        "elapsedMs": "<duration>",
+        "method": "claude.getPmRuntime",
+        "ok": true,
+        "phase": "ensureSpawned"
+      },
+      "type": "event"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork handles claude:get-pm-runtime in Rust and returns PM_RUNTIME_RECEIPT_UNAVAILABLE; upstream sends sidecar startup/call metrics then method-not-found."
+  },
+  {
+    "id": "pm-runtime-channel-08",
+    "path": "/pm-runtime/clients/0/received/3",
+    "upstream": {
+      "args": [
+        {
+          "elapsedMs": "<duration>",
+          "method": "claude.getPmRuntime",
+          "ok": false,
+          "phase": "call"
+        }
+      ],
+      "channel": "sidecar:metric",
+      "params": {
+        "elapsedMs": "<duration>",
+        "method": "claude.getPmRuntime",
+        "ok": false,
+        "phase": "call"
+      },
+      "type": "event"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork handles claude:get-pm-runtime in Rust and returns PM_RUNTIME_RECEIPT_UNAVAILABLE; upstream sends sidecar startup/call metrics then method-not-found."
+  },
+  {
+    "id": "pm-runtime-channel-09",
+    "path": "/pm-runtime/clients/0/received/4",
+    "upstream": {
+      "error": "sidecar(-32601): method not found: claude.getPmRuntime",
+      "id": "pm-runtime",
+      "type": "invoke-error"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: fork handles claude:get-pm-runtime in Rust and returns PM_RUNTIME_RECEIPT_UNAVAILABLE; upstream sends sidecar startup/call metrics then method-not-found."
+  },
+  {
+    "id": "retained-pm-ownership-01",
+    "path": "/retained-pm-resume/clients/0/received/1/args",
+    "upstream": [
+      "retained-fixture",
+      true
+    ],
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-02",
+    "path": "/retained-pm-resume/clients/0/received/1/channel",
+    "upstream": "agent:resume-loading",
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-03",
+    "path": "/retained-pm-resume/clients/0/received/1/params",
+    "upstream": {
+      "loading": true,
+      "sessionId": "retained-fixture"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-04",
+    "path": "/retained-pm-resume/clients/0/received/1/type",
+    "upstream": "event",
+    "fork": "invoke-error",
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-05",
+    "path": "/retained-pm-resume/clients/0/received/1/error",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "PM_RUNTIME_IMMUTABLE",
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-06",
+    "path": "/retained-pm-resume/clients/0/received/1/id",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "retained-resume",
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-07",
+    "path": "/retained-pm-resume/clients/0/received/2",
+    "upstream": {
+      "args": [
+        "retained-fixture",
+        {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "callCacheRead": 0,
+          "callCacheWrite": 0,
+          "codexApprovalPolicy": "on-request",
+          "codexSandboxMode": "workspace-write",
+          "contextTokens": 0,
+          "contextWindow": 272000,
+          "contextWindowOverride": null,
+          "cwd": "<scratch>/repository",
+          "durationMs": "<duration>",
+          "effort": "high",
+          "fastMode": false,
+          "fastModeAllowed": false,
+          "fastModeDisabledReason": "Fast mode requires BAT_DEBUG=1 on the host.",
+          "fastModePending": false,
+          "fastModeState": "off",
+          "inputTokens": 0,
+          "isStreaming": false,
+          "lastQueryCalls": 1,
+          "lastTurnDurationMs": null,
+          "lastTurnFirstTokenMs": null,
+          "maxOutputTokens": 0,
+          "model": "gpt-6-sol",
+          "numTurns": 0,
+          "outputTokens": 0,
+          "runtimeMessage": null,
+          "runtimeStatus": null,
+          "runtimeStatusStartedAt": null,
+          "sdkSessionId": "fixture-thread",
+          "supportsFastMode": true,
+          "totalCost": 0
+        }
+      ],
+      "channel": "agent:status",
+      "params": {
+        "meta": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "callCacheRead": 0,
+          "callCacheWrite": 0,
+          "codexApprovalPolicy": "on-request",
+          "codexSandboxMode": "workspace-write",
+          "contextTokens": 0,
+          "contextWindow": 272000,
+          "contextWindowOverride": null,
+          "cwd": "<scratch>/repository",
+          "durationMs": "<duration>",
+          "effort": "high",
+          "fastMode": false,
+          "fastModeAllowed": false,
+          "fastModeDisabledReason": "Fast mode requires BAT_DEBUG=1 on the host.",
+          "fastModePending": false,
+          "fastModeState": "off",
+          "inputTokens": 0,
+          "isStreaming": false,
+          "lastQueryCalls": 1,
+          "lastTurnDurationMs": null,
+          "lastTurnFirstTokenMs": null,
+          "maxOutputTokens": 0,
+          "model": "gpt-6-sol",
+          "numTurns": 0,
+          "outputTokens": 0,
+          "runtimeMessage": null,
+          "runtimeStatus": null,
+          "runtimeStatusStartedAt": null,
+          "sdkSessionId": "fixture-thread",
+          "supportsFastMode": true,
+          "totalCost": 0
+        },
+        "sessionId": "retained-fixture"
+      },
+      "type": "event"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-08",
+    "path": "/retained-pm-resume/clients/0/received/3",
+    "upstream": {
+      "args": [
+        "retained-fixture",
+        []
+      ],
+      "channel": "agent:history",
+      "params": {
+        "items": [],
+        "sessionId": "retained-fixture"
+      },
+      "type": "event"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-09",
+    "path": "/retained-pm-resume/clients/0/received/4",
+    "upstream": {
+      "args": [
+        "retained-fixture",
+        false
+      ],
+      "channel": "agent:resume-loading",
+      "params": {
+        "loading": false,
+        "sessionId": "retained-fixture"
+      },
+      "type": "event"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-10",
+    "path": "/retained-pm-resume/clients/0/received/5",
+    "upstream": {
+      "id": "retained-resume",
+      "result": {
+        "ok": true,
+        "sdkSessionId": "fixture-thread",
+        "sessionId": "retained-fixture"
+      },
+      "type": "invoke-result"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-11",
+    "path": "/retained-pm-send/clients/0/received/1/args",
+    "upstream": [
+      {
+        "elapsedMs": "<duration>",
+        "ok": true,
+        "phase": "spawnProcess"
+      }
+    ],
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-12",
+    "path": "/retained-pm-send/clients/0/received/1/channel",
+    "upstream": "sidecar:metric",
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-13",
+    "path": "/retained-pm-send/clients/0/received/1/params",
+    "upstream": {
+      "elapsedMs": "<duration>",
+      "ok": true,
+      "phase": "spawnProcess"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-14",
+    "path": "/retained-pm-send/clients/0/received/1/type",
+    "upstream": "event",
+    "fork": "invoke-error",
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-15",
+    "path": "/retained-pm-send/clients/0/received/1/error",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "PM_RUNTIME_RESTART_FORBIDDEN",
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-16",
+    "path": "/retained-pm-send/clients/0/received/1/id",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "retained-send",
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-17",
+    "path": "/retained-pm-send/clients/0/received/2",
+    "upstream": {
+      "args": [
+        {
+          "elapsedMs": "<duration>",
+          "method": "claude.sendMessage",
+          "ok": true,
+          "phase": "ensureSpawned"
+        }
+      ],
+      "channel": "sidecar:metric",
+      "params": {
+        "elapsedMs": "<duration>",
+        "method": "claude.sendMessage",
+        "ok": true,
+        "phase": "ensureSpawned"
+      },
+      "type": "event"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-18",
+    "path": "/retained-pm-send/clients/0/received/3",
+    "upstream": {
+      "args": [
+        {
+          "elapsedMs": "<duration>",
+          "method": "claude.sendMessage",
+          "ok": false,
+          "phase": "call"
+        }
+      ],
+      "channel": "sidecar:metric",
+      "params": {
+        "elapsedMs": "<duration>",
+        "method": "claude.sendMessage",
+        "ok": false,
+        "phase": "call"
+      },
+      "type": "event"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-19",
+    "path": "/retained-pm-send/clients/0/received/4",
+    "upstream": {
+      "error": "sidecar(-32000): claude.sendMessage(retained): session has no cwd; startSession must be called with options.cwd",
+      "id": "retained-send",
+      "type": "invoke-error"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-20",
+    "path": "/retained-pm-start/clients/0/received/1/args",
+    "upstream": [
+      "retained-fixture",
+      {
+        "content": "Codex session started (sandbox: workspace-write, approval: on-request)",
+        "id": "<message-0>",
+        "role": "system",
+        "sessionId": "retained-fixture",
+        "timestamp": "<timestamp>"
+      }
+    ],
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-21",
+    "path": "/retained-pm-start/clients/0/received/1/channel",
+    "upstream": "agent:message",
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-22",
+    "path": "/retained-pm-start/clients/0/received/1/params",
+    "upstream": {
+      "message": {
+        "content": "Codex session started (sandbox: workspace-write, approval: on-request)",
+        "id": "<message-0>",
+        "role": "system",
+        "sessionId": "retained-fixture",
+        "timestamp": "<timestamp>"
+      },
+      "sessionId": "retained-fixture"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-23",
+    "path": "/retained-pm-start/clients/0/received/1/type",
+    "upstream": "event",
+    "fork": "invoke-error",
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-24",
+    "path": "/retained-pm-start/clients/0/received/1/error",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "PM_RUNTIME_IMMUTABLE",
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-25",
+    "path": "/retained-pm-start/clients/0/received/1/id",
+    "upstream": {
+      "$missing": true
+    },
+    "fork": "retained-start",
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-26",
+    "path": "/retained-pm-start/clients/0/received/2",
+    "upstream": {
+      "args": [
+        "retained-fixture",
+        {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "callCacheRead": 0,
+          "callCacheWrite": 0,
+          "codexApprovalPolicy": "on-request",
+          "codexSandboxMode": "workspace-write",
+          "contextTokens": 0,
+          "contextWindow": 272000,
+          "contextWindowOverride": null,
+          "cwd": "<scratch>/repository",
+          "durationMs": "<duration>",
+          "effort": "high",
+          "fastMode": false,
+          "fastModeAllowed": false,
+          "fastModeDisabledReason": "Fast mode requires BAT_DEBUG=1 on the host.",
+          "fastModePending": false,
+          "fastModeState": "off",
+          "inputTokens": 0,
+          "isStreaming": false,
+          "lastQueryCalls": 1,
+          "lastTurnDurationMs": null,
+          "lastTurnFirstTokenMs": null,
+          "maxOutputTokens": 0,
+          "model": "gpt-6-sol",
+          "numTurns": 0,
+          "outputTokens": 0,
+          "runtimeMessage": null,
+          "runtimeStatus": null,
+          "runtimeStatusStartedAt": null,
+          "sdkSessionId": "fixture-thread",
+          "supportsFastMode": true,
+          "totalCost": 0
+        }
+      ],
+      "channel": "agent:status",
+      "params": {
+        "meta": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "callCacheRead": 0,
+          "callCacheWrite": 0,
+          "codexApprovalPolicy": "on-request",
+          "codexSandboxMode": "workspace-write",
+          "contextTokens": 0,
+          "contextWindow": 272000,
+          "contextWindowOverride": null,
+          "cwd": "<scratch>/repository",
+          "durationMs": "<duration>",
+          "effort": "high",
+          "fastMode": false,
+          "fastModeAllowed": false,
+          "fastModeDisabledReason": "Fast mode requires BAT_DEBUG=1 on the host.",
+          "fastModePending": false,
+          "fastModeState": "off",
+          "inputTokens": 0,
+          "isStreaming": false,
+          "lastQueryCalls": 1,
+          "lastTurnDurationMs": null,
+          "lastTurnFirstTokenMs": null,
+          "maxOutputTokens": 0,
+          "model": "gpt-6-sol",
+          "numTurns": 0,
+          "outputTokens": 0,
+          "runtimeMessage": null,
+          "runtimeStatus": null,
+          "runtimeStatusStartedAt": null,
+          "sdkSessionId": "fixture-thread",
+          "supportsFastMode": true,
+          "totalCost": 0
+        },
+        "sessionId": "retained-fixture"
+      },
+      "type": "event"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  },
+  {
+    "id": "retained-pm-ownership-27",
+    "path": "/retained-pm-start/clients/0/received/3",
+    "upstream": {
+      "id": "retained-start",
+      "result": {
+        "ok": true,
+        "sdkSessionId": "fixture-thread",
+        "sessionId": "retained-fixture"
+      },
+      "type": "invoke-result"
+    },
+    "fork": {
+      "$missing": true
+    },
+    "reason": "Compatibility debt: an existing pm-runtimes/<session digest> ownership directory prevents the fork from restarting or sending to the retained session. Upstream ignores that fork directory and follows its ordinary fake-backed runtime/error path. Start/resume return PM_RUNTIME_IMMUTABLE; send returns PM_RUNTIME_RESTART_FORBIDDEN."
+  }
+]
