@@ -137,7 +137,10 @@ uses the latest nonempty regular in-memory window; detached windows are never th
 read target. Otherwise it uses the first saved window; no saved windows produce
 the five-field empty workspace with `appendTargetEligible: false`. The document
 is not overlaid with runtime metadata. `appendTargetEligible` reports structural
-preconditions and, for saved snapshots, requires exactly one saved window.
+preconditions and, for saved snapshots, requires exactly one saved window. For
+saved snapshots, `appendTargetEligible` also requires the raw first window itself
+to contain `workspaces` and `terminals` arrays of objects with non-empty string
+`id` fields, even when the rendered `document` defaults missing fields to `[]`.
 
 ```json
 {"hostId":"h_0123456789abcdef0123456789abcdef","profileId":"default","source":"persisted","windowId":null,"revision":"sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c","document":{"workspaces":[],"activeWorkspaceId":null,"activeGroup":null,"terminals":[],"activeTerminalId":null},"appendTargetEligible":false}

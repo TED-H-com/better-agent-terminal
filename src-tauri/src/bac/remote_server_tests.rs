@@ -935,4 +935,114 @@ mod bac_tests {
 
         ws.close(None).unwrap();
     }
+
+    #[test]
+    fn ws_read_corrupt_first_saved_window_renders_document_but_is_ineligible() {
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"empty_obj","name":"EmptyObj","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"null_win","name":"NullWin","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"num_win","name":"NumWin","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"no_ws_id","name":"NoWsId","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+
+        let valid_snapshot = json!({
+            "version": 2,
+            "windows": [{
+                "workspaces": [{"id": "w"}],
+                "terminals": [{"id": "t-valid", "workspaceId": "w"}]
+            }]
+        });
+        fs::write(
+            profiles.join("default.json"),
+            serde_json::to_vec(&valid_snapshot).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("empty_obj.json"),
+            br#"{"version":2,"windows":[{}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("null_win.json"),
+            br#"{"version":2,"windows":[null]}"#,
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("num_win.json"),
+            br#"{"version":2,"windows":[42]}"#,
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("no_ws_id.json"),
+            br#"{"version":2,"windows":[{"workspaces":[{}],"terminals":[]}]}"#,
+        )
+        .unwrap();
+
+        let (mut ws, _, _) = connect(&host, true);
+        assert_eq!(hello(&mut ws)["ok"], true);
+
+        let empty_doc = bac_host_contracts::workspace::empty_workspace_document();
+        for id in ["empty_obj", "null_win", "num_win"] {
+            let reply = invoke(
+                &mut ws,
+                json!({"channel":"bac:workspace-read","params":{"profileId":id}}),
+            );
+            assert_eq!(reply["ok"], true);
+            assert_eq!(reply["value"]["source"], "persisted");
+            assert!(reply["value"]["windowId"].is_null());
+            assert_eq!(reply["value"]["document"], empty_doc);
+            assert_eq!(reply["value"]["appendTargetEligible"], false);
+        }
+
+        let no_ws_id = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"no_ws_id"}}),
+        );
+        assert_eq!(no_ws_id["ok"], true);
+        assert_eq!(no_ws_id["value"]["document"]["workspaces"], json!([{}]));
+        assert_eq!(no_ws_id["value"]["document"]["terminals"], json!([]));
+        assert_eq!(no_ws_id["value"]["appendTargetEligible"], false);
+
+        let locate_bad = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-valid"}}),
+        );
+        assert_eq!(error(locate_bad.clone()), "LOCATION_UNAVAILABLE");
+        assert_eq!(
+            locate_bad["error"]["details"]["profileIds"],
+            json!(["empty_obj", "no_ws_id", "null_win", "num_win"])
+        );
+
+        let valid_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"default"}}),
+        );
+        assert_eq!(valid_read["ok"], true);
+        assert_eq!(valid_read["value"]["appendTargetEligible"], true);
+
+        let only_default = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&only_default).unwrap(),
+        )
+        .unwrap();
+        let locate_valid = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-valid"}}),
+        );
+        assert_eq!(locate_valid["ok"], true);
+        assert_eq!(locate_valid["value"]["disposition"], "located");
+
+        ws.close(None).unwrap();
+    }
 }

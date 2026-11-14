@@ -1001,3 +1001,44 @@ fn duplicate_catalog_ids_first_entry_decides_for_read_and_locate() {
         serde_json::to_value(&once_locate).unwrap()
     );
 }
+
+#[test]
+fn persisted_read_eligibility_requires_readable_raw_first_window() {
+    let read_window = |window: Value| {
+        execute_read(
+            HOST,
+            &read_request("p"),
+            &catalog("p"),
+            &[],
+            || {
+                Ok(SavedFileOutcome::Snapshot {
+                    raw_bytes: 32,
+                    windows: vec![window],
+                })
+            },
+            first_document,
+        )
+        .unwrap()
+    };
+
+    for raw in [json!({}), Value::Null, json!(42)] {
+        let result = read_window(raw);
+        assert_eq!(result.source, Source::Persisted);
+        assert_eq!(result.window_id, None);
+        assert_eq!(result.document, empty_workspace_document());
+        assert!(!result.append_target_eligible);
+    }
+
+    let missing_workspace_id = read_window(json!({"workspaces": [{}], "terminals": []}));
+    assert_eq!(
+        missing_workspace_id.document,
+        document(json!([{}]), json!([]))
+    );
+    assert!(!missing_workspace_id.append_target_eligible);
+
+    let valid_single = read_window(json!({
+        "workspaces": [{"id": "w"}],
+        "terminals": [{"id": "t", "workspaceId": "w"}]
+    }));
+    assert!(valid_single.append_target_eligible);
+}

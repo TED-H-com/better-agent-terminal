@@ -462,10 +462,11 @@ pub fn execute_read(
                     (empty_workspace_document(), Source::Persisted, None, false)
                 }
                 SavedFileOutcome::Snapshot { windows, .. } => {
-                    let eligible_window_count = windows.len() == 1;
+                    let eligible_first_window = windows.len() == 1
+                        && windows.first().is_some_and(locate_document_is_readable);
                     let document =
                         first_document(&windows).ok_or(OperationError::WorkspaceUnavailable)?;
-                    let eligible = eligible_window_count && structural_preconditions_ok(&document);
+                    let eligible = eligible_first_window && structural_preconditions_ok(&document);
                     (document, Source::Persisted, None, eligible)
                 }
             }
