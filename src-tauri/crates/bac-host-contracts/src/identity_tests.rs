@@ -785,3 +785,90 @@ fn socket_identity_is_invalid_unchanged_and_repairable() {
     assert_eq!(load_or_create(&root).unwrap(), id);
     assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 1);
 }
+
+#[test]
+fn store_rejects_interior_nul_names_without_panicking_or_creating_entries() {
+    let scratch = Scratch::new();
+    let root = scratch.store();
+    let store = Store::open(&root).unwrap();
+    let bad = "host.json.tmp-\0bad";
+    assert_eq!(
+        store.create(bad).unwrap_err(),
+        StorageError::unavailable(Reason::TempCreate, &root.join("bac"))
+    );
+    assert_eq!(
+        store.publish(bad).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        store.remove(bad).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(fs::read_dir(root.join("bac")).unwrap().count(), 0);
+}
+
+#[test]
+fn storage_reason_replies_are_byte_identical_for_every_reason() {
+    let reasons = [
+        Reason::DataDirectoryUnavailable,
+        Reason::DataDirectoryType,
+        Reason::DirectoryMetadata,
+        Reason::DirectoryType,
+        Reason::DirectoryOpen,
+        Reason::DirectoryIntegrity,
+        Reason::DirectoryReadOnly,
+        Reason::DirectoryCreate,
+        Reason::DirectorySync,
+        Reason::IdentityMetadata,
+        Reason::IdentityType,
+        Reason::IdentityIntegrity,
+        Reason::IdentitySize,
+        Reason::IdentityContents,
+        Reason::IdentityChanged,
+        Reason::IdentityOpen,
+        Reason::IdentityRead,
+        Reason::Random,
+        Reason::TempCreate,
+        Reason::TempWrite,
+        Reason::TempSync,
+        Reason::Publish,
+        Reason::CachePoisoned,
+    ];
+    for reason in reasons {
+        match reason {
+            Reason::DataDirectoryUnavailable
+            | Reason::DataDirectoryType
+            | Reason::DirectoryMetadata
+            | Reason::DirectoryType
+            | Reason::DirectoryOpen
+            | Reason::DirectoryIntegrity
+            | Reason::DirectoryReadOnly
+            | Reason::DirectoryCreate
+            | Reason::DirectorySync
+            | Reason::IdentityMetadata
+            | Reason::IdentityType
+            | Reason::IdentityIntegrity
+            | Reason::IdentitySize
+            | Reason::IdentityContents
+            | Reason::IdentityChanged
+            | Reason::IdentityOpen
+            | Reason::IdentityRead
+            | Reason::Random
+            | Reason::TempCreate
+            | Reason::TempWrite
+            | Reason::TempSync
+            | Reason::Publish
+            | Reason::CachePoisoned => {}
+        }
+        for base in [Error::StorageUnavailable, Error::StorageCorrupt] {
+            let mut current = base.reply();
+            current["error"]["details"] = json!({"reason": reason.name()});
+            let actual = Error::StorageReason(Box::new(base), reason.name()).reply();
+            assert_eq!(actual, current);
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&current).unwrap()
+            );
+        }
+    }
+}

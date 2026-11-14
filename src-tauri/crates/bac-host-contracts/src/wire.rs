@@ -113,7 +113,9 @@ impl Error {
             ),
             Self::StorageReason(error, reason) => {
                 let mut reply = error.reply();
-                reply["error"]["details"] = json!({"reason":reason});
+                if let Some(error) = reply.get_mut("error").and_then(Value::as_object_mut) {
+                    error.insert("details".into(), json!({"reason":reason}));
+                }
                 return reply;
             }
             Self::Internal => ("INTERNAL_ERROR", "BAC request failed", json!({})),
