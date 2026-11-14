@@ -245,7 +245,10 @@ mod bac_tests {
                 error(invoke(&mut a, json!({"channel":name,"params":{}}))),
                 if name == "bac:future" {
                     "UNKNOWN_CHANNEL"
-                } else if name == "bac:workspace-read" || name == "bac:session-locate" {
+                } else if name == "bac:workspace-read"
+                    || name == "bac:workspace-add-terminal"
+                    || name == "bac:session-locate"
+                {
                     "INVALID_REQUEST"
                 } else {
                     "UNSUPPORTED_FEATURE"
@@ -315,7 +318,7 @@ mod bac_tests {
         assert_eq!(
             first["value"]["features"],
             json!({
-                "workspaceRead":true,"workspaceAddTerminal":false,"sessionLocate":true,"gitObserve":false
+                "workspaceRead":true,"workspaceAddTerminal":true,"sessionLocate":true,"gitObserve":false
             })
         );
         assert_eq!(
@@ -802,7 +805,10 @@ mod bac_tests {
             json!({"channel":"bac:session-locate","params":{"sessionId":"a:b"}}),
         );
         assert_eq!(error(locate_bad_catalog.clone()), "LOCATION_UNAVAILABLE");
-        assert_eq!(locate_bad_catalog["error"]["details"]["profileIds"], json!([]));
+        assert_eq!(
+            locate_bad_catalog["error"]["details"]["profileIds"],
+            json!([])
+        );
 
         ws.close(None).unwrap();
     }
@@ -873,7 +879,10 @@ mod bac_tests {
         );
         assert_eq!(dup_locate["ok"], true);
         assert_eq!(dup_locate["value"]["disposition"], "located");
-        assert_eq!(dup_locate["value"]["locations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            dup_locate["value"]["locations"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(dup_locate["value"]["locations"][0]["profileId"], "dup");
         assert_eq!(
             dup_locate["value"]["locations"][0]["profileRevision"],
@@ -895,7 +904,10 @@ mod bac_tests {
         assert_eq!(lf_locate["ok"], true);
         assert_eq!(lf_locate["value"]["disposition"], "located");
         assert_eq!(lf_locate["value"]["locations"].as_array().unwrap().len(), 1);
-        assert_eq!(lf_locate["value"]["locations"][0]["profileId"], "local_first");
+        assert_eq!(
+            lf_locate["value"]["locations"][0]["profileId"],
+            "local_first"
+        );
         assert_eq!(
             lf_locate["value"]["locations"][0]["profileRevision"],
             lf_read["value"]["revision"]

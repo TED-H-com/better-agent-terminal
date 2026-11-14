@@ -2,8 +2,8 @@
 
 Authentication adds only `capabilities.bac = {"protocol":"bac/1","minor":0}`
 to version 2 results. Authentication does no identity I/O. Version 1 is unchanged.
-`serverVersion` remains the upstream version. `workspaceRead` and `sessionLocate`
-are true; `workspaceAddTerminal` and `gitObserve` are false.
+`serverVersion` remains the upstream version. `workspaceRead`, `sessionLocate` and
+`workspaceAddTerminal` are true; `gitObserve` is false.
 
 `bac:hello` takes `{protocol:"bac/1", minor:0, expectedHostId?:string}` in the
 existing invoke envelope. Validation order is shape, size, presence of `contextId`,
@@ -420,6 +420,8 @@ enforce the following guarantees:
   `workspace:reload` event, `data` is the pretty-printed document read back
   inside the locked write (`staged.document`), never read again after the locks
   are released.
-- Feature gate: the operation stays disabled at the wire gate; `bac:hello`
-  advertises `workspaceAddTerminal: false` and `bac:workspace-add-terminal`
-  returns `UNSUPPORTED_FEATURE` (`WORKSPACE_ADD_TERMINAL_ENABLED` is `false`).
+- Feature gate: `WORKSPACE_ADD_TERMINAL_ENABLED` is `true`, and `bac:hello`
+  advertises `workspaceAddTerminal: true`. Like the other enabled features, the
+  channel answers `NOT_OPTED_IN` before hello; after hello its params are parsed
+  first, and a request that does not parse answers `INVALID_REQUEST` without
+  running the append.
