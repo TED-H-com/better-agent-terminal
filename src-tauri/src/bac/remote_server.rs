@@ -128,28 +128,33 @@ fn collect_saved_with(
     if local.len() > PROFILES_LIMIT {
         return Err(OperationError::LocationTooLarge);
     }
-    let _guard = LOCATE_MUTEX.lock().map_err(|_| OperationError::Internal)?;
-    let mut total = 0usize;
-    let mut saved = Vec::new();
-    let mut unavailable = Vec::new();
-    for profile in local {
-        let (outcome, bytes) = load(&profile.id);
-        total = total
-            .checked_add(bytes)
-            .ok_or(OperationError::LocationTooLarge)?;
-        if total > SAVED_TOTAL_MAX_BYTES {
-            return Err(OperationError::LocationTooLarge);
+    let guard = LOCATE_MUTEX.lock().map_err(|_| OperationError::Internal)?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut total = 0usize;
+        let mut saved = Vec::new();
+        let mut unavailable = Vec::new();
+        for profile in local {
+            let (outcome, bytes) = load(&profile.id);
+            total = total
+                .checked_add(bytes)
+                .ok_or(OperationError::LocationTooLarge)?;
+            if total > SAVED_TOTAL_MAX_BYTES {
+                return Err(OperationError::LocationTooLarge);
+            }
+            match outcome {
+                Ok(outcome) => saved.push(SavedProfile {
+                    profile_id: profile.id.clone(),
+                    outcome,
+                }),
+                Err(SavedReadError::TooLarge) => return Err(OperationError::LocationTooLarge),
+                Err(SavedReadError::Unreadable) => unavailable.push(profile.id.clone()),
+            }
         }
-        match outcome {
-            Ok(outcome) => saved.push(SavedProfile {
-                profile_id: profile.id.clone(),
-                outcome,
-            }),
-            Err(SavedReadError::TooLarge) => return Err(OperationError::LocationTooLarge),
-            Err(SavedReadError::Unreadable) => unavailable.push(profile.id.clone()),
-        }
-    }
-    Ok((saved, unavailable))
+        Ok((saved, unavailable))
+    }))
+    .map_err(|_| OperationError::Internal)?;
+    drop(guard);
+    result
 }
 
 fn collect_local_saved(
@@ -777,6 +782,24 @@ mod bac_tests {
         ));
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn collect_saved_with_catches_panic_without_poisoning_locate_mutex() {
+        use bac_host_contracts::workspace::{CatalogEntry, OperationError, SavedFileOutcome};
+        let catalog = vec![CatalogEntry {
+            id: "default".into(),
+            is_local: true,
+        }];
+        let err = collect_saved_with(&catalog, |_| panic!("injected loader panic")).unwrap_err();
+        assert_eq!(err, OperationError::Internal);
+        assert!(!LOCATE_MUTEX.is_poisoned());
+        let (saved, unavailable) =
+            collect_saved_with(&catalog, |_| (Ok(SavedFileOutcome::NoSavedWindows), 0)).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].profile_id, "default");
+        assert!(matches!(saved[0].outcome, SavedFileOutcome::NoSavedWindows));
+        assert!(unavailable.is_empty());
     }
 
 }
