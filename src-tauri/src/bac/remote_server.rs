@@ -158,17 +158,7 @@ fn collect_local_saved(
     collect_saved_with(catalog, |profile_id| read_saved_profile(dir, profile_id))
 }
 
-fn first_saved_document(windows: &[Value]) -> Option<Value> {
-    bat_app_storage::profile::workspace_from_first_snapshot_window(
-        &serde_json::json!({"windows":windows}),
-    )
-}
-
-fn saved_document(window: &Value) -> Option<Value> {
-    bat_app_storage::profile::workspace_from_first_snapshot_window(
-        &serde_json::json!({"windows":[window]}),
-    )
-}
+use crate::commands::profile::bac_workspace::{first_saved_document, saved_document};
 
 fn profiles_dir(ctx: &HostContext) -> Option<PathBuf> {
     ctx.data_dir_opt().map(|dir| dir.join("profiles"))

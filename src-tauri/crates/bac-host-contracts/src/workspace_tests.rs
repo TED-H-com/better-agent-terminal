@@ -1441,3 +1441,128 @@ fn verify_readback_rejects_missing_or_mismatched_registration() {
         json!({"outcome": "unknown"})
     );
 }
+
+#[test]
+fn catalog_files_acceptable_checks_absent_regular_oversize_non_regular_and_neither() {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "bac-catalog-acceptable-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+
+    assert_eq!(
+        catalog_files_acceptable(&dir),
+        Err(OperationError::WorkspaceUnavailable)
+    );
+
+    fs::write(dir.join("index.json"), b"{}").unwrap();
+    assert_eq!(catalog_files_acceptable(&dir), Ok(()));
+    fs::remove_file(dir.join("index.json")).unwrap();
+
+    fs::write(dir.join("index.json.bak"), b"{}").unwrap();
+    assert_eq!(catalog_files_acceptable(&dir), Ok(()));
+
+    let max_exact = dir.join("index.json");
+    fs::File::create(&max_exact)
+        .unwrap()
+        .set_len(CATALOG_FILE_MAX_BYTES as u64)
+        .unwrap();
+    assert_eq!(catalog_files_acceptable(&dir), Ok(()));
+
+    for (target, peer) in [
+        ("index.json", "index.json.bak"),
+        ("index.json.bak", "index.json"),
+    ] {
+        let _ = fs::remove_file(dir.join(target));
+        let _ = fs::remove_dir_all(dir.join(target));
+        fs::write(dir.join(peer), b"{}").unwrap();
+
+        fs::File::create(dir.join(target))
+            .unwrap()
+            .set_len(CATALOG_FILE_MAX_BYTES as u64 + 1)
+            .unwrap();
+        assert_eq!(
+            catalog_files_acceptable(&dir),
+            Err(OperationError::WorkspaceUnavailable)
+        );
+        fs::remove_file(dir.join(target)).unwrap();
+
+        fs::create_dir(dir.join(target)).unwrap();
+        assert_eq!(
+            catalog_files_acceptable(&dir),
+            Err(OperationError::WorkspaceUnavailable)
+        );
+        fs::remove_dir(dir.join(target)).unwrap();
+
+        #[cfg(unix)]
+        {
+            let real = dir.join("real.json");
+            fs::write(&real, b"{}").unwrap();
+            std::os::unix::fs::symlink(&real, dir.join(target)).unwrap();
+            assert_eq!(
+                catalog_files_acceptable(&dir),
+                Err(OperationError::WorkspaceUnavailable)
+            );
+            fs::remove_file(dir.join(target)).unwrap();
+            fs::remove_file(real).unwrap();
+        }
+    }
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn saved_windows_append_eligible_requires_single_readable_window_and_valid_document() {
+    let valid_window = json!({
+        "workspaces": [{"id": "w1"}],
+        "terminals": [{"id": "t1", "workspaceId": "w1"}]
+    });
+    let valid_doc = saved_document(&valid_window).unwrap();
+
+    assert!(saved_windows_append_eligible(
+        std::slice::from_ref(&valid_window),
+        &valid_doc
+    ));
+    assert!(!saved_windows_append_eligible(&[], &valid_doc));
+    assert!(!saved_windows_append_eligible(
+        &[valid_window.clone(), valid_window.clone()],
+        &valid_doc
+    ));
+
+    let missing_terminal_id_win = json!({
+        "workspaces": [{"id": "w1"}],
+        "terminals": [{"workspaceId": "w1"}]
+    });
+    assert!(!saved_windows_append_eligible(
+        &[missing_terminal_id_win],
+        &valid_doc
+    ));
+
+    let missing_workspaces_win = json!({"terminals": []});
+    let migrated_doc = saved_document(&missing_workspaces_win).unwrap();
+    assert!(structural_preconditions_ok(&migrated_doc));
+    assert!(!saved_windows_append_eligible(
+        &[missing_workspaces_win],
+        &migrated_doc
+    ));
+
+    let dup_terminals_doc = document(
+        json!([{"id": "w1"}]),
+        json!([
+            {"id": "dup", "workspaceId": "w1"},
+            {"id": "dup", "workspaceId": "w1"}
+        ]),
+    );
+    assert!(!saved_windows_append_eligible(
+        &[valid_window],
+        &dup_terminals_doc
+    ));
+}

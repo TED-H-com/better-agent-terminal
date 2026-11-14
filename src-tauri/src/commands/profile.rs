@@ -12,6 +12,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "desktop")]
 use tauri::{AppHandle, WebviewWindow};
+// bac-hook: profile-adapter
+#[path = "../bac/commands_profile.rs"]
+pub(crate) mod bac_workspace;
 fn profiles_dir(app: &HostContext) -> Option<PathBuf> {
     app.data_dir_opt().map(|dir| dir.join("profiles"))
 }

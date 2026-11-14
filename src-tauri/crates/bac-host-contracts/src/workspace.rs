@@ -522,6 +522,33 @@ pub fn parse_request(channel: &str, params: &Value) -> Result<Request, Operation
     }
 }
 
+fn catalog_file_is_acceptable(path: &Path) -> Result<bool, OperationError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.len() > CATALOG_FILE_MAX_BYTES as u64 {
+                Err(OperationError::WorkspaceUnavailable)
+            } else {
+                Ok(true)
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(OperationError::WorkspaceUnavailable),
+    }
+}
+
+pub fn catalog_files_acceptable(dir: &Path) -> Result<(), OperationError> {
+    let mut has_regular_index = false;
+    for name in ["index.json", "index.json.bak"] {
+        if catalog_file_is_acceptable(&dir.join(name))? {
+            has_regular_index = true;
+        }
+    }
+    if !has_regular_index {
+        return Err(OperationError::WorkspaceUnavailable);
+    }
+    Ok(())
+}
+
 pub fn require_local_profile(
     catalog: &[CatalogEntry],
     profile_id: &str,
@@ -730,6 +757,12 @@ fn read_bounded_saved_file_measured_for_platform(
     (Err(SavedReadError::Unreadable), last_size)
 }
 
+pub fn saved_windows_append_eligible(windows: &[Value], document: &Value) -> bool {
+    windows.len() == 1
+        && windows.first().is_some_and(locate_document_is_readable)
+        && structural_preconditions_ok(document)
+}
+
 /// Assemble one read from an already-observed registry and a lazy persisted read.
 pub fn execute_read(
     host_id: &str,
@@ -757,11 +790,9 @@ pub fn execute_read(
                     (empty_workspace_document(), Source::Persisted, None, false)
                 }
                 SavedFileOutcome::Snapshot { windows, .. } => {
-                    let eligible_first_window = windows.len() == 1
-                        && windows.first().is_some_and(locate_document_is_readable);
                     let document =
                         first_document(&windows).ok_or(OperationError::WorkspaceUnavailable)?;
-                    let eligible = eligible_first_window && structural_preconditions_ok(&document);
+                    let eligible = saved_windows_append_eligible(&windows, &document);
                     (document, Source::Persisted, None, eligible)
                 }
             }
