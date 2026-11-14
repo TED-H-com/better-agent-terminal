@@ -280,11 +280,12 @@ fn read_file(mut file: File, path: &Path) -> Result<String> {
     let invalid = || StorageError::corrupt(Reason::IdentityContents, path);
     let doc: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
     let obj = doc.as_object().ok_or_else(invalid)?;
-    let id = doc["hostId"]
-        .as_str()
+    let id = obj
+        .get("hostId")
+        .and_then(Value::as_str)
         .filter(|s| valid_host_id(s))
         .ok_or_else(invalid)?;
-    if obj.len() != 2 || doc["schema"] != 1 {
+    if obj.len() != 2 || obj.get("schema") != Some(&json!(1)) {
         return Err(invalid());
     }
     let sorted = format!("{}\n", json!({"schema":1,"hostId":id}));
@@ -394,10 +395,13 @@ fn initialize(data_dir: &Path, mut point: impl FnMut(Point) -> Result<()>) -> Re
     point(Point::TempCreated)?;
     let bytes = format!("{}\n", json!({"schema":1,"hostId":candidate})).into_bytes();
     let middle = bytes.len() / 2;
-    file.write_all(&bytes[..middle])
+    let (first, second) = bytes
+        .split_at_checked(middle)
+        .ok_or_else(|| cleanup_error(Reason::TempWrite, &dir))?;
+    file.write_all(first)
         .map_err(|_| cleanup_error(Reason::TempWrite, &dir))?;
     point(Point::PartialWritten)?;
-    file.write_all(&bytes[middle..])
+    file.write_all(second)
         .map_err(|_| cleanup_error(Reason::TempWrite, &dir))?;
     point(Point::Written)?;
     file.sync_all()

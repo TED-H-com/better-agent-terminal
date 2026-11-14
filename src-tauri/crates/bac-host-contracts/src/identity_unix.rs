@@ -205,19 +205,23 @@ impl Store {
     }
     pub(super) fn create(&self, name: &str) -> Result<File> {
         writable(&self.bac, &self.path)?;
+        let name = CString::new(name)
+            .map_err(|_| StorageError::unavailable(Reason::TempCreate, &self.path))?;
         open_at(
             &self.bac,
-            &CString::new(name).unwrap(),
+            &name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
             0o600,
         )
         .map_err(|_| StorageError::unavailable(Reason::TempCreate, &self.path))
     }
     pub(super) fn publish(&self, name: &str) -> io::Result<()> {
-        link_at(&self.bac, &CString::new(name).unwrap(), c"host.json")
+        let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        link_at(&self.bac, &name, c"host.json")
     }
     pub(super) fn remove(&self, name: &str) -> io::Result<()> {
-        unlink_at(&self.bac, &CString::new(name).unwrap())
+        let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        unlink_at(&self.bac, &name)
     }
     pub(super) fn sync(&self) -> Result<()> {
         sync_handle(&self.bac, &self.path)
