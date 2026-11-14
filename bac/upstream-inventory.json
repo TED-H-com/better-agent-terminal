@@ -130,20 +130,23 @@
       "reason": "Derived graph includes restored Rust security versions, local GLib, PM libc and bat-error-log.",
       "plan": "keep",
       "planReason": "Follow bac/SYNC.md#raise-a-rust-dependency-floor; compare parsed lock records so only intended packages differ, then require --locked resolution, floors and the exact backport source.",
-      "added": 170,
+      "added": 180,
       "removed": 86,
       "digest": null
     },
     {
       "path": "src-tauri/Cargo.toml",
       "kind": "dependency",
-      "feature": "security patches, PM producer and error log",
-      "reason": "Root manifest wires the local error logger, Linux libc and GTK-compatible GLib patch.",
+      "feature": "security patches, PM producer and error log, opt-in host contracts",
+      "reason": "Root manifest wires the local error logger, Linux libc and GTK-compatible GLib patch. The marked host-contract hook declares the dependency on the local bac-host-contracts crate.",
       "plan": "keep",
       "planReason": "Retain dependency/module registration and GLib patch until GTK supports fixed glib; move PM-only libc to an own crate when runtime extraction permits.",
-      "added": 10,
+      "added": 12,
       "removed": 0,
-      "digest": "bbe0d4a85ca2671d5bf30d2a4bfa2f465bed2b2c19775f36a0f5f88ab4b6f6cf"
+      "digest": "7b9d3c3c635583201d40f01a705f1ed0b788068303e062eb643bd5ba15e1014e",
+      "hooks": [
+        "host-dependency"
+      ]
     },
     {
       "path": "src-tauri/build.rs",
@@ -214,13 +217,22 @@
     {
       "path": "src-tauri/src/remote_server.rs",
       "kind": "legacy-patch",
-      "feature": "PM producer, archive transport and error log",
-      "reason": "Server embeds PM routing, bounded transport/backpressure, logging and regression tests.",
+      "feature": "PM producer, archive transport and error log, opt-in host contracts",
+      "reason": "Server embeds PM routing, bounded transport/backpressure, logging and regression tests. Small marked hooks register and dispatch the opt-in host handshake without sidecar fallback.",
       "plan": "move-to-extension",
       "planReason": "Separate PM bac routing and logger hooks from generic transport fixes, offer the latter upstream, and retain only lifecycle calls after compatibility review.",
-      "added": 261,
-      "removed": 29,
-      "digest": "214922639a33d9c54fcb88bb4537543ce84e98308361fe7c58e1d69cd0d1a225"
+      "added": 275,
+      "removed": 31,
+      "digest": "047b4162085552d5742655198b69c1ba55fb66976392604e48e9cd96f1bafd58",
+      "hooks": [
+        "host-module",
+        "host-connection",
+        "host-auth-capability",
+        "host-invoke-connection",
+        "host-dispatch",
+        "host-reply-id",
+        "host-fixture-tests"
+      ]
     },
     {
       "path": "tests/codex-panel-regression.test.ts",
@@ -253,6 +265,10 @@
     {
       "path": ".github/workflows/bac-differential.yml",
       "feature": "wire compatibility tests"
+    },
+    {
+      "path": ".github/workflows/bac-host-contracts.yml",
+      "feature": "opt-in host contracts"
     },
     {
       "path": ".github/workflows/dependency-checks.yml",
@@ -311,8 +327,24 @@
       "feature": "security patches"
     },
     {
+      "path": "src-tauri/crates/bac-host-contracts/",
+      "feature": "opt-in host contracts"
+    },
+    {
       "path": "src-tauri/crates/bat-error-log/",
       "feature": "error log"
+    },
+    {
+      "path": "src-tauri/src/bac/remote_server.rs",
+      "feature": "opt-in host contracts"
+    },
+    {
+      "path": "src-tauri/src/bac/remote_server_fake_sidecar.mjs",
+      "feature": "opt-in host contracts"
+    },
+    {
+      "path": "src-tauri/src/bac/remote_server_tests.rs",
+      "feature": "opt-in host contracts"
     },
     {
       "path": "src-tauri/src/codex_pm_runtime.rs",

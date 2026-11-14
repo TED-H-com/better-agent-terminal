@@ -1,0 +1,24 @@
+name: BAC host contracts
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: '1.98.1'
+      - name: Crate tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml -p bac-host-contracts --locked
