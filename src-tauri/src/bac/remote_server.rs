@@ -1108,4 +1108,111 @@ mod bac_tests {
         assert_eq!(ltr_locate.locations[0].profile_id, "l");
         assert_eq!(ltr_locate.locations[0].profile_revision, ltr_read.revision);
     }
+
+    #[test]
+    fn append_events_follow_the_append_target() {
+        use bac_host_contracts::workspace::{AppendResult, Source, StagedAppend};
+        use serde_json::json;
+
+        let doc = "{\n  \"terminals\": []\n}";
+        let staged = |source: Source,
+                      window_id: Option<&str>,
+                      appended: bool,
+                      document: Option<&str>,
+                      profile_changed: bool| StagedAppend {
+            result: AppendResult {
+                host_id: "fixture-host".into(),
+                profile_id: "p1".into(),
+                source,
+                window_id: window_id.map(str::to_owned),
+                terminal_id: "t2".into(),
+                appended,
+                revision: format!("sha256:{}", "0".repeat(64)),
+            },
+            document: document.map(str::to_owned),
+            profile_changed,
+        };
+
+        assert_eq!(
+            append_events(
+                "p1",
+                &staged(Source::Live, Some("main"), false, None, false),
+                &["main".into()],
+            ),
+            Vec::<AppendEvent>::new()
+        );
+        assert_eq!(
+            append_events(
+                "p1",
+                &staged(Source::Persisted, None, false, None, true),
+                &["a".into()],
+            ),
+            Vec::<AppendEvent>::new()
+        );
+
+        let live_payload = json!({
+            "profileId": "p1",
+            "windowId": "main",
+            "data": doc,
+        });
+        let live_events = append_events(
+            "p1",
+            &staged(Source::Live, Some("main"), true, Some(doc), false),
+            &["other".into()],
+        );
+        assert_eq!(
+            live_events,
+            vec![
+                AppendEvent::Window("main".into(), live_payload.clone()),
+                AppendEvent::Broadcast(live_payload),
+            ]
+        );
+
+        let saved_with_windows = append_events(
+            "p1",
+            &staged(Source::Persisted, None, true, Some(doc), true),
+            &["a".into(), "b".into()],
+        );
+        assert_eq!(
+            saved_with_windows,
+            vec![
+                AppendEvent::ProfileChanged,
+                AppendEvent::Window("a".into(), json!({ "windowId": "a", "data": doc })),
+                AppendEvent::Window("b".into(), json!({ "windowId": "b", "data": doc })),
+                AppendEvent::Broadcast(json!({ "profileId": "p1", "data": doc })),
+            ]
+        );
+
+        let saved_without_windows = append_events(
+            "p1",
+            &staged(Source::Persisted, None, true, Some(doc), true),
+            &[],
+        );
+        assert_eq!(
+            saved_without_windows,
+            vec![
+                AppendEvent::ProfileChanged,
+                AppendEvent::Broadcast(json!({ "profileId": "p1", "data": doc })),
+            ]
+        );
+
+        assert_eq!(
+            append_events(
+                "p1",
+                &staged(Source::Persisted, None, true, Some(doc), false),
+                &["a".into()],
+            ),
+            Vec::<AppendEvent>::new()
+        );
+
+        for event in live_events
+            .iter()
+            .chain(saved_with_windows.iter())
+            .chain(saved_without_windows.iter())
+        {
+            if let AppendEvent::Window(_, payload) | AppendEvent::Broadcast(payload) = event {
+                assert_eq!(payload.get("data"), Some(&Value::String(doc.to_owned())));
+            }
+        }
+    }
 }
