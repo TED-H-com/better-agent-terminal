@@ -266,15 +266,16 @@
     {
       "path": "src-tauri/src/window_registry.rs",
       "kind": "hook",
-      "feature": "read-only workspace contracts",
+      "feature": "read-only workspace contracts and workspace terminal append",
       "reason": "A marked module hook lets the BAC observer access the in-memory registry without loading or mutating it.",
       "plan": "keep",
       "planReason": "Retain minimal registry module registration while the implementation remains in the BAC adapter.",
-      "added": 3,
-      "removed": 0,
-      "digest": "a8bc2b5c7a31bafad7d4c13ab4cf73d0ecb1031671624b7f07707b1d7029c825",
+      "added": 19,
+      "removed": 5,
+      "digest": "c26451648d24ef959d46ab9262c84b761f1be748c245521f738777ed7177cc6a",
       "hooks": [
-        "registry-adapter"
+        "registry-adapter",
+        "live-writer-body"
       ]
     },
     {

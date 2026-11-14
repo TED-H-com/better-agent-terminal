@@ -9,9 +9,42 @@
     )
 )]
 
-use bac_host_contracts::workspace::{OperationError, RegistryWindowSnapshot};
-use std::{panic::AssertUnwindSafe, sync::OnceLock};
+use bac_host_contracts::workspace::{
+    live_target, prepare_append, verify_readback, AppendRequest, AppendResult, OperationError,
+    RegistryWindowSnapshot, Source, StagedAppend, TxAbort,
+};
+use serde_json::Value;
+use std::{
+    collections::{HashMap, HashSet},
+    panic::AssertUnwindSafe,
+    sync::OnceLock,
+};
 use tauri::{AppHandle, Manager};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Point {
+    Selected,
+    Prepared,
+    Written,
+}
+
+type Overlay<'a> = dyn FnMut(&mut Value) + 'a;
+type Writer<'a> = dyn FnMut(
+        &str,
+        Value,
+        &HashMap<String, (Option<String>, Value)>,
+        &mut Vec<super::WindowEntry>,
+    ) -> bool
+    + 'a;
+
+fn registry_lock_poisoned() -> OperationError {
+    static DIAGNOSTIC: OnceLock<()> = OnceLock::new();
+    DIAGNOSTIC.get_or_init(|| {
+        let message = crate::connection_diagnostics::redact("BAC registry mutex poisoned");
+        bat_error_log::log("warn", "bac.workspace.registry", &message);
+    });
+    OperationError::Internal
+}
 
 fn snapshot_entries(entries: &[super::WindowEntry]) -> Vec<RegistryWindowSnapshot> {
     entries
@@ -34,17 +67,178 @@ pub(crate) fn observe(app: &AppHandle) -> Result<Vec<RegistryWindowSnapshot>, Op
 pub(super) fn observe_state(
     state: &super::WindowRegistryState,
 ) -> Result<Vec<RegistryWindowSnapshot>, OperationError> {
-    let entries = state.entries.lock().map_err(|_| {
-        static DIAGNOSTIC: OnceLock<()> = OnceLock::new();
-        DIAGNOSTIC.get_or_init(|| {
-            let message =
-                crate::connection_diagnostics::redact("BAC registry entries mutex poisoned");
-            bat_error_log::log("warn", "bac.workspace.registry", &message);
-        });
-        OperationError::Internal
-    })?;
+    let entries = state.entries.lock().map_err(|_| registry_lock_poisoned())?;
     std::panic::catch_unwind(AssertUnwindSafe(|| snapshot_entries(&entries)))
         .map_err(|_| OperationError::Internal)
+}
+
+#[allow(dead_code)]
+pub(crate) fn append(
+    app: &AppHandle,
+    host_id: &str,
+    request: &AppendRequest,
+    persisted: &mut dyn FnMut(&mut Overlay<'_>) -> Result<StagedAppend, OperationError>,
+) -> Result<StagedAppend, OperationError> {
+    let state = app.state::<super::WindowRegistryState>();
+    append_state(
+        &state,
+        host_id,
+        request,
+        persisted,
+        &mut |window_id, value, runtime_meta, entries| {
+            super::save_workspace_locked(app, window_id, value, runtime_meta, entries)
+        },
+    )
+}
+
+pub(super) fn append_state(
+    state: &super::WindowRegistryState,
+    host_id: &str,
+    request: &AppendRequest,
+    persisted: &mut dyn FnMut(&mut Overlay<'_>) -> Result<StagedAppend, OperationError>,
+    writer: &mut Writer<'_>,
+) -> Result<StagedAppend, OperationError> {
+    append_state_at(state, host_id, request, persisted, writer, &mut |_| {})
+}
+
+fn append_state_at(
+    state: &super::WindowRegistryState,
+    host_id: &str,
+    request: &AppendRequest,
+    persisted: &mut dyn FnMut(&mut Overlay<'_>) -> Result<StagedAppend, OperationError>,
+    writer: &mut Writer<'_>,
+    point: &mut dyn FnMut(Point),
+) -> Result<StagedAppend, OperationError> {
+    let runtime_meta = state
+        .runtime_meta
+        .lock()
+        .map_err(|_| registry_lock_poisoned())?;
+    let mut entries = state.entries.lock().map_err(|_| registry_lock_poisoned())?;
+
+    let target = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let snapshots = snapshot_entries(&entries);
+        let target = live_target(&snapshots, &request.profile_id)?.cloned();
+        point(Point::Selected);
+        Ok::<_, OperationError>(target)
+    }))
+    .map_err(|_| OperationError::Internal)??;
+
+    let Some(target) = target else {
+        drop(entries);
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            persisted(&mut |doc| {
+                super::apply_runtime_workspace_meta(doc, &request.profile_id, &runtime_meta);
+            })
+        }));
+        drop(runtime_meta);
+        return outcome.map_err(|_| OperationError::WriteFailed)?;
+    };
+
+    let id = target.id;
+    let prospective = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let prospective = prepare_append(
+            host_id,
+            request,
+            Source::Live,
+            Some(id.clone()),
+            &target.workspace_document,
+            |doc| super::apply_runtime_workspace_meta(doc, &request.profile_id, &runtime_meta),
+        )
+        .map_err(Box::new)?;
+        point(Point::Prepared);
+        Ok::<_, Box<TxAbort>>(prospective)
+    }))
+    .map_err(|_| OperationError::Internal)?
+    .map_err(|abort| *abort)
+    {
+        Ok(prospective) => prospective,
+        Err(TxAbort::Noop(result)) => {
+            return Ok(StagedAppend {
+                result,
+                document: None,
+                profile_changed: false,
+            });
+        }
+        Err(TxAbort::Refused(error)) => return Err(error),
+    };
+
+    let wrote = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if !writer(&id, prospective.clone(), &runtime_meta, &mut entries) {
+            return false;
+        }
+        point(Point::Written);
+        true
+    }))
+    .map_err(|_| OperationError::WriteFailed)?;
+    if !wrote {
+        return Err(OperationError::WriteFailed);
+    }
+
+    let (revision, document) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or(OperationError::WriteFailed)?;
+        let readback = super::workspace_value_from_snapshot(&entry.snapshot);
+        let revision = verify_readback(&readback, &prospective, &request.terminal.id)?;
+        let document = serde_json::to_string_pretty(&readback)
+            .map(Some)
+            .map_err(|_| OperationError::WriteFailed)?;
+        Ok::<_, OperationError>((revision, document))
+    }))
+    .map_err(|_| OperationError::WriteFailed)??;
+
+    drop(entries);
+    drop(runtime_meta);
+    Ok(StagedAppend {
+        result: AppendResult {
+            host_id: host_id.to_owned(),
+            profile_id: request.profile_id.clone(),
+            source: Source::Live,
+            window_id: Some(id),
+            terminal_id: request.terminal.id.clone(),
+            appended: true,
+            revision,
+        },
+        document,
+        profile_changed: false,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn live_window_ids_for_profile(app: &AppHandle, profile_id: &str) -> Vec<String> {
+    let live = app
+        .webview_windows()
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    live_window_ids_state(
+        &app.state::<super::WindowRegistryState>(),
+        &live,
+        profile_id,
+    )
+}
+
+pub(super) fn live_window_ids_state(
+    state: &super::WindowRegistryState,
+    live: &HashSet<String>,
+    profile_id: &str,
+) -> Vec<String> {
+    let Ok(entries) = state.entries.lock() else {
+        return Vec::new();
+    };
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.profile_id == profile_id
+                    && entry.detached_workspace_id.is_none()
+                    && live.contains(&entry.id)
+            })
+            .map(|entry| entry.id.clone())
+            .collect()
+    }))
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
