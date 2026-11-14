@@ -57,25 +57,12 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn observe_empty_registry_does_not_load_windows_json_or_seed() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let dir = std::env::temp_dir().join(format!(
-            "bac-empty-registry-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("windows.json");
-        let before = br#"[{"id":"existing"}]"#;
-        std::fs::write(&path, before).unwrap();
+    fn observe_empty_registry_observes_no_windows_and_seeds_nothing() {
         let state = super::super::WindowRegistryState::default();
         assert!(observe_state(&state).unwrap().is_empty());
         assert!(state.entries.lock().unwrap().is_empty());
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(state.runtime_meta.lock().unwrap().is_empty());
+        assert!(state.fresh_windows.lock().unwrap().is_empty());
     }
 
     #[test]

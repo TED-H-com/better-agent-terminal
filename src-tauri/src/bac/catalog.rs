@@ -26,7 +26,9 @@ fn catalog_file_is_acceptable(path: &Path) -> Result<bool, OperationError> {
     }
 }
 
-pub(super) fn read_local_catalog(dir: &Path) -> Result<Vec<CatalogEntry>, OperationError> {
+fn read_local_profile_index(
+    dir: &Path,
+) -> Result<bat_app_storage::profile::ProfileIndex, OperationError> {
     let guard = bat_app_storage::profile::profile_index_guard();
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut has_regular_index = false;
@@ -43,7 +45,11 @@ pub(super) fn read_local_catalog(dir: &Path) -> Result<Vec<CatalogEntry>, Operat
     }))
     .map_err(|_| OperationError::Internal)?;
     drop(guard);
-    let index = result?;
+    result
+}
+
+pub(super) fn read_local_catalog(dir: &Path) -> Result<Vec<CatalogEntry>, OperationError> {
+    let index = read_local_profile_index(dir)?;
     Ok(index
         .profiles
         .into_iter()
@@ -313,5 +319,91 @@ mod tests {
             assert!(matches!(result, Err(OperationError::WorkspaceUnavailable)));
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    fn snapshot_dir_entries(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut entries = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().into_string().unwrap();
+                let bytes = fs::read(entry.path()).unwrap();
+                (name, bytes)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    #[test]
+    fn catalog_read_does_not_hydrate_remote_token_store_or_modify_dir() {
+        use bat_app_storage::profile::{default_entry, ProfileEntry, ProfileIndex};
+        use serde::Serialize;
+        use std::collections::HashMap;
+
+        #[derive(Serialize)]
+        struct PlaintextTokenStore {
+            tokens: HashMap<String, String>,
+        }
+
+        let dir = temp_catalog_dir("no-hydrate");
+        let remote_id = "remote-no-token";
+        let index = ProfileIndex {
+            profiles: vec![
+                default_entry(),
+                ProfileEntry {
+                    id: remote_id.into(),
+                    name: "Remote".into(),
+                    kind: "remote".into(),
+                    remote_host: Some("127.0.0.1".into()),
+                    remote_port: Some(9876),
+                    remote_token: None,
+                    remote_fingerprint: None,
+                    remote_profile_id: None,
+                    remote_profile_name: None,
+                    ssh_target: None,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            ],
+            active_profile_ids: vec![],
+            active_profile_id: None,
+        };
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        assert!(!String::from_utf8_lossy(&index_bytes).contains("remoteToken"));
+        fs::write(dir.join("index.json"), &index_bytes).unwrap();
+
+        let mut tokens = HashMap::new();
+        tokens.insert(remote_id.into(), "fixture-only-synthetic-token".into());
+        let store = PlaintextTokenStore { tokens };
+        let token_payload = json!({
+            "enc": false,
+            "data": serde_json::to_string(&store).unwrap(),
+        });
+        fs::write(
+            dir.join("remote-tokens.enc.json"),
+            serde_json::to_string_pretty(&token_payload).unwrap(),
+        )
+        .unwrap();
+
+        let before = snapshot_dir_entries(&dir);
+        let read_index = read_local_profile_index(&dir).unwrap();
+        let remote = read_index
+            .profiles
+            .iter()
+            .find(|profile| profile.id == remote_id)
+            .unwrap();
+        assert_eq!(remote.kind, "remote");
+        assert_eq!(remote.remote_token, None);
+        assert_eq!(snapshot_dir_entries(&dir), before);
+
+        let catalog = read_local_catalog(&dir).unwrap();
+        assert_eq!(catalog.len(), 2);
+        assert!(catalog
+            .iter()
+            .any(|entry| entry.id == remote_id && !entry.is_local));
+        assert_eq!(snapshot_dir_entries(&dir), before);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }
