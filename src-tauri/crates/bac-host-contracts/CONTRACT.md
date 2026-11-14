@@ -219,3 +219,94 @@ A catalog failure or invalid local catalog ID returns `LOCATION_UNAVAILABLE`
 with an empty `profileIds` list. Unreadable local saved documents or oversized
 window IDs contribute their profile IDs. The append and git channels remain
 unavailable.
+
+## Workspace terminal append
+
+`bac:workspace-add-terminal` accepts
+`{ "profileId": <ProfileId>, "expectedRevision": <Revision>, "terminal": <Registration> }`
+with no additional keys. `profileId` uses the `ProfileId` grammar
+(`valid_profile_id`), and `expectedRevision` must be `sha256:` followed by 64
+lowercase hexadecimal ASCII digits (`valid_revision`). `terminal` must be a JSON
+object whose compact UTF-8 encoding is at most `REGISTRATION_BYTES` (`16,384`
+bytes) and whose keys are drawn only from `id`, `workspaceId`, `title`, `type`,
+`cwd`, `agentPreset`, `model`, `permissionMode`, `agentParams`, `worktreePath`,
+and `worktreeBranch`:
+
+- `id` and `workspaceId`: `Id` grammar (`valid_id`, 1–128 ASCII bytes in `[A-Za-z0-9_.:-]`).
+- `title` and `cwd`: non-empty UTF-8 strings without NUL (`\0`).
+- `type`: `"terminal"`.
+- `agentPreset`: `"claude-code"`, `"claude-code-worktree"`, `"codex-agent"`, or `"codex-agent-worktree"`.
+- `model`, `permissionMode`, and `worktreePath`: optional; when present and non-`null`, each must be a non-empty string without NUL.
+- `agentParams`: optional; when present and non-`null`, a JSON object of at most `AGENT_PARAMS_LIMIT` (`32`, in `bac_host_contracts::workspace`) entries with non-empty NUL-free string keys and NUL-free string values.
+- `worktreeBranch`: optional; may be omitted, `null`, or a non-empty string without NUL.
+
+Invalid parameters return `INVALID_REQUEST` with a static `details.field`
+(`params`, `params.profileId`, `params.expectedRevision`, `params.terminal`, or
+`params.terminal.<field>`).
+
+`normalize_registration` produces the terminal JSON object written into the
+workspace document: it writes the six required keys, omits `model`,
+`permissionMode`, `agentParams`, and `worktreePath` when absent or `null`, omits
+`worktreeBranch` when absent on the wire, and preserves an explicit
+`"worktreeBranch": null` or string value. This omission rule applies only to the
+registration object inside the stored workspace document, never to BAC wire
+envelopes. Existing top-level, workspace, and terminal foreign keys in the
+document are preserved.
+
+`prepare_append` evaluates the target document in order:
+
+1. If `windowId` exceeds `WINDOW_ID_JSON_BYTES` (`1,024` compact JSON bytes
+   including quotes) or the current document fails `structural_preconditions_ok`,
+   refuse with `WORKSPACE_UNAVAILABLE`.
+2. Compute `(current_revision, current_bytes)` via `canonical_digest`.
+3. If `terminals` already contains an entry with `terminal.id`, compare the
+   stored terminal and normalized candidate with `effective_registration_equal`
+   after applying the runtime overlay to both (defaulting missing `type` to
+   `"terminal"`, treating absent and `null` as equal for `model`,
+   `permissionMode`, and `worktreePath`, distinguishing absent, `null`, and
+   string for `worktreeBranch`, and treating absent, `null`, and `{}` as equal
+   for `agentParams`):
+   - If effectively equal and `current_bytes > DOCUMENT_MAX_BYTES` (`520,192`),
+     refuse with `WORKSPACE_TOO_LARGE` (`{ "maxBytes": 520192 }`).
+   - If effectively equal and within `DOCUMENT_MAX_BYTES`, return an idempotent
+     no-op `AppendResult` (`hostId`, `profileId`, `source`, `windowId`,
+     `terminalId`, `appended: false`, `revision: current_revision`) even if
+     `expectedRevision` does not match or `workspaceId` is absent.
+   - Otherwise refuse with `TERMINAL_EXISTS`.
+4. If `expectedRevision != current_revision`, refuse with `REVISION_MISMATCH`.
+5. If `terminal.workspaceId` does not match any entry in `workspaces`, refuse
+   with `WORKSPACE_NOT_FOUND`.
+6. Append the normalized registration to `terminals`, check `canonical_digest`
+   byte length against `DOCUMENT_MAX_BYTES` (`520,192`) before the runtime
+   overlay, apply the runtime overlay, and check `canonical_digest` byte length
+   against `DOCUMENT_MAX_BYTES` again after the overlay. If either check exceeds
+   `DOCUMENT_MAX_BYTES`, refuse with `WORKSPACE_TOO_LARGE`. `prepare_append`
+   returns the prospective document after the runtime overlay.
+
+`verify_readback` confirms that a readback document satisfies
+`structural_preconditions_ok`, matches the overlaid prospective document for
+`terminal.id` under `effective_registration_equal`, and has canonical size at
+most `DOCUMENT_MAX_BYTES`, returning `WRITE_FAILED` otherwise.
+
+Append bounds reuse the existing constants (`REQUEST_BYTES = 65_536`,
+`RESULT_BYTES = 524_288`, `REGISTRATION_BYTES = 16_384`,
+`PROFILES_LIMIT = 256`, `TERMINALS_LIMIT = 4_096`,
+`LOCATION_MATCHES_LIMIT = 100`, `DOCUMENT_MAX_BYTES = 520_192`,
+`WINDOW_ID_JSON_BYTES = 1_024`, `SAVED_FILE_MAX_BYTES = 8_388_608`,
+`CATALOG_FILE_MAX_BYTES = 8_388_608`, `SAVED_TOTAL_MAX_BYTES = 67_108_864`) plus
+`AGENT_PARAMS_LIMIT = 32`. The largest live `bac:workspace-add-terminal` result
+frame (`770`-byte `id`, `1,024`-byte JSON `windowId`, `130`-byte `profileId` and
+`terminalId`, `appended: false`) serializes to `2,318` bytes, within
+`RESULT_BYTES` (`524,288`).
+
+Append-specific operation errors:
+
+| Code | Message | Retryable | Details |
+|---|---|---|---|
+| `WORKSPACE_NOT_FOUND` | `Target workspace not found` | `false` | `{ "workspaceId": <workspaceId> }` |
+| `TERMINAL_EXISTS` | `Terminal ID has a different registration` | `false` | `{ "terminalId": <terminalId>, "currentRevision": <revision> }` |
+| `REVISION_MISMATCH` | `Workspace revision changed` | `true` | `{ "currentRevision": <revision> }` |
+| `WRITE_FAILED` | `Canonical workspace save failed; read back before retry` | `false` | `{ "outcome": "unknown" }` |
+
+Live and persisted workspace write execution is not yet available
+(`WORKSPACE_ADD_TERMINAL_ENABLED` is `false`).
