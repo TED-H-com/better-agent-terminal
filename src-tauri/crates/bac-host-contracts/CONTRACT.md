@@ -380,14 +380,46 @@ called before target selection) with the following guarantees:
   selection and `prepare_append` run inside `catch_unwind`; before the write
   starts, any refusal returns its specific error and any panic returns
   `INTERNAL_ERROR` without calling the writer or poisoning the registry mutexes.
-  From the write onward (including the saved-profile fallback, a writer return
-  of `false`, a missing entry or mismatch on readback, or any panic during the
-  write or readback), any failure returns `WRITE_FAILED` with
+  From the write onward (including a writer return of `false`, a missing entry
+  or mismatch on readback, or any panic during the write or readback), any
+  failure returns `WRITE_FAILED` with `{ "outcome": "unknown" }` while leaving
+  the registry mutexes unpoisoned. The saved-profile fallback returns the
+  saved-profile path's own result (its refusals, its no-op, and its
+  `WRITE_FAILED`), and only a panic that escapes it is `WRITE_FAILED` with
   `{ "outcome": "unknown" }` while leaving the registry mutexes unpoisoned.
 - `live_window_ids_for_profile` / `live_window_ids_state` collects live webview
   window IDs before locking `entries`, returns the profile's regular live window
   IDs in registry order, skips detached and closed windows, and returns an empty
   list if `entries` is poisoned.
 
-Remote dispatch is not yet available (`WORKSPACE_ADD_TERMINAL_ENABLED` is
-`false`).
+Dispatch and events (`dispatch_append`, `append_events`, `emit_append_events`)
+enforce the following guarantees:
+
+- Order of checks: `dispatch` routes `bac:workspace-add-terminal` to
+  `dispatch_append` before any registry observation. A reserved Windows profile
+  name (`is_reserved_profile_id`) is refused with `WORKSPACE_UNAVAILABLE` before
+  any file is opened; an unresolved host data directory or a missing or
+  unacceptable catalog (`read_local_catalog` / `catalog_files_acceptable`)
+  returns `WORKSPACE_UNAVAILABLE`; then `require_local_profile` resolves the
+  first catalog entry of `profileId` (`PROFILE_NOT_FOUND` or
+  `PROFILE_NOT_LOCAL`). The append takes no separate registry snapshot: on
+  desktop builds, the choice between the live window and the saved profile is
+  made under the registry locks (`runtime_meta` then `entries`); on headless
+  builds, the append delegates directly to `append_persisted`.
+- Events: emitted only after every registry and profile-index lock is released,
+  inside `catch_unwind`; an error or panic while sending never changes the
+  reply, and a no-op (`appended: false`) or a refusal sends nothing. A
+  live-window append sends `workspace:reload` with
+  `{ "profileId", "windowId", "data" }` to that window (`emit_to`) and the same
+  payload to remote clients (`broadcast_event`), and no `profile:changed`
+  (matching upstream's `workspace:save` with a window ID). A saved-profile
+  append sends `profile:changed` (upstream's payload), then `workspace:reload`
+  with `{ "windowId", "data" }` to each open regular window of the profile
+  (`live_window_ids_for_profile`) and `{ "profileId", "data" }` to remote
+  clients (matching upstream's `workspace:save` without a window ID). In every
+  `workspace:reload` event, `data` is the pretty-printed document read back
+  inside the locked write (`staged.document`), never read again after the locks
+  are released.
+- Feature gate: the operation stays disabled at the wire gate; `bac:hello`
+  advertises `workspaceAddTerminal: false` and `bac:workspace-add-terminal`
+  returns `UNSUPPORTED_FEATURE` (`WORKSPACE_ADD_TERMINAL_ENABLED` is `false`).
