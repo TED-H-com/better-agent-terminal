@@ -282,16 +282,8 @@ mod bac_tests {
         b.close(None).unwrap();
         reconnect.close(None).unwrap();
     }
-    #[cfg(unix)]
     #[test]
     fn ws_read_and_locate_empty_registry_persisted_roundtrip() {
-        use std::{
-            ffi::CString,
-            io::Write,
-            os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-            sync::mpsc,
-            time::Instant,
-        };
         let host = TestHost::new();
         let profiles = host.dir.join("profiles");
         let index = json!({"profiles":[
@@ -364,37 +356,9 @@ mod bac_tests {
             read["value"]["revision"]
         );
 
-        // A FIFO holds the bounded saved read inside dispatch while a second
+        // A test gate holds the bounded saved read inside dispatch while a second
         // invoke on this same connection must still complete its hello.
-        let path = profiles.join("default.json");
-        fs::remove_file(&path).unwrap();
-        let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let bytes = serde_json::to_vec(&snapshot).unwrap();
-        let writer = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut file = loop {
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(&path)
-                {
-                    Ok(file) => break file,
-                    Err(error)
-                        if error.raw_os_error() == Some(libc::ENXIO)
-                            && Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("FIFO reader did not start: {error}"),
-                }
-            };
-            ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(10));
-            file.write_all(&bytes).unwrap();
-        });
+        let (ready_rx, release_tx, _gate_guard) = bac::install_saved_read_gate(&profiles);
         ws.send(Message::Text(
             json!({"type":"invoke","id":"slow-read",
             "channel":"bac:workspace-read","params":{"profileId":"default"}})
@@ -424,7 +388,6 @@ mod bac_tests {
             );
         }
         release_tx.send(()).unwrap();
-        writer.join().unwrap();
         loop {
             let value = decode_remote_text_frame(&ws.read().unwrap().into_text().unwrap()).unwrap();
             if value["id"] == "slow-read" {
@@ -436,6 +399,82 @@ mod bac_tests {
                 break;
             }
         }
+        ws.close(None).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ws_locate_fifo_profile_returns_location_unavailable_and_does_not_block_followup() {
+        use std::{
+            ffi::CString,
+            os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+            sync::mpsc,
+        };
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"fifo-profile","name":"FIFO","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        let snapshot = json!({"version":2,"windows":[{"workspaces":[{"id":"w"}],
+            "terminals":[{"id":"t","workspaceId":"w"}]}]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("default.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        let fifo_path = profiles.join("fifo-profile.json");
+        let fifo = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let (mut ws, _, _) = connect(&host, true);
+        assert_eq!(hello(&mut ws)["ok"], true);
+
+        let run_locate = |mut ws: Socket| -> (Socket, Value) {
+            let (tx, rx) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let reply = invoke(
+                    &mut ws,
+                    json!({"channel":"bac:session-locate","params":{"sessionId":"t"}}),
+                );
+                let _ = tx.send((ws, reply));
+            });
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(pair) => {
+                    handle.join().unwrap();
+                    pair
+                }
+                Err(error) => {
+                    let _ = fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo_path);
+                    let _ = handle.join();
+                    panic!("bac:session-locate did not return within 5s: {error}");
+                }
+            }
+        };
+
+        let (ws, first) = run_locate(ws);
+        assert_eq!(first["ok"], false);
+        assert_eq!(first["error"]["code"], "LOCATION_UNAVAILABLE");
+        assert_eq!(
+            first["error"]["details"],
+            json!({"profileIds":["fifo-profile"]})
+        );
+
+        let (mut ws, second) = run_locate(ws);
+        assert_eq!(second["ok"], false);
+        assert_eq!(second["error"]["code"], "LOCATION_UNAVAILABLE");
+        assert_eq!(
+            second["error"]["details"],
+            json!({"profileIds":["fifo-profile"]})
+        );
+
         ws.close(None).unwrap();
     }
     #[test]

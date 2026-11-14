@@ -484,3 +484,129 @@ fn saved_file_retry_reader_handles_torn_then_valid_and_8mib_limit() {
     assert_eq!(invoked.load(Ordering::SeqCst), 0);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(unix)]
+fn run_with_fifo_deadline<T: Send + 'static>(
+    fifo: &Path,
+    action: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    use std::{os::unix::fs::OpenOptionsExt, sync::mpsc};
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let _ = tx.send(action());
+    });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(value) => {
+            handle.join().unwrap();
+            value
+        }
+        Err(error) => {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo);
+            let _ = handle.join();
+            panic!("FIFO operation did not return within 5s: {error}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_file_rejects_non_regular_files_and_oversized_metadata_without_blocking() {
+    use std::{
+        ffi::CString,
+        fs,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "bac-saved-nonreg-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+
+    let fifo_path = dir.join("fifo.json");
+    let fifo = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let fifo_for_read = fifo_path.clone();
+    let ((result, count), migrate_calls) = run_with_fifo_deadline(&fifo_path, move || {
+        let invoked = AtomicUsize::new(0);
+        let outcome = read_bounded_saved_file_measured(&fifo_for_read, |value| {
+            invoked.fetch_add(1, Ordering::SeqCst);
+            Some(value)
+        });
+        (outcome, invoked.load(Ordering::SeqCst))
+    });
+    assert!(matches!(result, Err(SavedReadError::Unreadable)));
+    assert_eq!(count, 0);
+    assert_eq!(migrate_calls, 0);
+
+    let fifo_for_open = fifo_path.clone();
+    let open_result =
+        run_with_fifo_deadline(&fifo_path, move || open_regular_saved_file(&fifo_for_open));
+    assert!(matches!(open_result, Err(Err(SavedReadError::Unreadable))));
+
+    for (name, target) in [("null.json", "/dev/null"), ("zero.json", "/dev/zero")] {
+        let link = dir.join(name);
+        symlink(target, &link).unwrap();
+        let invoked = AtomicUsize::new(0);
+        let (result, count) = read_bounded_saved_file_measured(&link, |value| {
+            invoked.fetch_add(1, Ordering::SeqCst);
+            Some(value)
+        });
+        assert!(matches!(result, Err(SavedReadError::Unreadable)));
+        assert_eq!(count, 0);
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            open_regular_saved_file(&link),
+            Err(Err(SavedReadError::Unreadable))
+        ));
+    }
+
+    let subdir = dir.join("subdir.json");
+    fs::create_dir(&subdir).unwrap();
+    let (result, count) = read_bounded_saved_file_measured(&subdir, Some);
+    assert!(matches!(result, Err(SavedReadError::Unreadable)));
+    assert_eq!(count, 0);
+
+    let sparse = dir.join("sparse.json");
+    fs::File::create(&sparse)
+        .unwrap()
+        .set_len(SAVED_FILE_MAX_BYTES as u64 + 1)
+        .unwrap();
+    let invoked = AtomicUsize::new(0);
+    let (result, count) = read_bounded_saved_file_measured(&sparse, |value| {
+        invoked.fetch_add(1, Ordering::SeqCst);
+        Some(value)
+    });
+    assert!(matches!(result, Err(SavedReadError::TooLarge)));
+    assert_eq!(count, 0);
+    assert_eq!(invoked.load(Ordering::SeqCst), 0);
+
+    let dangling = dir.join("dangling.json");
+    symlink(dir.join("missing.json"), &dangling).unwrap();
+    let (result, count) = read_bounded_saved_file_measured(&dangling, Some);
+    assert!(matches!(result, Ok(SavedFileOutcome::NoSavedWindows)));
+    assert_eq!(count, 0);
+
+    let regular = dir.join("regular.json");
+    fs::write(
+        &regular,
+        br#"{"version":2,"windows":[{"workspaces":[],"terminals":[]}]}"#,
+    )
+    .unwrap();
+    let regular_link = dir.join("regular-link.json");
+    symlink(&regular, &regular_link).unwrap();
+    let (result, count) = read_bounded_saved_file_measured(&regular_link, Some);
+    assert!(matches!(result, Ok(SavedFileOutcome::Snapshot { .. })));
+    assert_eq!(count, fs::metadata(&regular).unwrap().len() as usize);
+
+    fs::remove_dir_all(dir).unwrap();
+}

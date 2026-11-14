@@ -164,9 +164,15 @@ Before the desktop host loads its registry, `windows.json` is not consulted;
 read and locate use saved profiles. An empty in-memory registry means no live
 placement, including in desktop-compiled servers. Neither operation seeds,
 repairs, or hydrates the catalog or registry. Remote and uncatalogued registry
-entries are ignored. Saved profile reads use a single parsed buffer, at most
-8 MiB per file, with up to three attempts for torn or invalid JSON and 20 ms
-between attempts. A locate scan reads no more than 64 MiB in total.
+entries are ignored. Saved profile reads inspect `metadata` (following symlinks) before opening,
+open with `O_NONBLOCK` on Unix, and require `is_file()` on the opened handle
+before reading. Missing paths and dangling symlinks produce no saved windows
+with 0 bytes read; non-regular entries and metadata or open failures report
+unreadability with 0 bytes read without retrying; regular files whose metadata
+exceeds 8 MiB immediately report too large with 0 bytes read without retrying.
+Readable regular files use a single parsed buffer, at most 8 MiB per file, with
+up to three attempts for torn or invalid JSON and 20 ms between attempts. A
+locate scan reads no more than 64 MiB in total.
 
 The 11-key `bac:hello` limits map is unchanged: `requestBytes: 65536`,
 `resultBytes: 524288`, `registrationBytes: 16384`, `profiles: 256`,

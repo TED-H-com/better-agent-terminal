@@ -22,6 +22,52 @@ use std::{
 // This gate bounds concurrent full-catalog scans; it never guards an upstream lock.
 static LOCATE_MUTEX: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
+type SavedReadGate = (
+    std::sync::mpsc::Sender<()>,
+    Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+);
+
+#[cfg(test)]
+fn saved_read_gates() -> &'static Mutex<HashMap<PathBuf, SavedReadGate>> {
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, SavedReadGate>>> = OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+#[cfg_attr(feature = "desktop", allow(dead_code))]
+pub(super) struct SavedReadGateGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for SavedReadGateGuard {
+    fn drop(&mut self) {
+        if let Ok(mut gates) = saved_read_gates().lock() {
+            gates.remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(feature = "desktop", allow(dead_code))]
+pub(super) fn install_saved_read_gate(
+    profiles_dir: &Path,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    SavedReadGateGuard,
+) {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let key = profiles_dir.to_path_buf();
+    if let Ok(mut gates) = saved_read_gates().lock() {
+        gates.insert(
+            key.clone(),
+            (started_tx, Arc::new(Mutex::new(Some(release_rx)))),
+        );
+    }
+    (started_rx, release_tx, SavedReadGateGuard(key))
+}
+
 fn read_saved_profile(
     dir: &Path,
     profile_id: &str,
@@ -29,6 +75,21 @@ fn read_saved_profile(
     Result<workspace::SavedFileOutcome, workspace::SavedReadError>,
     usize,
 ) {
+    #[cfg(test)]
+    {
+        let gate = saved_read_gates()
+            .lock()
+            .ok()
+            .and_then(|mut gates| gates.remove(dir));
+        if let Some((started_tx, release_rx)) = gate {
+            let _ = started_tx.send(());
+            if let Ok(mut rx_guard) = release_rx.lock() {
+                if let Some(rx) = rx_guard.take() {
+                    let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+                }
+            }
+        }
+    }
     let path = bat_app_storage::profile::profile_path(dir, profile_id);
     workspace::read_bounded_saved_file_measured(&path, bat_app_storage::profile::migrate_snapshot)
 }

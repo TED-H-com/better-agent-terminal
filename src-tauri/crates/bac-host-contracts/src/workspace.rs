@@ -282,18 +282,52 @@ pub fn read_bounded_saved_file(
 
 /// Also report the final observed byte count, including empty or unreadable files,
 /// so a locate scan enforces its cumulative bound before reporting unreadability.
+fn open_regular_saved_file(path: &Path) -> Result<File, Result<SavedFileOutcome, SavedReadError>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(Ok(SavedFileOutcome::NoSavedWindows))
+        }
+        Err(_) => return Err(Err(SavedReadError::Unreadable)),
+    };
+    let Ok(meta) = file.metadata() else {
+        return Err(Err(SavedReadError::Unreadable));
+    };
+    if !meta.is_file() {
+        return Err(Err(SavedReadError::Unreadable));
+    }
+    Ok(file)
+}
+
 pub fn read_bounded_saved_file_measured(
     path: &Path,
     mut migrate: impl FnMut(Value) -> Option<Value>,
 ) -> (Result<SavedFileOutcome, SavedReadError>, usize) {
     let mut last_size = 0;
     for attempt in 0..SAVED_READ_MAX_ATTEMPTS {
-        let file = match File::open(path) {
-            Ok(file) => file,
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return (Ok(SavedFileOutcome::NoSavedWindows), 0)
             }
             Err(_) => return (Err(SavedReadError::Unreadable), 0),
+        };
+        if !meta.is_file() {
+            return (Err(SavedReadError::Unreadable), 0);
+        }
+        if meta.len() > SAVED_FILE_MAX_BYTES as u64 {
+            return (Err(SavedReadError::TooLarge), 0);
+        }
+        let file = match open_regular_saved_file(path) {
+            Ok(file) => file,
+            Err(outcome) => return (outcome, 0),
         };
         let mut raw = Vec::new();
         if file
