@@ -806,4 +806,133 @@ mod bac_tests {
 
         ws.close(None).unwrap();
     }
+
+    #[test]
+    fn ws_duplicate_catalog_ids_first_entry_decides_across_read_and_locate() {
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let write_snapshot = |id: &str, session_id: &str| {
+            let snapshot = json!({
+                "version": 2,
+                "windows": [{
+                    "workspaces": [{"id": "w"}],
+                    "terminals": [{"id": session_id, "workspaceId": "w"}]
+                }]
+            });
+            fs::write(
+                profiles.join(format!("{id}.json")),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+        };
+        write_snapshot("dup", "t-dup");
+        write_snapshot("remote_first", "t-rf");
+        write_snapshot("local_first", "t-lf");
+
+        let dup_index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"dup","name":"Dup1","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"dup","name":"Dup2","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"remote_first","name":"RFRemote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0},
+            {"id":"remote_first","name":"RFLocal","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"local_first","name":"LFLocal","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"local_first","name":"LFRemote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&dup_index).unwrap(),
+        )
+        .unwrap();
+
+        let (mut ws, _, _) = connect(&host, true);
+        assert_eq!(hello(&mut ws)["ok"], true);
+
+        let dup_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"dup"}}),
+        );
+        assert_eq!(dup_read["ok"], true);
+        assert_eq!(dup_read["value"]["document"]["terminals"][0]["id"], "t-dup");
+
+        let rf_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"remote_first"}}),
+        );
+        assert_eq!(error(rf_read), "PROFILE_NOT_LOCAL");
+
+        let lf_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"local_first"}}),
+        );
+        assert_eq!(lf_read["ok"], true);
+        assert_eq!(lf_read["value"]["document"]["terminals"][0]["id"], "t-lf");
+
+        let dup_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-dup"}}),
+        );
+        assert_eq!(dup_locate["ok"], true);
+        assert_eq!(dup_locate["value"]["disposition"], "located");
+        assert_eq!(dup_locate["value"]["locations"].as_array().unwrap().len(), 1);
+        assert_eq!(dup_locate["value"]["locations"][0]["profileId"], "dup");
+        assert_eq!(
+            dup_locate["value"]["locations"][0]["profileRevision"],
+            dup_read["value"]["revision"]
+        );
+
+        let rf_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-rf"}}),
+        );
+        assert_eq!(rf_locate["ok"], true);
+        assert_eq!(rf_locate["value"]["disposition"], "unregistered");
+        assert_eq!(rf_locate["value"]["locations"], json!([]));
+
+        let lf_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-lf"}}),
+        );
+        assert_eq!(lf_locate["ok"], true);
+        assert_eq!(lf_locate["value"]["disposition"], "located");
+        assert_eq!(lf_locate["value"]["locations"].as_array().unwrap().len(), 1);
+        assert_eq!(lf_locate["value"]["locations"][0]["profileId"], "local_first");
+        assert_eq!(
+            lf_locate["value"]["locations"][0]["profileRevision"],
+            lf_read["value"]["revision"]
+        );
+
+        let single_index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"dup","name":"Dup1","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"remote_first","name":"RFRemote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0},
+            {"id":"local_first","name":"LFLocal","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&single_index).unwrap(),
+        )
+        .unwrap();
+
+        let single_dup_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"dup"}}),
+        );
+        let single_dup_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-dup"}}),
+        );
+        let single_lf_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-lf"}}),
+        );
+        assert_eq!(dup_read, single_dup_read);
+        assert_eq!(dup_locate, single_dup_locate);
+        assert_eq!(
+            dup_locate["value"]["locationRevision"],
+            single_dup_locate["value"]["locationRevision"]
+        );
+        assert_eq!(lf_locate, single_lf_locate);
+
+        ws.close(None).unwrap();
+    }
 }

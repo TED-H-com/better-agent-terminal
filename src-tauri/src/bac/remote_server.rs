@@ -118,16 +118,10 @@ fn collect_saved_with(
     ),
 ) -> Result<(Vec<workspace::SavedProfile>, Vec<String>), workspace::OperationError> {
     use workspace::{
-        valid_profile_id, OperationError, SavedProfile, SavedReadError, PROFILES_LIMIT,
+        local_catalog_profiles, OperationError, SavedProfile, SavedReadError,
         SAVED_TOTAL_MAX_BYTES,
     };
-    let local: Vec<_> = catalog.iter().filter(|profile| profile.is_local).collect();
-    if local.iter().any(|profile| !valid_profile_id(&profile.id)) {
-        return Err(OperationError::LocationUnavailable(vec![]));
-    }
-    if local.len() > PROFILES_LIMIT {
-        return Err(OperationError::LocationTooLarge);
-    }
+    let local = local_catalog_profiles(catalog)?;
     let guard = LOCATE_MUTEX.lock().map_err(|_| OperationError::Internal)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut total = 0usize;
@@ -800,6 +794,219 @@ mod bac_tests {
         assert_eq!(saved[0].profile_id, "default");
         assert!(matches!(saved[0].outcome, SavedFileOutcome::NoSavedWindows));
         assert!(unavailable.is_empty());
+    }
+
+    #[test]
+    fn duplicate_catalog_ids_read_saved_once_and_respect_first_entry() {
+        use bac_host_contracts::workspace::{
+            execute_locate, execute_read, CatalogEntry, Disposition, LocateRequest, OperationError,
+            ReadRequest, SavedFileOutcome, SAVED_FILE_MAX_BYTES,
+        };
+        use std::collections::HashMap;
+
+        let make_window = |session_id: &str| {
+            serde_json::json!({
+                "workspaces": [{"id": "w"}],
+                "terminals": [{"id": session_id, "workspaceId": "w"}]
+            })
+        };
+        let dup_window = make_window("t-dup");
+
+        let once_catalog = vec![CatalogEntry {
+            id: "dup".into(),
+            is_local: true,
+        }];
+        let twice_catalog = vec![
+            CatalogEntry {
+                id: "dup".into(),
+                is_local: true,
+            },
+            CatalogEntry {
+                id: "dup".into(),
+                is_local: true,
+            },
+        ];
+
+        let mut once_reads = 0usize;
+        let (once_saved, once_unavailable) = collect_saved_with(&once_catalog, |id| {
+            assert_eq!(id, "dup");
+            once_reads += 1;
+            (
+                Ok(SavedFileOutcome::Snapshot {
+                    raw_bytes: 128,
+                    windows: vec![dup_window.clone()],
+                }),
+                128,
+            )
+        })
+        .unwrap();
+        assert_eq!(once_reads, 1);
+
+        let mut twice_reads = 0usize;
+        let (twice_saved, twice_unavailable) = collect_saved_with(&twice_catalog, |id| {
+            assert_eq!(id, "dup");
+            twice_reads += 1;
+            (
+                Ok(SavedFileOutcome::Snapshot {
+                    raw_bytes: 128,
+                    windows: vec![dup_window.clone()],
+                }),
+                128,
+            )
+        })
+        .unwrap();
+        assert_eq!(twice_reads, 1);
+        assert_eq!(twice_saved.len(), 1);
+
+        let once_located = execute_locate(
+            "host",
+            &LocateRequest {
+                session_id: "t-dup".into(),
+            },
+            &once_catalog,
+            &[],
+            &once_saved,
+            once_unavailable,
+            saved_document,
+        )
+        .unwrap();
+        let twice_located = execute_locate(
+            "host",
+            &LocateRequest {
+                session_id: "t-dup".into(),
+            },
+            &twice_catalog,
+            &[],
+            &twice_saved,
+            twice_unavailable,
+            saved_document,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&twice_located).unwrap(),
+            serde_json::to_value(&once_located).unwrap()
+        );
+        assert_eq!(
+            twice_located.location_revision,
+            once_located.location_revision
+        );
+
+        let nine_dups = vec![
+            CatalogEntry {
+                id: "dup".into(),
+                is_local: true,
+            };
+            9
+        ];
+        let mut max_reads = 0usize;
+        let (max_saved, _) = collect_saved_with(&nine_dups, |_| {
+            max_reads += 1;
+            (Ok(SavedFileOutcome::NoSavedWindows), SAVED_FILE_MAX_BYTES)
+        })
+        .unwrap();
+        assert_eq!(max_reads, 1);
+        assert_eq!(max_saved.len(), 1);
+
+        let remote_then_local = vec![
+            CatalogEntry {
+                id: "r".into(),
+                is_local: false,
+            },
+            CatalogEntry {
+                id: "r".into(),
+                is_local: true,
+            },
+        ];
+        let (rtl_saved, rtl_unavailable) =
+            collect_saved_with(&remote_then_local, |_| panic!("remote-first must not read"))
+                .unwrap();
+        assert!(rtl_saved.is_empty());
+        assert!(rtl_unavailable.is_empty());
+        assert_eq!(
+            execute_read(
+                "host",
+                &ReadRequest {
+                    profile_id: "r".into()
+                },
+                &remote_then_local,
+                &[],
+                || panic!("remote-first must not read"),
+                first_saved_document,
+            )
+            .unwrap_err(),
+            OperationError::ProfileNotLocal
+        );
+        let rtl_locate = execute_locate(
+            "host",
+            &LocateRequest {
+                session_id: "t-r".into(),
+            },
+            &remote_then_local,
+            &[],
+            &rtl_saved,
+            rtl_unavailable,
+            saved_document,
+        )
+        .unwrap();
+        assert_eq!(rtl_locate.disposition, Disposition::Unregistered);
+        assert!(rtl_locate.locations.is_empty());
+
+        let local_then_remote = vec![
+            CatalogEntry {
+                id: "l".into(),
+                is_local: true,
+            },
+            CatalogEntry {
+                id: "l".into(),
+                is_local: false,
+            },
+        ];
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let (ltr_saved, ltr_unavailable) = collect_saved_with(&local_then_remote, |id| {
+            *counts.entry(id.to_owned()).or_default() += 1;
+            (
+                Ok(SavedFileOutcome::Snapshot {
+                    raw_bytes: 64,
+                    windows: vec![make_window("t-l")],
+                }),
+                64,
+            )
+        })
+        .unwrap();
+        assert_eq!(counts.get("l").copied(), Some(1));
+        assert!(ltr_unavailable.is_empty());
+        let ltr_read = execute_read(
+            "host",
+            &ReadRequest {
+                profile_id: "l".into(),
+            },
+            &local_then_remote,
+            &[],
+            || {
+                Ok(SavedFileOutcome::Snapshot {
+                    raw_bytes: 64,
+                    windows: vec![make_window("t-l")],
+                })
+            },
+            first_saved_document,
+        )
+        .unwrap();
+        let ltr_locate = execute_locate(
+            "host",
+            &LocateRequest {
+                session_id: "t-l".into(),
+            },
+            &local_then_remote,
+            &[],
+            &ltr_saved,
+            ltr_unavailable,
+            saved_document,
+        )
+        .unwrap();
+        assert_eq!(ltr_locate.disposition, Disposition::Located);
+        assert_eq!(ltr_locate.locations.len(), 1);
+        assert_eq!(ltr_locate.locations[0].profile_id, "l");
+        assert_eq!(ltr_locate.locations[0].profile_revision, ltr_read.revision);
     }
 
 }

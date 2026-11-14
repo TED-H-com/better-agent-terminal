@@ -241,6 +241,24 @@ pub fn require_local_profile(
     Ok(())
 }
 
+/// Resolve each catalog ID from its first entry, keep locals, then check grammar and limit.
+pub fn local_catalog_profiles(
+    catalog: &[CatalogEntry],
+) -> Result<Vec<&CatalogEntry>, OperationError> {
+    let mut seen = HashSet::new();
+    let locals: Vec<&CatalogEntry> = catalog
+        .iter()
+        .filter(|entry| seen.insert(entry.id.as_str()) && entry.is_local)
+        .collect();
+    if locals.iter().any(|profile| !valid_profile_id(&profile.id)) {
+        return Err(OperationError::LocationUnavailable(vec![]));
+    }
+    if locals.len() > PROFILES_LIMIT {
+        return Err(OperationError::LocationTooLarge);
+    }
+    Ok(locals)
+}
+
 pub fn canonicalize_json(value: &Value) -> Result<Value, OperationError> {
     match value {
         Value::Array(values) => values
@@ -512,13 +530,7 @@ pub fn execute_locate(
     saved_document: impl Fn(&Value) -> Option<Value>,
 ) -> Result<LocateResult, OperationError> {
     use std::collections::{BTreeMap, BTreeSet};
-    let locals: Vec<_> = catalog.iter().filter(|profile| profile.is_local).collect();
-    if locals.iter().any(|profile| !valid_profile_id(&profile.id)) {
-        return Err(OperationError::LocationUnavailable(vec![]));
-    }
-    if locals.len() > PROFILES_LIMIT {
-        return Err(OperationError::LocationTooLarge);
-    }
+    let locals = local_catalog_profiles(catalog)?;
     let local_ids: HashSet<&str> = locals.iter().map(|profile| profile.id.as_str()).collect();
     let mut documents = Vec::new();
     for entry in entries

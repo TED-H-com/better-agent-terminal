@@ -823,3 +823,181 @@ fn reserved_profile_ids_respect_platform_and_skip_filesystem() {
 
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn duplicate_catalog_ids_first_entry_decides_for_read_and_locate() {
+    let entry_local = |id: &str| CatalogEntry {
+        id: id.into(),
+        is_local: true,
+    };
+    let entry_remote = |id: &str| CatalogEntry {
+        id: id.into(),
+        is_local: false,
+    };
+
+    let dedup_catalog = vec![entry_local("dup"), entry_local("dup")];
+    let resolved = local_catalog_profiles(&dedup_catalog).unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].id, "dup");
+
+    let mut limit_with_duplicates: Vec<CatalogEntry> =
+        (0..256).map(|i| entry_local(&format!("p{i}"))).collect();
+    limit_with_duplicates.push(entry_local("p0"));
+    assert_eq!(
+        local_catalog_profiles(&limit_with_duplicates)
+            .unwrap()
+            .len(),
+        256
+    );
+    limit_with_duplicates.push(entry_local("p256"));
+    assert_eq!(
+        local_catalog_profiles(&limit_with_duplicates).unwrap_err(),
+        OperationError::LocationTooLarge
+    );
+
+    assert!(
+        local_catalog_profiles(&[entry_remote("bad/id"), entry_local("bad/id")])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        local_catalog_profiles(&[entry_local("bad/id"), entry_remote("bad/id")]).unwrap_err(),
+        OperationError::LocationUnavailable(vec![])
+    );
+
+    let live_doc = document(
+        json!([{"id": "w"}]),
+        json!([{"id": "t-dup", "workspaceId": "w"}]),
+    );
+    let live_entries = vec![entry("dup", "win-1", None, live_doc)];
+    let once_read = execute_read(
+        HOST,
+        &read_request("dup"),
+        &catalog("dup"),
+        &live_entries,
+        || panic!("live read should not touch disk"),
+        first_document,
+    )
+    .unwrap();
+    let twice_read = execute_read(
+        HOST,
+        &read_request("dup"),
+        &dedup_catalog,
+        &live_entries,
+        || panic!("live read should not touch disk"),
+        first_document,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&twice_read).unwrap(),
+        serde_json::to_value(&once_read).unwrap()
+    );
+
+    let once_locate = execute_locate(
+        HOST,
+        &locate_request("t-dup"),
+        &catalog("dup"),
+        &live_entries,
+        &[],
+        vec![],
+        saved_document,
+    )
+    .unwrap();
+    let twice_locate = execute_locate(
+        HOST,
+        &locate_request("t-dup"),
+        &dedup_catalog,
+        &live_entries,
+        &[],
+        vec![],
+        saved_document,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&twice_locate).unwrap(),
+        serde_json::to_value(&once_locate).unwrap()
+    );
+    assert_eq!(
+        twice_locate.location_revision,
+        once_locate.location_revision
+    );
+
+    let remote_then_local = vec![entry_remote("dup"), entry_local("dup")];
+    assert_eq!(
+        execute_read(
+            HOST,
+            &read_request("dup"),
+            &remote_then_local,
+            &live_entries,
+            || panic!("remote profile must not read disk"),
+            first_document,
+        )
+        .unwrap_err(),
+        OperationError::ProfileNotLocal
+    );
+    let remote_saved = vec![SavedProfile {
+        profile_id: "dup".into(),
+        outcome: SavedFileOutcome::Snapshot {
+            raw_bytes: 16,
+            windows: vec![json!({
+                "workspaces": [{"id": "w"}],
+                "terminals": [{"id": "t-dup", "workspaceId": "w"}]
+            })],
+        },
+    }];
+    let remote_locate = execute_locate(
+        HOST,
+        &locate_request("t-dup"),
+        &remote_then_local,
+        &live_entries,
+        &remote_saved,
+        vec![],
+        saved_document,
+    )
+    .unwrap();
+    let empty_locate = execute_locate(
+        HOST,
+        &locate_request("t-dup"),
+        &[],
+        &live_entries,
+        &remote_saved,
+        vec![],
+        saved_document,
+    )
+    .unwrap();
+    assert_eq!(remote_locate.disposition, Disposition::Unregistered);
+    assert!(remote_locate.locations.is_empty());
+    assert_eq!(
+        remote_locate.location_revision,
+        empty_locate.location_revision
+    );
+
+    let local_then_remote = vec![entry_local("dup"), entry_remote("dup")];
+    let local_read = execute_read(
+        HOST,
+        &read_request("dup"),
+        &local_then_remote,
+        &live_entries,
+        || panic!("live read should not touch disk"),
+        first_document,
+    )
+    .unwrap();
+    let local_locate = execute_locate(
+        HOST,
+        &locate_request("t-dup"),
+        &local_then_remote,
+        &live_entries,
+        &[],
+        vec![],
+        saved_document,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&local_read).unwrap(),
+        serde_json::to_value(&once_read).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&local_locate).unwrap(),
+        serde_json::to_value(&once_locate).unwrap()
+    );
+}
