@@ -635,6 +635,19 @@ pub fn select_regular_entry<'a>(
         .max_by_key(|entry| entry.last_active_at)
 }
 
+pub fn live_target<'a>(
+    entries: &'a [RegistryWindowSnapshot],
+    profile_id: &str,
+) -> Result<Option<&'a RegistryWindowSnapshot>, OperationError> {
+    if entries
+        .iter()
+        .any(|entry| entry.profile_id == profile_id && !window_id_within_bound(&entry.id))
+    {
+        return Err(OperationError::WorkspaceUnavailable);
+    }
+    Ok(select_regular_entry(entries, profile_id))
+}
+
 #[derive(Clone, Debug)]
 pub enum SavedFileOutcome {
     NoSavedWindows,
@@ -773,14 +786,8 @@ pub fn execute_read(
     first_document: impl FnOnce(&[Value]) -> Option<Value>,
 ) -> Result<ReadResult, OperationError> {
     require_local_profile(catalog, &request.profile_id)?;
-    if entries
-        .iter()
-        .any(|entry| entry.profile_id == request.profile_id && !window_id_within_bound(&entry.id))
-    {
-        return Err(OperationError::WorkspaceUnavailable);
-    }
     let (document, source, window_id, eligible) =
-        if let Some(entry) = select_regular_entry(entries, &request.profile_id) {
+        if let Some(entry) = live_target(entries, &request.profile_id)? {
             let document = entry.workspace_document.clone();
             let eligible = structural_preconditions_ok(&document);
             (document, Source::Live, Some(entry.id.clone()), eligible)

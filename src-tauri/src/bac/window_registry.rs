@@ -13,6 +13,20 @@ use bac_host_contracts::workspace::{OperationError, RegistryWindowSnapshot};
 use std::{panic::AssertUnwindSafe, sync::OnceLock};
 use tauri::{AppHandle, Manager};
 
+fn snapshot_entries(entries: &[super::WindowEntry]) -> Vec<RegistryWindowSnapshot> {
+    entries
+        .iter()
+        .map(|entry| RegistryWindowSnapshot {
+            id: entry.id.clone(),
+            profile_id: entry.profile_id.clone(),
+            detached_workspace_id: entry.detached_workspace_id.clone(),
+            has_content: super::snapshot_has_content(&entry.snapshot),
+            last_active_at: entry.last_active_at,
+            workspace_document: super::workspace_value_from_snapshot(&entry.snapshot),
+        })
+        .collect()
+}
+
 pub(crate) fn observe(app: &AppHandle) -> Result<Vec<RegistryWindowSnapshot>, OperationError> {
     observe_state(&app.state::<super::WindowRegistryState>())
 }
@@ -29,21 +43,8 @@ pub(super) fn observe_state(
         });
         OperationError::Internal
     })?;
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
-        entries
-            .clone()
-            .into_iter()
-            .map(|entry| RegistryWindowSnapshot {
-                id: entry.id,
-                profile_id: entry.profile_id,
-                detached_workspace_id: entry.detached_workspace_id,
-                has_content: super::snapshot_has_content(&entry.snapshot),
-                last_active_at: entry.last_active_at,
-                workspace_document: super::workspace_value_from_snapshot(&entry.snapshot),
-            })
-            .collect()
-    }))
-    .map_err(|_| OperationError::Internal)
+    std::panic::catch_unwind(AssertUnwindSafe(|| snapshot_entries(&entries)))
+        .map_err(|_| OperationError::Internal)
 }
 
 #[cfg(test)]
