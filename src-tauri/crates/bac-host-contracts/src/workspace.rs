@@ -26,6 +26,7 @@ pub use crate::wire::{
 };
 pub const DOCUMENT_MAX_BYTES: usize = 520_192;
 pub const SAVED_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub const CATALOG_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const SAVED_TOTAL_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const WINDOW_ID_JSON_BYTES: usize = 1_024;
 pub const SAVED_READ_MAX_ATTEMPTS: usize = 3;

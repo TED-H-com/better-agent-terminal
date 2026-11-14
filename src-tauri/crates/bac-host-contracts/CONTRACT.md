@@ -163,7 +163,12 @@ documents.
 Before the desktop host loads its registry, `windows.json` is not consulted;
 read and locate use saved profiles. An empty in-memory registry means no live
 placement, including in desktop-compiled servers. Neither operation seeds,
-repairs, or hydrates the catalog or registry. Remote and uncatalogued registry
+repairs, or hydrates the catalog or registry. Under the profile index lock, local
+catalog reads inspect both `index.json` and `index.json.bak` with
+`symlink_metadata` before reading; each must be absent or a regular file of at
+most 8 MiB (with at least one present), otherwise the operation returns
+`WORKSPACE_UNAVAILABLE` (or `LOCATION_UNAVAILABLE` with empty `profileIds` for
+locate) without reading either catalog file. Remote and uncatalogued registry
 entries are ignored. Saved profile reads inspect `metadata` (following symlinks) before opening,
 open with `O_NONBLOCK` on Unix, and require `is_file()` on the opened handle
 before reading. Missing paths and dangling symlinks produce no saved windows
