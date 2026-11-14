@@ -342,5 +342,52 @@ following guarantees:
   write, readback verification, index commit, or a panic at or after that
   point), any failure returns `WRITE_FAILED` with `{ "outcome": "unknown" }`.
 
-Live window write execution and remote dispatch are not yet available
-(`WORKSPACE_ADD_TERMINAL_ENABLED` is `false`).
+For a live window (`source: "live"`, `windowId: "<id>"`), `append` /
+`append_state` executes against the in-memory `WindowRegistryState` without
+loading, repairing, or seeding the registry (`ensure_entries_ready` is not
+called before target selection) with the following guarantees:
+
+- Target selection shares `live_target` with `bac:workspace-read`
+  (`execute_read`): among the profile's regular (`detached_workspace_id` is
+  `None`) registry entries that have content (`snapshot_has_content`), the entry
+  with the highest `last_active_at` is selected (`select_regular_entry`).
+- If any registry entry of `profileId` (regular or detached) has a `windowId`
+  whose compact JSON encoding exceeds `WINDOW_ID_JSON_BYTES` (`1,024` bytes
+  including quotes), `live_target` refuses with `WORKSPACE_UNAVAILABLE` without
+  falling back to the saved profile.
+- When `live_target` returns `None` because the profile has no regular window
+  with content (detached-only, contentless-only, or an empty registry),
+  `entries` is unlocked and the append delegates to the saved-profile path while
+  `runtime_meta` stays locked, passing `apply_runtime_workspace_meta` for
+  `profileId` as the runtime overlay.
+- The live write goes through upstream's own save path
+  (`save_workspace_locked`), so the files (`windows.json`, `workspace.json` when
+  `windowId == "main"`, and `profiles/<profileId>.json`) and bytes written are
+  the same writer and the same bytes as upstream's `workspace:save` for the same
+  document.
+- Upstream's snapshot writers (`persist_entries_at`,
+  `write_global_workspace_at`, `write_profile_snapshot_at`) do not report disk
+  write errors; after `save_workspace_locked` returns `true`, the updated
+  registry entry is read back via `workspace_value_from_snapshot` and checked
+  with `verify_readback`, so the reply revision and staged document reflect the
+  registry readback.
+- `prepare_append` applies `apply_runtime_workspace_meta` to produce the
+  prospective document and `save_workspace_locked` applies
+  `apply_runtime_workspace_meta` before storing the snapshot, so the runtime
+  overlay is part of the written document.
+- Lock, stage, and unwind rule: `runtime_meta` and `entries` are locked in that
+  order (a poisoned mutex returns `INTERNAL_ERROR` without recovery). Target
+  selection and `prepare_append` run inside `catch_unwind`; before the write
+  starts, any refusal returns its specific error and any panic returns
+  `INTERNAL_ERROR` without calling the writer or poisoning the registry mutexes.
+  From the write onward (including the saved-profile fallback, a writer return
+  of `false`, a missing entry or mismatch on readback, or any panic during the
+  write or readback), any failure returns `WRITE_FAILED` with
+  `{ "outcome": "unknown" }` while leaving the registry mutexes unpoisoned.
+- `live_window_ids_for_profile` / `live_window_ids_state` collects live webview
+  window IDs before locking `entries`, returns the profile's regular live window
+  IDs in registry order, skips detached and closed windows, and returns an empty
+  list if `entries` is poisoned.
+
+Remote dispatch is not yet available (`WORKSPACE_ADD_TERMINAL_ENABLED` is
+`false`).
