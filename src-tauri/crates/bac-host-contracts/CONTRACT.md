@@ -308,5 +308,39 @@ Append-specific operation errors:
 | `REVISION_MISMATCH` | `Workspace revision changed` | `true` | `{ "currentRevision": <revision> }` |
 | `WRITE_FAILED` | `Canonical workspace save failed; read back before retry` | `false` | `{ "outcome": "unknown" }` |
 
-Live and persisted workspace write execution is not yet available
+For a saved profile (`source: "persisted"`, `windowId: null`), `append_persisted`
+executes inside a single profile-index transaction (`update_index_at`) with the
+following guarantees:
+
+- Reserved Windows profile names (`is_reserved_profile_id`) are refused with
+  `WORKSPACE_UNAVAILABLE` before opening any file.
+- Inside the index lock, `catalog_files_acceptable` rechecks that `index.json`
+  and `index.json.bak` are each absent or a regular file of at most
+  `CATALOG_FILE_MAX_BYTES` (`8,388,608` bytes) with at least one present, and
+  `require_local_profile` checks the first catalog entry matching `profileId`
+  (`PROFILE_NOT_FOUND` or `PROFILE_NOT_LOCAL`).
+- The profile snapshot is read with `read_bounded_saved_file` and
+  `migrate_snapshot`. `NoSavedWindows` (missing file, dangling symlink, or
+  `"windows": []`) evaluates against `empty_workspace_document()` without
+  seeding or creating a profile file (stopping at `WORKSPACE_NOT_FOUND` when
+  `expectedRevision` matches the empty workspace revision).
+- Saved-profile append eligibility shares `saved_windows_append_eligible` with
+  `bac:workspace-read`: only a single-window snapshot whose raw `windows[0]` and
+  extracted workspace document satisfy the read eligibility check is accepted;
+  multi-window or otherwise ineligible snapshots return `WORKSPACE_UNAVAILABLE`
+  with the profile file untouched.
+- After `prepare_append` produces the overlaid prospective document (or aborts
+  without writing on an idempotent no-op or refusal), the snapshot is written
+  through upstream's profile writer (`snapshot_from_workspace` and
+  `write_snapshot_at`), re-read with `read_bounded_saved_file`, verified with
+  `verify_readback`, and activated in the profile index
+  (`activate_profile_in_index`) before the index commit.
+- Stage and unwind rule: the index closure runs inside `catch_unwind`. Before
+  the snapshot write starts, any I/O error or structural refusal returns
+  `WORKSPACE_UNAVAILABLE` (or the specific refusal), and a panic returns
+  `INTERNAL_ERROR`, without writing. Once the snapshot write starts (snapshot
+  write, readback verification, index commit, or a panic at or after that
+  point), any failure returns `WRITE_FAILED` with `{ "outcome": "unknown" }`.
+
+Live window write execution and remote dispatch are not yet available
 (`WORKSPACE_ADD_TERMINAL_ENABLED` is `false`).
