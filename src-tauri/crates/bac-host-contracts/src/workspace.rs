@@ -1017,6 +1017,214 @@ pub fn execute_locate(
     Ok(result)
 }
 
+pub fn normalize_registration(reg: &Registration) -> Value {
+    let mut map = Map::new();
+    map.insert("id".into(), Value::String(reg.id.clone()));
+    map.insert(
+        "workspaceId".into(),
+        Value::String(reg.workspace_id.clone()),
+    );
+    map.insert("title".into(), Value::String(reg.title.clone()));
+    map.insert("type".into(), Value::String("terminal".into()));
+    map.insert("cwd".into(), Value::String(reg.cwd.clone()));
+    map.insert(
+        "agentPreset".into(),
+        Value::String(reg.agent_preset.as_str().into()),
+    );
+    if let Some(model) = &reg.model {
+        map.insert("model".into(), Value::String(model.clone()));
+    }
+    if let Some(permission_mode) = &reg.permission_mode {
+        map.insert(
+            "permissionMode".into(),
+            Value::String(permission_mode.clone()),
+        );
+    }
+    if let Some(agent_params) = &reg.agent_params {
+        let params = agent_params
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect::<Map<_, _>>();
+        map.insert("agentParams".into(), Value::Object(params));
+    }
+    if let Some(worktree_path) = &reg.worktree_path {
+        map.insert("worktreePath".into(), Value::String(worktree_path.clone()));
+    }
+    match &reg.worktree_branch {
+        None => {}
+        Some(None) => {
+            map.insert("worktreeBranch".into(), Value::Null);
+        }
+        Some(Some(branch)) => {
+            map.insert("worktreeBranch".into(), Value::String(branch.clone()));
+        }
+    }
+    Value::Object(map)
+}
+
+fn find_terminal<'a>(value: &'a Value, terminal_id: &str) -> Option<&'a Map<String, Value>> {
+    if let Some(terminals) = value.get("terminals").and_then(Value::as_array) {
+        return terminals.iter().find_map(|item| {
+            let obj = item.as_object()?;
+            (obj.get("id").and_then(Value::as_str) == Some(terminal_id)).then_some(obj)
+        });
+    }
+    let obj = value.as_object()?;
+    (obj.get("id").and_then(Value::as_str) == Some(terminal_id)).then_some(obj)
+}
+
+pub fn effective_registration_equal(
+    stored_doc_with_overlay: &Value,
+    candidate_with_overlay: &Value,
+    terminal_id: &str,
+) -> bool {
+    let Some(stored) = find_terminal(stored_doc_with_overlay, terminal_id) else {
+        return false;
+    };
+    let Some(candidate) = find_terminal(candidate_with_overlay, terminal_id) else {
+        return false;
+    };
+    let default_type = Value::String("terminal".into());
+    if stored.get("type").unwrap_or(&default_type) != candidate.get("type").unwrap_or(&default_type)
+    {
+        return false;
+    }
+    for required in ["id", "workspaceId", "title", "cwd", "agentPreset"] {
+        if stored.get(required) != candidate.get(required) {
+            return false;
+        }
+    }
+    for optional in ["model", "permissionMode", "worktreePath"] {
+        if stored.get(optional).filter(|v| !v.is_null())
+            != candidate.get(optional).filter(|v| !v.is_null())
+        {
+            return false;
+        }
+    }
+    if stored.get("worktreeBranch") != candidate.get("worktreeBranch") {
+        return false;
+    }
+    let empty_params = Value::Object(Map::new());
+    let stored_params = stored
+        .get("agentParams")
+        .filter(|v| !v.is_null())
+        .unwrap_or(&empty_params);
+    let candidate_params = candidate
+        .get("agentParams")
+        .filter(|v| !v.is_null())
+        .unwrap_or(&empty_params);
+    stored_params == candidate_params
+}
+
+#[allow(clippy::result_large_err)]
+pub fn prepare_append(
+    host_id: &str,
+    request: &AppendRequest,
+    source: Source,
+    window_id: Option<String>,
+    current_doc: &Value,
+    mut overlay: impl FnMut(&mut Value),
+) -> Result<Value, TxAbort> {
+    if window_id
+        .as_deref()
+        .is_some_and(|id| !window_id_within_bound(id))
+        || !structural_preconditions_ok(current_doc)
+    {
+        return Err(TxAbort::Refused(OperationError::WorkspaceUnavailable));
+    }
+    let (current_revision, current_bytes) =
+        canonical_digest(current_doc).map_err(TxAbort::Refused)?;
+    let terminal_exists = current_doc
+        .get("terminals")
+        .and_then(Value::as_array)
+        .is_some_and(|terminals| {
+            terminals.iter().any(|item| {
+                item.get("id").and_then(Value::as_str) == Some(request.terminal.id.as_str())
+            })
+        });
+    let normalized = normalize_registration(&request.terminal);
+    if terminal_exists {
+        let mut stored_with_overlay = current_doc.clone();
+        overlay(&mut stored_with_overlay);
+        let mut candidate_with_overlay = json!({"terminals": [normalized]});
+        overlay(&mut candidate_with_overlay);
+        if effective_registration_equal(
+            &stored_with_overlay,
+            &candidate_with_overlay,
+            &request.terminal.id,
+        ) {
+            if current_bytes > DOCUMENT_MAX_BYTES {
+                return Err(TxAbort::Refused(OperationError::WorkspaceTooLarge));
+            }
+            return Err(TxAbort::Noop(AppendResult {
+                host_id: host_id.to_owned(),
+                profile_id: request.profile_id.clone(),
+                source,
+                window_id,
+                terminal_id: request.terminal.id.clone(),
+                appended: false,
+                revision: current_revision,
+            }));
+        }
+        return Err(TxAbort::Refused(OperationError::TerminalExists {
+            terminal_id: request.terminal.id.clone(),
+            current_revision,
+        }));
+    }
+    if request.expected_revision != current_revision {
+        return Err(TxAbort::Refused(OperationError::RevisionMismatch {
+            current_revision,
+        }));
+    }
+    let workspace_exists = current_doc
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .is_some_and(|workspaces| {
+            workspaces.iter().any(|item| {
+                item.get("id").and_then(Value::as_str)
+                    == Some(request.terminal.workspace_id.as_str())
+            })
+        });
+    if !workspace_exists {
+        return Err(TxAbort::Refused(OperationError::WorkspaceNotFound(
+            request.terminal.workspace_id.clone(),
+        )));
+    }
+    let mut prospective = current_doc.clone();
+    let Some(terminals) = prospective
+        .get_mut("terminals")
+        .and_then(Value::as_array_mut)
+    else {
+        return Err(TxAbort::Refused(OperationError::WorkspaceUnavailable));
+    };
+    terminals.push(normalized);
+    let (_, pre_overlay_bytes) = canonical_digest(&prospective).map_err(TxAbort::Refused)?;
+    overlay(&mut prospective);
+    let (_, post_overlay_bytes) = canonical_digest(&prospective).map_err(TxAbort::Refused)?;
+    if pre_overlay_bytes > DOCUMENT_MAX_BYTES || post_overlay_bytes > DOCUMENT_MAX_BYTES {
+        return Err(TxAbort::Refused(OperationError::WorkspaceTooLarge));
+    }
+    Ok(prospective)
+}
+
+pub fn verify_readback(
+    readback_doc: &Value,
+    expected_with_overlay: &Value,
+    terminal_id: &str,
+) -> Result<String, OperationError> {
+    if !structural_preconditions_ok(readback_doc)
+        || !effective_registration_equal(readback_doc, expected_with_overlay, terminal_id)
+    {
+        return Err(OperationError::WriteFailed);
+    }
+    let (new_revision, bytes) =
+        canonical_digest(readback_doc).map_err(|_| OperationError::WriteFailed)?;
+    if bytes > DOCUMENT_MAX_BYTES {
+        return Err(OperationError::WriteFailed);
+    }
+    Ok(new_revision)
+}
+
 #[cfg(test)]
 #[path = "workspace_tests.rs"]
 mod tests;
