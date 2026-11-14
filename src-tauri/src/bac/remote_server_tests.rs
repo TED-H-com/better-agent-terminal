@@ -81,6 +81,26 @@ mod bac_tests {
             }
         }
     }
+    fn invoke_collect(ws: &mut Socket, mut frame: Value) -> (Value, Vec<(String, Value)>) {
+        frame["type"] = json!("invoke");
+        frame["id"] = json!("request");
+        ws.send(Message::Text(frame.to_string().into())).unwrap();
+        let mut events = Vec::new();
+        loop {
+            let value = decode_remote_text_frame(&ws.read().unwrap().into_text().unwrap()).unwrap();
+            if value["type"] == "event" {
+                if let Some(channel @ ("profile:changed" | "workspace:reload")) =
+                    value["channel"].as_str()
+                {
+                    events.push((channel.to_owned(), value["params"].clone()));
+                }
+            }
+            if value["id"] == "request" {
+                assert_eq!(value["type"], "invoke-result", "{value}");
+                return (value["result"].clone(), events);
+            }
+        }
+    }
     fn hello(ws: &mut Socket) -> Value {
         invoke(
             ws,
@@ -97,6 +117,30 @@ mod bac_tests {
             .collect();
         result.sort();
         result
+    }
+    fn append_fixture(host: &TestHost) {
+        let profiles = host.dir.join("profiles");
+        let index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"remote","name":"Remote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        let snapshot = json!({"version":2,"windows":[{"workspaces":[{"id":"w"}],
+            "terminals":[{"id":"t","workspaceId":"w"}]}]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("default.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+    }
+    fn append_params(revision: &Value, id: &str) -> Value {
+        json!({"profileId":"default","expectedRevision":revision,
+            "terminal":{"id":id,"workspaceId":"w","title":"Term 2","type":"terminal",
+                "cwd":"/repo","agentPreset":"codex-agent"}})
     }
     #[test]
     fn auth_bytes_only_add_constant_capability_and_v1_is_unchanged() {
@@ -285,6 +329,147 @@ mod bac_tests {
         b.close(None).unwrap();
         reconnect.close(None).unwrap();
     }
+    #[test]
+    fn ws_add_terminal_appends_to_the_saved_profile_and_notifies_remote_clients() {
+        let host = TestHost::new();
+        append_fixture(&host);
+        let (mut a, _, _) = connect(&host, true);
+        let (mut b, _, _) = connect(&host, true);
+        let negotiated = hello(&mut a);
+        assert_eq!(negotiated["ok"], true);
+        let read_frame = json!({"channel":"bac:workspace-read","params":{"profileId":"default"}});
+        let before = invoke(&mut a, read_frame.clone());
+        assert_eq!(before["ok"], true);
+        let r1 = before["value"]["revision"].clone();
+        let params = append_params(&r1, "t2");
+        let (reply, events) = invoke_collect(
+            &mut a,
+            json!({"channel":"bac:workspace-add-terminal","params":params}),
+        );
+        assert_eq!(reply["ok"], true, "{reply}");
+        let r2 = reply["value"]["revision"].clone();
+        assert!(r2.is_string());
+        assert_ne!(r2, r1);
+        assert_eq!(
+            reply,
+            json!({"ok":true,"value":{"hostId":negotiated["value"]["hostId"],
+                "profileId":"default","source":"persisted","windowId":null,
+                "terminalId":"t2","appended":true,"revision":r2}})
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "profile:changed");
+        assert!(events[0].1["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|profile| profile["id"] == "default"));
+        assert_eq!(events[1].0, "workspace:reload");
+        let reload = &events[1].1;
+        let mut keys: Vec<_> = reload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["data", "profileId"]);
+        assert_eq!(reload["profileId"], "default");
+        let document: Value = serde_json::from_str(reload["data"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            document["terminals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|terminal| terminal["id"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("t"), json!("t2")]
+        );
+        let (refused, b_events) = invoke_collect(&mut b, read_frame.clone());
+        assert_eq!(error(refused), "NOT_OPTED_IN");
+        assert_eq!(b_events, events);
+        let after = invoke(&mut a, read_frame);
+        assert_eq!(after["ok"], true);
+        assert_eq!(after["value"]["revision"], r2);
+        assert_eq!(
+            after["value"]["document"]["terminals"][1],
+            params["terminal"]
+        );
+        a.close(None).unwrap();
+        b.close(None).unwrap();
+    }
+
+    #[test]
+    fn ws_add_terminal_noop_and_stale_revision_change_nothing_and_send_no_events() {
+        let host = TestHost::new();
+        append_fixture(&host);
+        let (mut a, _, _) = connect(&host, true);
+        let (mut b, _, _) = connect(&host, true);
+        assert_eq!(hello(&mut a)["ok"], true);
+        let read_frame = json!({"channel":"bac:workspace-read","params":{"profileId":"default"}});
+        let before = invoke(&mut a, read_frame.clone());
+        assert_eq!(before["ok"], true);
+        let r1 = before["value"]["revision"].clone();
+        let params = append_params(&r1, "t2");
+        let frame = json!({"channel":"bac:workspace-add-terminal","params":params});
+        let (first, events) = invoke_collect(&mut a, frame.clone());
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["value"]["appended"], true);
+        assert_eq!(events.len(), 2);
+        let r2 = first["value"]["revision"].clone();
+        assert_ne!(r2, r1);
+        let (refused, b_events) = invoke_collect(&mut b, read_frame.clone());
+        assert_eq!(error(refused), "NOT_OPTED_IN");
+        assert_eq!(b_events, events);
+        let saved = host.dir.join("profiles/default.json");
+        let baseline = fs::read(&saved).unwrap();
+
+        let (noop, events) = invoke_collect(&mut a, frame);
+        let mut expected_noop = first.clone();
+        expected_noop["value"]["appended"] = json!(false);
+        assert_eq!(noop, expected_noop);
+        assert!(events.is_empty());
+        assert_eq!(fs::read(&saved).unwrap(), baseline);
+
+        let (stale, events) = invoke_collect(
+            &mut a,
+            json!({"channel":"bac:workspace-add-terminal","params":append_params(&r1, "t3")}),
+        );
+        assert_eq!(error(stale.clone()), "REVISION_MISMATCH");
+        assert_eq!(stale["error"]["retryable"], true);
+        assert_eq!(stale["error"]["details"], json!({"currentRevision":r2}));
+        assert!(events.is_empty());
+        assert_eq!(fs::read(&saved).unwrap(), baseline);
+
+        let mut different = append_params(&r2, "t2");
+        different["terminal"]["title"] = json!("Other");
+        let (exists, events) = invoke_collect(
+            &mut a,
+            json!({"channel":"bac:workspace-add-terminal","params":different}),
+        );
+        assert_eq!(error(exists.clone()), "TERMINAL_EXISTS");
+        assert_eq!(
+            exists["error"]["details"],
+            json!({"terminalId":"t2","currentRevision":r2})
+        );
+        assert!(events.is_empty());
+        assert_eq!(fs::read(&saved).unwrap(), baseline);
+
+        let mut remote = append_params(&r2, "t3");
+        remote["profileId"] = json!("remote");
+        let (not_local, events) = invoke_collect(
+            &mut a,
+            json!({"channel":"bac:workspace-add-terminal","params":remote}),
+        );
+        assert_eq!(error(not_local), "PROFILE_NOT_LOCAL");
+        assert!(events.is_empty());
+        assert_eq!(fs::read(&saved).unwrap(), baseline);
+        let (refused, events) = invoke_collect(&mut b, read_frame);
+        assert_eq!(error(refused), "NOT_OPTED_IN");
+        assert!(events.is_empty());
+        a.close(None).unwrap();
+        b.close(None).unwrap();
+    }
+
     #[test]
     fn ws_read_and_locate_empty_registry_persisted_roundtrip() {
         let host = TestHost::new();
