@@ -12,11 +12,27 @@ pub const GIT_INDEX_BYTES_LIMIT: usize = 16_777_216;
 pub const GIT_PATHS_LIMIT: usize = 10_000;
 pub const GIT_TIMEOUT_MS_LIMIT: usize = 5_000;
 pub const GIT_ATTEMPTS_LIMIT: usize = 2;
-pub const STAGE_A_CHANNELS: [(&str, &str); 4] = [
-    ("bac:workspace-read", "workspaceRead"),
-    ("bac:workspace-add-terminal", "workspaceAddTerminal"),
-    ("bac:session-locate", "sessionLocate"),
-    ("bac:git-observe", "gitObserve"),
+pub const WORKSPACE_READ_ENABLED: bool = true;
+pub const WORKSPACE_ADD_TERMINAL_ENABLED: bool = false;
+pub const SESSION_LOCATE_ENABLED: bool = true;
+pub const GIT_OBSERVE_ENABLED: bool = false;
+pub const STAGE_A_CHANNELS: [(&str, &str, bool); 4] = [
+    (
+        "bac:workspace-read",
+        "workspaceRead",
+        WORKSPACE_READ_ENABLED,
+    ),
+    (
+        "bac:workspace-add-terminal",
+        "workspaceAddTerminal",
+        WORKSPACE_ADD_TERMINAL_ENABLED,
+    ),
+    (
+        "bac:session-locate",
+        "sessionLocate",
+        SESSION_LOCATE_ENABLED,
+    ),
+    ("bac:git-observe", "gitObserve", GIT_OBSERVE_ENABLED),
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,11 +146,16 @@ fn build() -> Value {
 }
 
 pub fn hello_value(host: &str) -> Value {
+    let features: serde_json::Map<String, Value> = STAGE_A_CHANNELS
+        .iter()
+        .map(|(_, feature, enabled)| ((*feature).to_owned(), Value::Bool(*enabled)))
+        .collect();
     json!({"protocol":"bac/1","minor":0,"hostId":host,"build":build(),
-        "features":{"workspaceRead":false,"workspaceAddTerminal":false,"sessionLocate":false,"gitObserve":false},
-        "limits":{"requestBytes":REQUEST_BYTES,"resultBytes":RESULT_BYTES,"registrationBytes":16384,
-            "profiles":256,"terminals":4096,"locationMatches":100,"gitStatusBytes":4194304,
-            "gitIndexBytes":16777216,"gitPaths":10000,"gitTimeoutMs":5000,"gitAttempts":2}})
+        "features":features,
+        "limits":{"requestBytes":REQUEST_BYTES,"resultBytes":RESULT_BYTES,"registrationBytes":REGISTRATION_BYTES,
+            "profiles":PROFILES_LIMIT,"terminals":TERMINALS_LIMIT,"locationMatches":LOCATION_MATCHES_LIMIT,
+            "gitStatusBytes":GIT_STATUS_BYTES_LIMIT,"gitIndexBytes":GIT_INDEX_BYTES_LIMIT,
+            "gitPaths":GIT_PATHS_LIMIT,"gitTimeoutMs":GIT_TIMEOUT_MS_LIMIT,"gitAttempts":GIT_ATTEMPTS_LIMIT}})
 }
 
 pub fn valid_host_id(s: &str) -> bool {
@@ -148,114 +169,151 @@ pub fn valid_host_id(s: &str) -> bool {
 /// One per websocket. No I/O or host identity is acquired by construction.
 #[derive(Default)]
 pub struct Connection {
-    negotiated: Mutex<bool>,
+    negotiated: Mutex<Option<String>>,
+}
+
+enum Prepared {
+    Hello(Value),
+    Feature {
+        host_id: String,
+        request: crate::workspace::Request,
+    },
 }
 
 impl Connection {
-    /// The loader is called only by a shape-valid, context-free hello. Storage
-    /// errors follow version negotiation; no provider fallback.
+    /// Feature work starts only after preparation has released the negotiation lock.
     pub fn invoke(
         &self,
         v2: bool,
         channel: &str,
         frame: &Value,
         load_identity: impl FnOnce() -> Result<String, Error>,
+        run: impl FnOnce(
+            &str,
+            crate::workspace::Request,
+        ) -> Result<Value, crate::workspace::OperationError>,
     ) -> Value {
-        let result = self
-            .handle(v2, channel, frame, load_identity)
-            .map(|value| json!({"ok":true,"value":value}))
-            .unwrap_or_else(|err| err.reply());
-        bound_result(&frame["id"], result)
+        let result = match self.prepare(v2, channel, frame, load_identity) {
+            Ok(Prepared::Hello(value)) => json!({"ok":true,"value":value}),
+            Ok(Prepared::Feature { host_id, request }) => match run(&host_id, request) {
+                Ok(value) => json!({"ok":true,"value":value}),
+                Err(error) => error.reply(),
+            },
+            Err(reply) => reply,
+        };
+        bound_result(frame.get("id").unwrap_or(&Value::Null), result)
     }
 
-    fn handle(
+    fn prepare(
         &self,
         v2: bool,
         channel: &str,
         frame: &Value,
         load_identity: impl FnOnce() -> Result<String, Error>,
-    ) -> Result<Value, Error> {
-        let mut negotiated = self.negotiated.lock().map_err(|_| Error::Internal)?;
+    ) -> Result<Prepared, Value> {
+        let mut negotiated = self
+            .negotiated
+            .lock()
+            .map_err(|_| Error::Internal.reply())?;
         let hello = channel == "bac:hello";
-        if !hello && !*negotiated {
-            return Err(Error::NotOptedIn);
+        if !hello && negotiated.is_none() {
+            return Err(Error::NotOptedIn.reply());
         }
-        let object = frame.as_object().ok_or(Error::InvalidRequest("frame"))?;
-        if frame["type"] != "invoke" {
-            return Err(Error::InvalidRequest("type"));
+        let object = frame
+            .as_object()
+            .ok_or_else(|| Error::InvalidRequest("frame").reply())?;
+        if object.get("type").and_then(Value::as_str) != Some("invoke") {
+            return Err(Error::InvalidRequest("type").reply());
         }
-        if !frame["id"]
-            .as_str()
+        if !object
+            .get("id")
+            .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty() && s.len() <= 128 && !s.contains('\0'))
         {
-            return Err(Error::InvalidRequest("id"));
+            return Err(Error::InvalidRequest("id").reply());
         }
-        if frame["channel"].as_str() != Some(channel)
+        if object.get("channel").and_then(Value::as_str) != Some(channel)
             || channel.len() > 128
             || channel.contains('\0')
         {
-            return Err(Error::InvalidRequest("channel"));
+            return Err(Error::InvalidRequest("channel").reply());
         }
         if object
             .keys()
             .any(|k| !["type", "id", "channel", "params", "contextId"].contains(&k.as_str()))
         {
-            return Err(Error::InvalidRequest("frame"));
+            return Err(Error::InvalidRequest("frame").reply());
         }
-        let params = frame["params"]
+        let params_value = object
+            .get("params")
+            .ok_or_else(|| Error::InvalidRequest("params").reply())?;
+        let params = params_value
             .as_object()
-            .ok_or(Error::InvalidRequest("params"))?;
+            .ok_or_else(|| Error::InvalidRequest("params").reply())?;
         if hello {
             if params
                 .keys()
                 .any(|k| !["protocol", "minor", "expectedHostId"].contains(&k.as_str()))
             {
-                return Err(Error::InvalidRequest("params"));
+                return Err(Error::InvalidRequest("params").reply());
             }
             if !params
                 .get("protocol")
                 .is_some_and(|v| v.as_str().is_some_and(|s| !s.contains('\0')))
             {
-                return Err(Error::InvalidRequest("params.protocol"));
+                return Err(Error::InvalidRequest("params.protocol").reply());
             }
             if !params.get("minor").is_some_and(|v| v.as_u64().is_some()) {
-                return Err(Error::InvalidRequest("params.minor"));
+                return Err(Error::InvalidRequest("params.minor").reply());
             }
             if let Some(expected) = params.get("expectedHostId") {
                 if !expected.as_str().is_some_and(valid_host_id) {
-                    return Err(Error::InvalidRequest("params.expectedHostId"));
+                    return Err(Error::InvalidRequest("params.expectedHostId").reply());
                 }
             }
         }
         if serde_json::to_vec(frame)
-            .map_err(|_| Error::Internal)?
+            .map_err(|_| Error::Internal.reply())?
             .len()
             > REQUEST_BYTES
         {
-            return Err(Error::PayloadTooLarge);
+            return Err(Error::PayloadTooLarge.reply());
         }
         if object.contains_key("contextId") {
-            return Err(Error::ContextNotSupported);
+            return Err(Error::ContextNotSupported.reply());
         }
         if hello {
-            if !v2 || params["protocol"] != "bac/1" || params["minor"] != 0 {
-                return Err(Error::UnsupportedVersion);
+            if !v2
+                || params.get("protocol").and_then(Value::as_str) != Some("bac/1")
+                || params.get("minor").and_then(Value::as_u64) != Some(0)
+            {
+                return Err(Error::UnsupportedVersion.reply());
             }
-            let host = load_identity()?;
+            let host = load_identity().map_err(|error| error.reply())?;
             if params
                 .get("expectedHostId")
                 .is_some_and(|expected| expected != &host)
             {
-                // An explicit identity mismatch revokes any earlier negotiation.
-                *negotiated = false;
-                return Err(Error::HostMismatch(host));
+                *negotiated = None;
+                return Err(Error::HostMismatch(host).reply());
             }
-            *negotiated = true;
-            return Ok(hello_value(&host));
+            *negotiated = Some(host.clone());
+            return Ok(Prepared::Hello(hello_value(&host)));
         }
-        match STAGE_A_CHANNELS.iter().find(|(name, _)| *name == channel) {
-            Some((_, feature)) => Err(Error::UnsupportedFeature(feature)),
-            None => Err(Error::UnknownChannel),
+        match STAGE_A_CHANNELS
+            .iter()
+            .find(|(name, _, _)| *name == channel)
+        {
+            None => Err(Error::UnknownChannel.reply()),
+            Some((_, feature, false)) => Err(Error::UnsupportedFeature(feature).reply()),
+            Some((_, _, true)) => {
+                let request = crate::workspace::parse_request(channel, params_value)
+                    .map_err(|error| error.reply())?;
+                let host_id = negotiated
+                    .clone()
+                    .ok_or_else(|| Error::NotOptedIn.reply())?;
+                Ok(Prepared::Feature { host_id, request })
+            }
         }
     }
 }

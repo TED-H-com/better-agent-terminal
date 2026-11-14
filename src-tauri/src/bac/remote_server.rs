@@ -194,11 +194,13 @@ impl Connection {
         sink: ContextSink,
     ) -> Result<Value, String> {
         if channel.starts_with("bac:") {
-            return Ok(self
-                .0
-                .invoke(protocol == RemoteProtocol::V2, channel, frame, || {
-                    identity(ctx)
-                }));
+            return Ok(self.0.invoke(
+                protocol == RemoteProtocol::V2,
+                channel,
+                frame,
+                || identity(ctx),
+                |host_id, request| dispatch(ctx, host_id, request),
+            ));
         }
         super::invoke_with_profile_context(ctx, sidecar, protocol, channel, frame, contexts, sink)
     }

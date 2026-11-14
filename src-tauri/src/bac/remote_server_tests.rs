@@ -245,6 +245,8 @@ mod bac_tests {
                 error(invoke(&mut a, json!({"channel":name,"params":{}}))),
                 if name == "bac:future" {
                     "UNKNOWN_CHANNEL"
+                } else if name == "bac:workspace-read" || name == "bac:session-locate" {
+                    "INVALID_REQUEST"
                 } else {
                     "UNSUPPORTED_FEATURE"
                 }
@@ -279,6 +281,162 @@ mod bac_tests {
         assert_eq!(hello(&mut reconnect), first);
         b.close(None).unwrap();
         reconnect.close(None).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ws_read_and_locate_empty_registry_persisted_roundtrip() {
+        use std::{
+            ffi::CString,
+            io::Write,
+            os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+            sync::mpsc,
+            time::Instant,
+        };
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"empty","name":"Empty","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"remote","name":"Remote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        let snapshot = json!({"version":2,"windows":[{"workspaces":[{"id":"w"}],
+            "terminals":[{"id":"t","workspaceId":"w"}]}]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("default.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("empty.json"),
+            br#"{"version":2,"windows":[]}"#,
+        )
+        .unwrap();
+
+        let (mut ws, _, _) = connect(&host, true);
+        let first = hello(&mut ws);
+        assert_eq!(first["ok"], true);
+        assert_eq!(
+            first["value"]["features"],
+            json!({
+                "workspaceRead":true,"workspaceAddTerminal":false,"sessionLocate":true,"gitObserve":false
+            })
+        );
+        assert_eq!(
+            first["value"]["limits"],
+            json!({
+                "requestBytes":65536,"resultBytes":524288,"registrationBytes":16384,
+                "profiles":256,"terminals":4096,"locationMatches":100,"gitStatusBytes":4194304,
+                "gitIndexBytes":16777216,"gitPaths":10000,"gitTimeoutMs":5000,"gitAttempts":2
+            })
+        );
+        let read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"default"}}),
+        );
+        assert_eq!(read["ok"], true);
+        assert_eq!(read["value"]["source"], "persisted");
+        assert!(read["value"]["windowId"].is_null());
+        assert_eq!(read["value"]["document"]["terminals"][0]["id"], "t");
+        let empty = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"empty"}}),
+        );
+        assert_eq!(
+            empty["value"]["revision"],
+            "sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c"
+        );
+        assert_eq!(empty["value"]["appendTargetEligible"], false);
+        let locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t"}}),
+        );
+        assert_eq!(locate["value"]["disposition"], "located");
+        assert_eq!(locate["value"]["consistency"], "sequential");
+        assert_eq!(locate["value"]["atomic"], false);
+        assert_eq!(locate["value"]["locations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            locate["value"]["locations"][0]["profileRevision"],
+            read["value"]["revision"]
+        );
+
+        // A FIFO holds the bounded saved read inside dispatch while a second
+        // invoke on this same connection must still complete its hello.
+        let path = profiles.join("default.json");
+        fs::remove_file(&path).unwrap();
+        let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let writer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut file = loop {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path)
+                {
+                    Ok(file) => break file,
+                    Err(error)
+                        if error.raw_os_error() == Some(libc::ENXIO)
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("FIFO reader did not start: {error}"),
+                }
+            };
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            file.write_all(&bytes).unwrap();
+        });
+        ws.send(Message::Text(
+            json!({"type":"invoke","id":"slow-read",
+            "channel":"bac:workspace-read","params":{"profileId":"default"}})
+            .to_string()
+            .into(),
+        ))
+        .unwrap();
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("saved read did not start");
+        ws.send(Message::Text(
+            json!({"type":"invoke","id":"during-read",
+            "channel":"bac:hello","params":{"protocol":"bac/1","minor":0}})
+            .to_string()
+            .into(),
+        ))
+        .unwrap();
+        loop {
+            let value = decode_remote_text_frame(&ws.read().unwrap().into_text().unwrap()).unwrap();
+            if value["id"] == "during-read" {
+                assert_eq!(value["result"], first);
+                break;
+            }
+            assert_ne!(
+                value["id"], "slow-read",
+                "slow read returned before release"
+            );
+        }
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        loop {
+            let value = decode_remote_text_frame(&ws.read().unwrap().into_text().unwrap()).unwrap();
+            if value["id"] == "slow-read" {
+                assert_eq!(value["result"]["ok"], true);
+                assert_eq!(
+                    value["result"]["value"]["revision"],
+                    read["value"]["revision"]
+                );
+                break;
+            }
+        }
+        ws.close(None).unwrap();
     }
     #[test]
     fn wire_hello_validation_and_expected_identity() {

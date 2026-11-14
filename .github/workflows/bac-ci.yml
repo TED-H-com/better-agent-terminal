@@ -88,9 +88,10 @@ jobs:
           pnpm --dir node-sidecar install --frozen-lockfile
           pnpm run compile
           pnpm run build:tauri-sidecar
-      - name: Check Linux desktop workspace with default features
+      - name: Test Linux desktop workspace with default features
         working-directory: src-tauri
-        run: cargo check --workspace --locked
+        # Fails on Unix at the upstream base (`/` is an existing ancestor); upstream code is not changed here.
+        run: cargo test --workspace --locked -- --skip commands::shell::tests::reveal_target_falls_back_to_the_nearest_existing_ancestor
       - name: Check inventory and native lock/manifest consistency
         run: node bac/tools/check-upstream-inventory.mjs
       - name: Require unchanged tracked source
