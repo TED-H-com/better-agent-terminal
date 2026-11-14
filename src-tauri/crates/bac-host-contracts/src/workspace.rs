@@ -20,6 +20,7 @@ pub const SAVED_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const CATALOG_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const SAVED_TOTAL_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const WINDOW_ID_JSON_BYTES: usize = 1_024;
+pub const AGENT_PARAMS_LIMIT: usize = 32;
 pub const SAVED_READ_MAX_ATTEMPTS: usize = 3;
 pub const SAVED_READ_RETRY_DELAY: Duration = Duration::from_millis(20);
 
@@ -31,10 +32,59 @@ pub struct ReadRequest {
 pub struct LocateRequest {
     pub session_id: String,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPreset {
+    ClaudeCode,
+    ClaudeCodeWorktree,
+    CodexAgent,
+    CodexAgentWorktree,
+}
+impl AgentPreset {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::ClaudeCodeWorktree => "claude-code-worktree",
+            Self::CodexAgent => "codex-agent",
+            Self::CodexAgentWorktree => "codex-agent-worktree",
+        }
+    }
+
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "claude-code" => Some(Self::ClaudeCode),
+            "claude-code-worktree" => Some(Self::ClaudeCodeWorktree),
+            "codex-agent" => Some(Self::CodexAgent),
+            "codex-agent-worktree" => Some(Self::CodexAgentWorktree),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Registration {
+    pub id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub agent_preset: AgentPreset,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub agent_params: Option<BTreeMap<String, String>>,
+    pub worktree_path: Option<String>,
+    pub worktree_branch: Option<Option<String>>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendRequest {
+    pub profile_id: String,
+    pub expected_revision: String,
+    pub terminal: Registration,
+}
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     WorkspaceRead(ReadRequest),
     SessionLocate(LocateRequest),
+    WorkspaceAddTerminal(AppendRequest),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -94,6 +144,34 @@ pub struct LocateResult {
     pub atomic: bool,
     pub locations: Vec<LocateRow>,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendResult {
+    pub host_id: String,
+    pub profile_id: String,
+    pub source: Source,
+    pub window_id: Option<String>,
+    pub terminal_id: String,
+    pub appended: bool,
+    pub revision: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedAppend {
+    pub result: AppendResult,
+    pub document: Option<String>,
+    pub profile_changed: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TxAbort {
+    Noop(AppendResult),
+    Refused(OperationError),
+}
+impl std::fmt::Display for TxAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BAC workspace transaction aborted")
+    }
+}
+impl std::error::Error for TxAbort {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationError {
@@ -193,10 +271,189 @@ pub fn window_id_within_bound(id: &str) -> bool {
     serde_json::to_string(id).is_ok_and(|encoded| encoded.len() <= WINDOW_ID_JSON_BYTES)
 }
 
+pub fn valid_revision(s: &str) -> bool {
+    s.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn valid_non_empty_text(s: &str) -> bool {
+    !s.is_empty() && !s.contains('\0')
+}
+
+fn parse_optional_string(
+    object: &Map<String, Value>,
+    key: &str,
+    field: &'static str,
+) -> Result<Option<String>, OperationError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if valid_non_empty_text(value) => Ok(Some(value.clone())),
+        Some(_) => Err(OperationError::InvalidRequest(field)),
+    }
+}
+
+fn parse_registration(terminal_value: &Value) -> Result<Registration, OperationError> {
+    let terminal = terminal_value
+        .as_object()
+        .ok_or(OperationError::InvalidRequest("params.terminal"))?;
+    const TERMINAL_KEYS: [&str; 11] = [
+        "id",
+        "workspaceId",
+        "title",
+        "type",
+        "cwd",
+        "agentPreset",
+        "model",
+        "permissionMode",
+        "agentParams",
+        "worktreePath",
+        "worktreeBranch",
+    ];
+    if terminal
+        .keys()
+        .any(|name| !TERMINAL_KEYS.contains(&name.as_str()))
+    {
+        return Err(OperationError::InvalidRequest("params.terminal"));
+    }
+    let id = terminal
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .ok_or(OperationError::InvalidRequest("params.terminal.id"))?
+        .to_owned();
+    let workspace_id = terminal
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .ok_or(OperationError::InvalidRequest(
+            "params.terminal.workspaceId",
+        ))?
+        .to_owned();
+    let title = terminal
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|s| valid_non_empty_text(s))
+        .ok_or(OperationError::InvalidRequest("params.terminal.title"))?
+        .to_owned();
+    if terminal.get("type").and_then(Value::as_str) != Some("terminal") {
+        return Err(OperationError::InvalidRequest("params.terminal.type"));
+    }
+    let cwd = terminal
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| valid_non_empty_text(s))
+        .ok_or(OperationError::InvalidRequest("params.terminal.cwd"))?
+        .to_owned();
+    let agent_preset = terminal
+        .get("agentPreset")
+        .and_then(Value::as_str)
+        .and_then(AgentPreset::from_wire)
+        .ok_or(OperationError::InvalidRequest(
+            "params.terminal.agentPreset",
+        ))?;
+    let model = parse_optional_string(terminal, "model", "params.terminal.model")?;
+    let permission_mode =
+        parse_optional_string(terminal, "permissionMode", "params.terminal.permissionMode")?;
+    let agent_params = match terminal.get("agentParams") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(entries)) => {
+            if entries.len() > AGENT_PARAMS_LIMIT {
+                return Err(OperationError::InvalidRequest(
+                    "params.terminal.agentParams",
+                ));
+            }
+            let mut parsed = BTreeMap::new();
+            for (key, value) in entries {
+                let Some(val) = value.as_str() else {
+                    return Err(OperationError::InvalidRequest(
+                        "params.terminal.agentParams",
+                    ));
+                };
+                if !valid_non_empty_text(key) || val.contains('\0') {
+                    return Err(OperationError::InvalidRequest(
+                        "params.terminal.agentParams",
+                    ));
+                }
+                parsed.insert(key.clone(), val.to_owned());
+            }
+            Some(parsed)
+        }
+        Some(_) => {
+            return Err(OperationError::InvalidRequest(
+                "params.terminal.agentParams",
+            ))
+        }
+    };
+    let worktree_path =
+        parse_optional_string(terminal, "worktreePath", "params.terminal.worktreePath")?;
+    let worktree_branch = match terminal.get("worktreeBranch") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(branch)) if valid_non_empty_text(branch) => Some(Some(branch.clone())),
+        Some(_) => {
+            return Err(OperationError::InvalidRequest(
+                "params.terminal.worktreeBranch",
+            ))
+        }
+    };
+    if serde_json::to_vec(terminal_value)
+        .map_err(|_| OperationError::Internal)?
+        .len()
+        > REGISTRATION_BYTES
+    {
+        return Err(OperationError::InvalidRequest("params.terminal"));
+    }
+    Ok(Registration {
+        id,
+        workspace_id,
+        title,
+        cwd,
+        agent_preset,
+        model,
+        permission_mode,
+        agent_params,
+        worktree_path,
+        worktree_branch,
+    })
+}
+
 pub fn parse_request(channel: &str, params: &Value) -> Result<Request, OperationError> {
     let object = params
         .as_object()
         .ok_or(OperationError::InvalidRequest("params"))?;
+    if channel == "bac:workspace-add-terminal" {
+        if object
+            .keys()
+            .any(|name| !["profileId", "expectedRevision", "terminal"].contains(&name.as_str()))
+        {
+            return Err(OperationError::InvalidRequest("params"));
+        }
+        let profile_id = object
+            .get("profileId")
+            .and_then(Value::as_str)
+            .filter(|id| valid_profile_id(id))
+            .ok_or(OperationError::InvalidRequest("params.profileId"))?
+            .to_owned();
+        let expected_revision = object
+            .get("expectedRevision")
+            .and_then(Value::as_str)
+            .filter(|rev| valid_revision(rev))
+            .ok_or(OperationError::InvalidRequest("params.expectedRevision"))?
+            .to_owned();
+        let terminal_value = object
+            .get("terminal")
+            .ok_or(OperationError::InvalidRequest("params.terminal"))?;
+        let terminal = parse_registration(terminal_value)?;
+        return Ok(Request::WorkspaceAddTerminal(AppendRequest {
+            profile_id,
+            expected_revision,
+            terminal,
+        }));
+    }
     let (key, field, validator): (_, _, fn(&str) -> bool) = match channel {
         "bac:workspace-read" => ("profileId", "params.profileId", valid_profile_id),
         "bac:session-locate" => ("sessionId", "params.sessionId", valid_id),

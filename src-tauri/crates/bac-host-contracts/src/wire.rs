@@ -174,6 +174,7 @@ pub struct Connection {
     negotiated: Mutex<Option<String>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Prepared {
     Hello(Value),
     Feature {

@@ -185,7 +185,9 @@ fn dispatch(
     #[cfg(not(feature = "desktop"))]
     let entries = Vec::new();
     let catalog_unavailable = || match &request {
-        Request::WorkspaceRead(_) => OperationError::WorkspaceUnavailable,
+        Request::WorkspaceRead(_) | Request::WorkspaceAddTerminal(_) => {
+            OperationError::WorkspaceUnavailable
+        }
         Request::SessionLocate(_) => OperationError::LocationUnavailable(vec![]),
     };
     let dir = profiles_dir(ctx).ok_or_else(catalog_unavailable)?;
@@ -194,6 +196,9 @@ fn dispatch(
         other => other,
     })?;
     let value = match request {
+        // Not routed while `WORKSPACE_ADD_TERMINAL_ENABLED` is false; the append path replaces
+        // this arm when the operation is enabled.
+        Request::WorkspaceAddTerminal(_) => return Err(OperationError::Internal),
         Request::WorkspaceRead(request) => {
             let result = execute_read(
                 host_id,
