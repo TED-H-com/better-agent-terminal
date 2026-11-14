@@ -35,6 +35,7 @@ class Readback:
         # This connection is only to our own disposable loopback listener.
         # The actual generated certificate is retained and compared on restart.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         self.sock = context.wrap_socket(
