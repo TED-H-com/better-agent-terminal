@@ -72,7 +72,6 @@ pub(super) fn observe_state(
         .map_err(|_| OperationError::Internal)
 }
 
-#[allow(dead_code)]
 pub(crate) fn append(
     app: &AppHandle,
     host_id: &str,
@@ -205,7 +204,6 @@ fn append_state_at(
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn live_window_ids_for_profile(app: &AppHandle, profile_id: &str) -> Vec<String> {
     let live = app
         .webview_windows()

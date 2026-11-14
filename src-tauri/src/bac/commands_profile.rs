@@ -8,8 +8,6 @@
         clippy::indexing_slicing
     )
 )]
-// Used once bac:workspace-add-terminal is wired into the remote dispatcher.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::*;
 use bac_host_contracts::workspace::{
@@ -63,6 +61,11 @@ pub(crate) fn append_persisted(
     overlay: &mut dyn FnMut(&mut Value),
 ) -> Result<StagedAppend, OperationError> {
     transact(dir, host_id, request, overlay, cfg!(windows), |_| Ok(()))
+}
+
+/// Publishes `profile:changed` as upstream's remote save does after its index transaction.
+pub(crate) fn emit_changed(app: &HostContext) {
+    emit_profile_changed(app);
 }
 
 #[cfg(test)]

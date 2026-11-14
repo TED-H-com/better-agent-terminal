@@ -118,8 +118,7 @@ fn collect_saved_with(
     ),
 ) -> Result<(Vec<workspace::SavedProfile>, Vec<String>), workspace::OperationError> {
     use workspace::{
-        local_catalog_profiles, OperationError, SavedProfile, SavedReadError,
-        SAVED_TOTAL_MAX_BYTES,
+        local_catalog_profiles, OperationError, SavedProfile, SavedReadError, SAVED_TOTAL_MAX_BYTES,
     };
     let local = local_catalog_profiles(catalog)?;
     let guard = LOCATE_MUTEX.lock().map_err(|_| OperationError::Internal)?;
@@ -158,10 +157,113 @@ fn collect_local_saved(
     collect_saved_with(catalog, |profile_id| read_saved_profile(dir, profile_id))
 }
 
-use crate::commands::profile::bac_workspace::{first_saved_document, saved_document};
+use crate::commands::profile::bac_workspace::{
+    append_persisted, emit_changed, first_saved_document, saved_document,
+};
 
 fn profiles_dir(ctx: &HostContext) -> Option<PathBuf> {
     ctx.data_dir_opt().map(|dir| dir.join("profiles"))
+}
+
+#[derive(Debug, PartialEq)]
+enum AppendEvent {
+    ProfileChanged,
+    Window(String, Value),
+    Broadcast(Value),
+}
+
+fn append_events(
+    profile_id: &str,
+    staged: &workspace::StagedAppend,
+    live_windows: &[String],
+) -> Vec<AppendEvent> {
+    use serde_json::json;
+    let Some(data) = staged.document.as_deref() else {
+        return Vec::new();
+    };
+    if staged.profile_changed {
+        let mut events = Vec::with_capacity(live_windows.len() + 2);
+        events.push(AppendEvent::ProfileChanged);
+        for id in live_windows {
+            events.push(AppendEvent::Window(
+                id.clone(),
+                json!({ "windowId": id, "data": data }),
+            ));
+        }
+        events.push(AppendEvent::Broadcast(
+            json!({ "profileId": profile_id, "data": data }),
+        ));
+        events
+    } else if let Some(window_id) = staged.result.window_id.as_deref() {
+        let payload = json!({ "profileId": profile_id, "windowId": window_id, "data": data });
+        vec![
+            AppendEvent::Window(window_id.to_owned(), payload.clone()),
+            AppendEvent::Broadcast(payload),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn emit_append_events(ctx: &HostContext, profile_id: &str, staged: &workspace::StagedAppend) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(feature = "desktop")]
+        let live_windows = if staged.profile_changed && staged.document.is_some() {
+            crate::window_registry::bac_workspace::live_window_ids_for_profile(
+                ctx.app(),
+                profile_id,
+            )
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(feature = "desktop"))]
+        let live_windows: Vec<String> = Vec::new();
+        for event in append_events(profile_id, staged, &live_windows) {
+            match event {
+                AppendEvent::ProfileChanged => emit_changed(ctx),
+                AppendEvent::Window(id, payload) => {
+                    ctx.emit_to(&id, "workspace:reload", payload);
+                }
+                AppendEvent::Broadcast(payload) => {
+                    if let Some(remote_state) = ctx.try_state::<super::RustRemoteServerState>() {
+                        remote_state.broadcast_event("workspace:reload", &payload);
+                    }
+                }
+            }
+        }
+    }));
+}
+
+fn dispatch_append(
+    ctx: &HostContext,
+    host_id: &str,
+    request: &workspace::AppendRequest,
+    windows: bool,
+) -> Result<Value, workspace::OperationError> {
+    use workspace::OperationError;
+    if workspace::is_reserved_profile_id(&request.profile_id, windows) {
+        return Err(OperationError::WorkspaceUnavailable);
+    }
+    let dir = profiles_dir(ctx).ok_or(OperationError::WorkspaceUnavailable)?;
+    let catalog = catalog::read_local_catalog(&dir)?;
+    workspace::require_local_profile(&catalog, &request.profile_id)?;
+    #[cfg(feature = "desktop")]
+    let staged = crate::window_registry::bac_workspace::append(
+        ctx.app(),
+        host_id,
+        request,
+        &mut |overlay| append_persisted(&dir, host_id, request, overlay),
+    )?;
+    #[cfg(not(feature = "desktop"))]
+    let staged = append_persisted(&dir, host_id, request, &mut |_| {})?;
+    emit_append_events(ctx, &request.profile_id, &staged);
+    serde_json::to_value(&staged.result).map_err(|_| {
+        if staged.result.appended {
+            OperationError::WriteFailed
+        } else {
+            OperationError::Internal
+        }
+    })
 }
 
 fn dispatch(
@@ -170,6 +272,9 @@ fn dispatch(
     request: workspace::Request,
 ) -> Result<Value, workspace::OperationError> {
     use workspace::{execute_locate, execute_read, OperationError, Request};
+    if let Request::WorkspaceAddTerminal(request) = &request {
+        return dispatch_append(ctx, host_id, request, cfg!(windows));
+    }
     #[cfg(feature = "desktop")]
     let entries = crate::window_registry::bac_workspace::observe(ctx.app())?;
     #[cfg(not(feature = "desktop"))]
@@ -186,8 +291,7 @@ fn dispatch(
         other => other,
     })?;
     let value = match request {
-        // Not routed while `WORKSPACE_ADD_TERMINAL_ENABLED` is false; the append path replaces
-        // this arm when the operation is enabled.
+        // Routed to dispatch_append before the registry is observed.
         Request::WorkspaceAddTerminal(_) => return Err(OperationError::Internal),
         Request::WorkspaceRead(request) => {
             let result = execute_read(
@@ -749,7 +853,8 @@ mod bac_tests {
             Err(OperationError::LocationUnavailable(ids)) if ids.is_empty()
         ));
 
-        let con_snapshot = br#"{"version":2,"windows":[{"workspaces":[{"id":"w"}],"terminals":[]}]}"#;
+        let con_snapshot =
+            br#"{"version":2,"windows":[{"workspaces":[{"id":"w"}],"terminals":[]}]}"#;
         fs::write(dir.join("CON.json"), con_snapshot).unwrap();
         fs::write(dir.join("con.foo.json"), con_snapshot).unwrap();
         for reserved in ["CON", "con.foo", "lpt0", "com9"] {
@@ -1003,5 +1108,4 @@ mod bac_tests {
         assert_eq!(ltr_locate.locations[0].profile_id, "l");
         assert_eq!(ltr_locate.locations[0].profile_revision, ltr_read.revision);
     }
-
 }
