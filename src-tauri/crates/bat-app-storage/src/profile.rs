@@ -495,6 +495,12 @@ fn read_index_file(path: &Path) -> io::Result<Option<ProfileIndex>> {
 }
 
 pub fn read_index_for_update_unlocked(dir: &Path) -> io::Result<ProfileIndex> {
+    let index = read_catalog_unlocked(dir)?;
+    Ok(hydrate_remote_tokens(dir, index))
+}
+
+// bac-hook: catalog-without-hydration
+pub fn read_catalog_unlocked(dir: &Path) -> io::Result<ProfileIndex> {
     let primary = dir.join(INDEX_FILE);
     let backup = dir.join(INDEX_BACKUP_FILE);
     let parsed = match read_index_file(&primary) {
@@ -508,7 +514,7 @@ pub fn read_index_for_update_unlocked(dir: &Path) -> io::Result<ProfileIndex> {
             _ => return Err(primary_error),
         },
     };
-    Ok(hydrate_remote_tokens(dir, normalize_index(parsed)))
+    Ok(normalize_index(parsed))
 }
 
 pub fn read_index_at(dir: &Path) -> ProfileIndex {
@@ -954,7 +960,8 @@ pub fn repair_cross_profile_snapshot_collisions_once(
     Ok(repaired)
 }
 
-fn migrate_snapshot(raw: Value) -> Option<Value> {
+// bac-hook: snapshot-migrate-visibility
+pub fn migrate_snapshot(raw: Value) -> Option<Value> {
     if raw.get("version").and_then(Value::as_i64) == Some(2) {
         return Some(raw);
     }

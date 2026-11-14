@@ -3,6 +3,15 @@ use std::sync::Mutex;
 
 pub const REQUEST_BYTES: usize = 65_536;
 pub const RESULT_BYTES: usize = 524_288;
+pub const REGISTRATION_BYTES: usize = 16_384;
+pub const PROFILES_LIMIT: usize = 256;
+pub const TERMINALS_LIMIT: usize = 4_096;
+pub const LOCATION_MATCHES_LIMIT: usize = 100;
+pub const GIT_STATUS_BYTES_LIMIT: usize = 4_194_304;
+pub const GIT_INDEX_BYTES_LIMIT: usize = 16_777_216;
+pub const GIT_PATHS_LIMIT: usize = 10_000;
+pub const GIT_TIMEOUT_MS_LIMIT: usize = 5_000;
+pub const GIT_ATTEMPTS_LIMIT: usize = 2;
 pub const STAGE_A_CHANNELS: [(&str, &str); 4] = [
     ("bac:workspace-read", "workspaceRead"),
     ("bac:workspace-add-terminal", "workspaceAddTerminal"),
@@ -25,6 +34,15 @@ pub enum Error {
     StorageCorrupt,
     Internal,
     StorageReason(Box<Error>, &'static str),
+}
+
+pub(crate) fn error_reply(
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+    details: Value,
+) -> Value {
+    json!({"ok":false,"error":{"code":code,"message":message,"retryable":retryable,"details":details}})
 }
 
 impl Error {
@@ -84,7 +102,7 @@ impl Error {
             }
             Self::Internal => ("INTERNAL_ERROR", "BAC request failed", json!({})),
         };
-        json!({"ok":false,"error":{"code":code,"message":message,"retryable":false,"details":details}})
+        error_reply(code, message, false, details)
     }
 }
 
