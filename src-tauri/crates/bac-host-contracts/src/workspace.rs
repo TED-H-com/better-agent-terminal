@@ -180,47 +180,94 @@ pub enum OperationError {
     ProfileNotLocal,
     WorkspaceUnavailable,
     WorkspaceTooLarge,
+    WorkspaceNotFound(String),
+    TerminalExists {
+        terminal_id: String,
+        current_revision: String,
+    },
+    RevisionMismatch {
+        current_revision: String,
+    },
+    WriteFailed,
     LocationUnavailable(Vec<String>),
     LocationTooLarge,
     Internal,
 }
 impl OperationError {
     pub fn reply(&self) -> Value {
-        let (code, message, details) = match self {
+        let (code, message, retryable, details) = match self {
             Self::InvalidRequest(field) => (
                 "INVALID_REQUEST",
                 "Invalid BAC request",
+                false,
                 json!({"field":field}),
             ),
-            Self::ProfileNotFound => ("PROFILE_NOT_FOUND", "Local profile not found", json!({})),
+            Self::ProfileNotFound => (
+                "PROFILE_NOT_FOUND",
+                "Local profile not found",
+                false,
+                json!({}),
+            ),
             Self::ProfileNotLocal => (
                 "PROFILE_NOT_LOCAL",
                 "BAC requires a local profile",
+                false,
                 json!({}),
             ),
             Self::WorkspaceUnavailable => (
                 "WORKSPACE_UNAVAILABLE",
                 "Canonical workspace is unavailable",
+                false,
                 json!({}),
             ),
             Self::WorkspaceTooLarge => (
                 "WORKSPACE_TOO_LARGE",
                 "Canonical workspace exceeds limit",
+                false,
                 json!({"maxBytes":DOCUMENT_MAX_BYTES}),
+            ),
+            Self::WorkspaceNotFound(workspace_id) => (
+                "WORKSPACE_NOT_FOUND",
+                "Target workspace not found",
+                false,
+                json!({"workspaceId":workspace_id}),
+            ),
+            Self::TerminalExists {
+                terminal_id,
+                current_revision,
+            } => (
+                "TERMINAL_EXISTS",
+                "Terminal ID has a different registration",
+                false,
+                json!({"terminalId":terminal_id,"currentRevision":current_revision}),
+            ),
+            Self::RevisionMismatch { current_revision } => (
+                "REVISION_MISMATCH",
+                "Workspace revision changed",
+                true,
+                json!({"currentRevision":current_revision}),
+            ),
+            Self::WriteFailed => (
+                "WRITE_FAILED",
+                "Canonical workspace save failed; read back before retry",
+                false,
+                json!({"outcome":"unknown"}),
             ),
             Self::LocationUnavailable(ids) => (
                 "LOCATION_UNAVAILABLE",
                 "Session locations are unavailable",
+                false,
                 json!({"profileIds":ids}),
             ),
             Self::LocationTooLarge => (
                 "LOCATION_TOO_LARGE",
                 "Session locations exceed limit",
+                false,
                 json!({}),
             ),
-            Self::Internal => ("INTERNAL_ERROR", "BAC request failed", json!({})),
+            Self::Internal => ("INTERNAL_ERROR", "BAC request failed", false, json!({})),
         };
-        crate::wire::error_reply(code, message, false, details)
+        crate::wire::error_reply(code, message, retryable, details)
     }
 }
 
