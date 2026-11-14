@@ -217,8 +217,7 @@ Operation failures have `{ "ok": false, "error": { "code", "message",
 
 A catalog failure or invalid local catalog ID returns `LOCATION_UNAVAILABLE`
 with an empty `profileIds` list. Unreadable local saved documents or oversized
-window IDs contribute their profile IDs. The append and git channels remain
-unavailable.
+window IDs contribute their profile IDs. The git channel remains unavailable.
 
 ## Workspace terminal append
 
