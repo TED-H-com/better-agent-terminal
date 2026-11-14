@@ -15,7 +15,9 @@ separate from the four feature commits `04d76a7`, `a1ee88e`, `dc203ad`, and
 or update any main branch. The baseline job checks the prerequisite source; it
 does not contain or claim to test the feature's PM confinement canary.
 
-Pushes to `feat/pm-v12-native-input-identity-final` and PR updates run verification.
+Pushes to `main` and pull-request updates run verification. The workflow has no manual trigger:
+code scanning reports one as a cache-poisoning risk for this job, which builds and runs a checkout
+of the pinned upstream baseline.
 Both events share a head-repository/head-branch concurrency group so a new run
 cancels duplicate or stale work. The workflow has read-only repository access,
 does not persist checkout credentials, and uses no repository secrets. It has no

@@ -5,10 +5,13 @@
 name: BAC compatibility CI
 on:
   pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: bac-ci-${{ github.event.pull_request.number }}
+  group: bac-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   upstream-tests:

@@ -3,7 +3,7 @@ name: PM runtime offline verification
 on:
   push:
     branches:
-      - feat/pm-v12-native-input-identity-final
+      - main
   pull_request:
 
 permissions:
