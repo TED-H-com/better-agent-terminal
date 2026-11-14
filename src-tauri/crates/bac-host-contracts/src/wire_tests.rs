@@ -623,7 +623,76 @@ fn dispatch_invalid_params_never_calls_run() {
             err.reply()["error"]["details"],
             json!({"field": invalid_field})
         );
+        let mut request = frame("bac:workspace-add-terminal");
+        request["params"] = params;
+        let reply = connection.invoke(
+            true,
+            "bac:workspace-add-terminal",
+            &request,
+            || panic!("feature must not load identity"),
+            |_, _| panic!("invalid request ran"),
+        );
+        assert_eq!(
+            reply,
+            crate::workspace::OperationError::InvalidRequest(invalid_field).reply()
+        );
     }
+}
+
+#[test]
+fn dispatch_passes_the_parsed_append_request_to_run() {
+    let empty_rev = "sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c";
+    let base_terminal = || {
+        json!({
+            "id": "t1",
+            "workspaceId": "w1",
+            "title": "Shell",
+            "type": "terminal",
+            "cwd": "/tmp",
+            "agentPreset": "claude-code"
+        })
+    };
+    let valid_params = |terminal: Value| {
+        json!({
+            "profileId": "default",
+            "expectedRevision": empty_rev,
+            "terminal": terminal
+        })
+    };
+    let params = valid_params(base_terminal());
+    let expected = crate::workspace::parse_request("bac:workspace-add-terminal", &params).unwrap();
+    let mut request = frame("bac:workspace-add-terminal");
+    request["params"] = params;
+    let connection = Connection::default();
+    assert_eq!(call(&connection, &hello())["ok"], true);
+    let calls = AtomicUsize::new(0);
+    let value = json!({"terminalId":"t1","appended":true});
+    let reply = connection.invoke(
+        true,
+        "bac:workspace-add-terminal",
+        &request,
+        || panic!("feature must not load identity"),
+        |host, parsed| {
+            assert_eq!(calls.fetch_add(1, Ordering::SeqCst), 0);
+            assert_eq!(host, HOST);
+            assert_eq!(parsed, expected);
+            Ok(value.clone())
+        },
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reply, json!({"ok":true,"value":value}));
+
+    let fresh = Connection::default();
+    assert_eq!(
+        fresh.invoke(
+            true,
+            "bac:workspace-add-terminal",
+            &request,
+            || panic!("feature must not load identity"),
+            |_, _| panic!("unnegotiated request ran"),
+        ),
+        Error::NotOptedIn.reply()
+    );
 }
 
 #[test]
