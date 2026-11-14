@@ -709,4 +709,101 @@ mod bac_tests {
             ws.close(None).unwrap();
         }
     }
+
+    #[test]
+    fn ws_profile_id_grammar_supports_chinese_rejects_colon_and_keeps_session_id() {
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let chinese = "\u{4e2d}\u{6587}";
+        let cjk_42 = "\u{4e00}".repeat(42);
+        let cjk_43 = "\u{4e00}".repeat(43);
+        let index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":chinese,"name":"Chinese","type":"local","createdAt":0,"updatedAt":0},
+            {"id":cjk_42,"name":"MaxCJK","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let chinese_snapshot = json!({"version":2,"windows":[{"workspaces":[{"id":"w"}],
+            "terminals":[{"id":"a:b","workspaceId":"w"}]}]});
+        fs::write(
+            profiles.join(format!("{chinese}.json")),
+            serde_json::to_vec(&chinese_snapshot).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join(format!("{cjk_42}.json")),
+            br#"{"version":2,"windows":[{"workspaces":[{"id":"w42"}],"terminals":[]}]}"#,
+        )
+        .unwrap();
+
+        let (mut ws, _, _) = connect(&host, true);
+        assert_eq!(hello(&mut ws)["ok"], true);
+
+        let read_cn = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":chinese}}),
+        );
+        assert_eq!(read_cn["ok"], true);
+        assert_eq!(read_cn["value"]["profileId"], chinese);
+        assert_eq!(read_cn["value"]["document"]["terminals"][0]["id"], "a:b");
+
+        let read_42 = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":cjk_42}}),
+        );
+        assert_eq!(read_42["ok"], true);
+        assert_eq!(read_42["value"]["document"]["workspaces"][0]["id"], "w42");
+
+        for invalid_profile in ["a:b", &cjk_43, "\u{3042}", "\u{ac00}"] {
+            let reply = invoke(
+                &mut ws,
+                json!({"channel":"bac:workspace-read","params":{"profileId":invalid_profile}}),
+            );
+            assert_eq!(error(reply.clone()), "INVALID_REQUEST");
+            assert_eq!(reply["error"]["details"]["field"], "params.profileId");
+        }
+
+        let locate_colon = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"a:b"}}),
+        );
+        assert_eq!(locate_colon["ok"], true);
+        assert_eq!(locate_colon["value"]["disposition"], "located");
+        assert_eq!(locate_colon["value"]["locations"][0]["profileId"], chinese);
+        assert_eq!(
+            locate_colon["value"]["locations"][0]["profileRevision"],
+            read_cn["value"]["revision"]
+        );
+
+        let locate_chinese_session = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":chinese}}),
+        );
+        assert_eq!(error(locate_chinese_session.clone()), "INVALID_REQUEST");
+        assert_eq!(
+            locate_chinese_session["error"]["details"]["field"],
+            "params.sessionId"
+        );
+
+        let bad_index = json!({"profiles":[
+            {"id":"a:b","name":"BadColon","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&bad_index).unwrap(),
+        )
+        .unwrap();
+        let locate_bad_catalog = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"a:b"}}),
+        );
+        assert_eq!(error(locate_bad_catalog.clone()), "LOCATION_UNAVAILABLE");
+        assert_eq!(locate_bad_catalog["error"]["details"]["profileIds"], json!([]));
+
+        ws.close(None).unwrap();
+    }
 }

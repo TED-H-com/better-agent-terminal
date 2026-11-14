@@ -68,13 +68,17 @@ pub(super) fn install_saved_read_gate(
     (started_rx, release_tx, SavedReadGateGuard(key))
 }
 
-fn read_saved_profile(
+fn read_saved_profile_for_platform(
     dir: &Path,
     profile_id: &str,
+    windows: bool,
 ) -> (
     Result<workspace::SavedFileOutcome, workspace::SavedReadError>,
     usize,
 ) {
+    if workspace::is_reserved_profile_id(profile_id, windows) {
+        return (Err(workspace::SavedReadError::Unreadable), 0);
+    }
     #[cfg(test)]
     {
         let gate = saved_read_gates()
@@ -94,6 +98,16 @@ fn read_saved_profile(
     workspace::read_bounded_saved_file_measured(&path, bat_app_storage::profile::migrate_snapshot)
 }
 
+fn read_saved_profile(
+    dir: &Path,
+    profile_id: &str,
+) -> (
+    Result<workspace::SavedFileOutcome, workspace::SavedReadError>,
+    usize,
+) {
+    read_saved_profile_for_platform(dir, profile_id, cfg!(windows))
+}
+
 fn collect_saved_with(
     catalog: &[workspace::CatalogEntry],
     mut load: impl FnMut(
@@ -104,11 +118,11 @@ fn collect_saved_with(
     ),
 ) -> Result<(Vec<workspace::SavedProfile>, Vec<String>), workspace::OperationError> {
     use workspace::{
-        valid_id, OperationError, SavedProfile, SavedReadError, PROFILES_LIMIT,
+        valid_profile_id, OperationError, SavedProfile, SavedReadError, PROFILES_LIMIT,
         SAVED_TOTAL_MAX_BYTES,
     };
     let local: Vec<_> = catalog.iter().filter(|profile| profile.is_local).collect();
-    if local.iter().any(|profile| !valid_id(&profile.id)) {
+    if local.iter().any(|profile| !valid_profile_id(&profile.id)) {
         return Err(OperationError::LocationUnavailable(vec![]));
     }
     if local.len() > PROFILES_LIMIT {
@@ -599,6 +613,169 @@ mod bac_tests {
         assert_eq!(located["atomic"], false);
         assert_eq!(located["locations"][0]["profileRevision"], read["revision"]);
         assert_eq!(located["locations"][0]["windowId"], Value::Null);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chinese_dotted_reserved_and_upstream_profile_ids_are_handled() {
+        use bac_host_contracts::workspace::{
+            execute_locate, execute_read, valid_profile_id, CatalogEntry, LocateRequest,
+            OperationError, ReadRequest, SavedFileOutcome, SavedReadError,
+        };
+        use bat_app_storage::profile::{
+            default_entry, profile_from_options, profile_path, unique_profile_id, ProfileIndex,
+        };
+        use std::{
+            ffi::OsStr,
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let mut index = ProfileIndex {
+            profiles: vec![default_entry()],
+            active_profile_ids: vec![],
+            active_profile_id: None,
+        };
+        let cjk_42 = "\u{4e00}".repeat(42);
+        let cjk_43 = "\u{4e00}".repeat(43);
+        let names = [
+            "ASCII Profile",
+            "ASCII Profile",
+            "my_name.v2",
+            "\u{4e2d}\u{6587}",
+            "\u{4e2d}\u{6587}",
+            "\u{5de5}\u{4f5c}-\u{533a}",
+            "team-\u{6d4b}\u{8bd5} 01",
+            "\u{3042}-\u{4e2d}\u{6587}-\u{ac00}",
+            "!!!",
+            &cjk_42,
+            &cjk_43,
+        ];
+        for name in names {
+            let id = unique_profile_id(&index, name);
+            if id.len() <= 128 {
+                assert!(
+                    valid_profile_id(&id),
+                    "expected valid_profile_id for generated id {id:?}"
+                );
+            } else {
+                assert!(
+                    !valid_profile_id(&id),
+                    "expected >128 byte id to fail: len={}",
+                    id.len()
+                );
+            }
+            index
+                .profiles
+                .push(profile_from_options(id, name.to_string(), None));
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "bac-profile-ids-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let chinese = "\u{4e2d}\u{6587}";
+        for id in [chinese, &cjk_42, ".", ".."] {
+            let path = profile_path(&dir, id);
+            assert_eq!(path.parent(), Some(dir.as_path()));
+            let expected_name = format!("{id}.json");
+            assert_eq!(path.file_name(), Some(OsStr::new(expected_name.as_str())));
+            let snapshot = serde_json::json!({
+                "version": 2,
+                "windows": [{
+                    "workspaces": [{"id": "w"}],
+                    "terminals": [{"id": format!("a:b-{id}"), "workspaceId": "w"}]
+                }]
+            });
+            fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        }
+
+        let catalog = vec![
+            CatalogEntry {
+                id: chinese.into(),
+                is_local: true,
+            },
+            CatalogEntry {
+                id: cjk_42.clone(),
+                is_local: true,
+            },
+            CatalogEntry {
+                id: ".".into(),
+                is_local: true,
+            },
+            CatalogEntry {
+                id: "..".into(),
+                is_local: true,
+            },
+        ];
+        for id in [chinese, &cjk_42, ".", ".."] {
+            let result = execute_read(
+                "host",
+                &ReadRequest {
+                    profile_id: id.into(),
+                },
+                &catalog,
+                &[],
+                || read_saved_profile(&dir, id).0,
+                first_saved_document,
+            )
+            .unwrap();
+            assert_eq!(result.profile_id, id);
+            assert_eq!(result.document["workspaces"][0]["id"], "w");
+        }
+        let (saved, unavailable) = collect_local_saved(&dir, &catalog).unwrap();
+        assert!(unavailable.is_empty());
+        let located = execute_locate(
+            "host",
+            &LocateRequest {
+                session_id: format!("a:b-{chinese}"),
+            },
+            &catalog,
+            &[],
+            &saved,
+            unavailable,
+            saved_document,
+        )
+        .unwrap();
+        assert_eq!(located.locations.len(), 1);
+        assert_eq!(located.locations[0].profile_id, chinese);
+
+        let colon_catalog = vec![CatalogEntry {
+            id: "a:b".into(),
+            is_local: true,
+        }];
+        assert!(matches!(
+            collect_saved_with(&colon_catalog, |_| panic!("must reject invalid catalog id")),
+            Err(OperationError::LocationUnavailable(ids)) if ids.is_empty()
+        ));
+
+        let con_snapshot = br#"{"version":2,"windows":[{"workspaces":[{"id":"w"}],"terminals":[]}]}"#;
+        fs::write(dir.join("CON.json"), con_snapshot).unwrap();
+        fs::write(dir.join("con.foo.json"), con_snapshot).unwrap();
+        for reserved in ["CON", "con.foo", "lpt0", "com9"] {
+            let (outcome, bytes) = read_saved_profile_for_platform(&dir, reserved, true);
+            assert!(matches!(outcome, Err(SavedReadError::Unreadable)));
+            assert_eq!(bytes, 0);
+        }
+        assert!(matches!(
+            read_saved_profile_for_platform(&dir, "CON", false).0,
+            Ok(SavedFileOutcome::Snapshot { .. })
+        ));
+        assert!(matches!(
+            read_saved_profile_for_platform(&dir, "con.foo", false).0,
+            Ok(SavedFileOutcome::Snapshot { .. })
+        ));
+        assert!(matches!(
+            read_saved_profile_for_platform(&dir, "lpt0", false).0,
+            Ok(SavedFileOutcome::NoSavedWindows)
+        ));
+
         fs::remove_dir_all(dir).unwrap();
     }
 

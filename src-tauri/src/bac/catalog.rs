@@ -87,7 +87,9 @@ mod tests {
         fs::write(dir.join("index.json"), b"{").unwrap();
         let index = json!({"profiles":[
             {"id":"local","name":"Local","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"\u{4e2d}\u{6587}","name":"Chinese","type":"local","createdAt":0,"updatedAt":0},
             {"id":"bad/id","name":"Bad","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"a:b","name":"Colon","type":"local","createdAt":0,"updatedAt":0},
             {"id":"remote","name":"Remote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0}
         ],"activeProfileIds":[]});
         fs::write(
@@ -98,8 +100,13 @@ mod tests {
         let profiles = read_local_catalog(&dir).unwrap();
         use bac_host_contracts::workspace::require_local_profile;
         assert!(require_local_profile(&profiles, "local").is_ok());
+        assert!(require_local_profile(&profiles, "\u{4e2d}\u{6587}").is_ok());
         assert!(matches!(
             require_local_profile(&profiles, "bad/id"),
+            Err(OperationError::ProfileNotFound)
+        ));
+        assert!(matches!(
+            require_local_profile(&profiles, "a:b"),
             Err(OperationError::ProfileNotFound)
         ));
         assert!(matches!(

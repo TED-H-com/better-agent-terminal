@@ -120,11 +120,13 @@ the cap is removed from authentication; no cap change is part of this contract.
 
 ## Read-only workspace and session location
 
-`bac:workspace-read` accepts exactly `{ "profileId": <Id> }` and
-`bac:session-locate` accepts exactly `{ "sessionId": <Id> }`. An `Id` is 1–128
-UTF-8 bytes, each in `[A-Za-z0-9_.:-]`. This grammar applies to request fields
-and catalog addressability only; stored workspace, terminal, and window IDs are
-not rewritten or rejected by workspace read. Invalid input returns
+`bac:workspace-read` accepts exactly `{ "profileId": <ProfileId> }` and
+`bac:session-locate` accepts exactly `{ "sessionId": <SessionId> }`. A
+`SessionId` is 1–128 UTF-8 bytes, each in `[A-Za-z0-9_.:-]`. A `ProfileId` is
+1–128 UTF-8 bytes, each character ASCII alphanumeric, `_`, `.`, `-`, or in
+`U+4E00`–`U+9FFF` inclusive (`:` is not allowed). This grammar applies to
+request fields and catalog addressability only; stored workspace, terminal, and
+window IDs are not rewritten or rejected by workspace read. Invalid input returns
 `INVALID_REQUEST` with a static `details.field`, without echoing caller values.
 Feature operations use the host ID negotiated by `bac:hello` and release the
 negotiation lock before reading application state.
@@ -171,7 +173,10 @@ most 8 MiB (with at least one present), otherwise the operation returns
 locate) without reading either catalog file. Remote and uncatalogued registry
 entries are ignored. Saved profile reads inspect `metadata` (following symlinks) before opening,
 open with `O_NONBLOCK` on Unix, and require `is_file()` on the opened handle
-before reading. Missing paths and dangling symlinks produce no saved windows
+before reading. On Windows, any saved profile whose ID prefix before the first
+`.` equals (ASCII case-insensitive) `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`,
+or `LPT0`–`LPT9` is treated as unreadable with 0 bytes read without touching the
+filesystem. Missing paths and dangling symlinks produce no saved windows
 with 0 bytes read; non-regular entries and metadata or open failures report
 unreadability with 0 bytes read without retrying; regular files whose metadata
 exceeds 8 MiB immediately report too large with 0 bytes read without retrying.

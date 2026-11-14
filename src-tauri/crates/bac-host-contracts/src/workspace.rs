@@ -162,6 +162,42 @@ pub fn valid_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
 }
 
+pub fn valid_profile_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '.' | '-')
+                || ('\u{4e00}'..='\u{9fff}').contains(&ch)
+        })
+}
+
+pub fn is_reserved_profile_id(profile_id: &str, windows: bool) -> bool {
+    if !windows {
+        return false;
+    }
+    let stem = profile_id.split('.').next().unwrap_or(profile_id);
+    if stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL")
+    {
+        return true;
+    }
+    match stem.as_bytes() {
+        [a, b, c, d] => matches!(
+            (
+                a.to_ascii_uppercase(),
+                b.to_ascii_uppercase(),
+                c.to_ascii_uppercase(),
+                *d
+            ),
+            (b'C', b'O', b'M', b'0'..=b'9') | (b'L', b'P', b'T', b'0'..=b'9')
+        ),
+        _ => false,
+    }
+}
+
 pub fn window_id_within_bound(id: &str) -> bool {
     serde_json::to_string(id).is_ok_and(|encoded| encoded.len() <= WINDOW_ID_JSON_BYTES)
 }
@@ -170,9 +206,9 @@ pub fn parse_request(channel: &str, params: &Value) -> Result<Request, Operation
     let object = params
         .as_object()
         .ok_or(OperationError::InvalidRequest("params"))?;
-    let (key, field) = match channel {
-        "bac:workspace-read" => ("profileId", "params.profileId"),
-        "bac:session-locate" => ("sessionId", "params.sessionId"),
+    let (key, field, validator): (_, _, fn(&str) -> bool) = match channel {
+        "bac:workspace-read" => ("profileId", "params.profileId", valid_profile_id),
+        "bac:session-locate" => ("sessionId", "params.sessionId", valid_id),
         _ => return Err(OperationError::InvalidRequest("params")),
     };
     if object.keys().any(|name| name != key) {
@@ -181,7 +217,7 @@ pub fn parse_request(channel: &str, params: &Value) -> Result<Request, Operation
     let id = object
         .get(key)
         .and_then(Value::as_str)
-        .filter(|id| valid_id(id))
+        .filter(|id| validator(id))
         .ok_or(OperationError::InvalidRequest(field))?
         .to_owned();
     match channel {
@@ -197,7 +233,7 @@ pub fn require_local_profile(
 ) -> Result<(), OperationError> {
     let entry = catalog
         .iter()
-        .find(|entry| entry.id == profile_id && valid_id(&entry.id))
+        .find(|entry| entry.id == profile_id && valid_profile_id(&entry.id))
         .ok_or(OperationError::ProfileNotFound)?;
     if !entry.is_local {
         return Err(OperationError::ProfileNotLocal);
@@ -309,8 +345,23 @@ fn open_regular_saved_file(path: &Path) -> Result<File, Result<SavedFileOutcome,
 
 pub fn read_bounded_saved_file_measured(
     path: &Path,
+    migrate: impl FnMut(Value) -> Option<Value>,
+) -> (Result<SavedFileOutcome, SavedReadError>, usize) {
+    read_bounded_saved_file_measured_for_platform(path, cfg!(windows), migrate)
+}
+
+fn read_bounded_saved_file_measured_for_platform(
+    path: &Path,
+    windows: bool,
     mut migrate: impl FnMut(Value) -> Option<Value>,
 ) -> (Result<SavedFileOutcome, SavedReadError>, usize) {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| is_reserved_profile_id(name, windows))
+    {
+        return (Err(SavedReadError::Unreadable), 0);
+    }
     let mut last_size = 0;
     for attempt in 0..SAVED_READ_MAX_ATTEMPTS {
         let meta = match std::fs::metadata(path) {
@@ -462,7 +513,7 @@ pub fn execute_locate(
 ) -> Result<LocateResult, OperationError> {
     use std::collections::{BTreeMap, BTreeSet};
     let locals: Vec<_> = catalog.iter().filter(|profile| profile.is_local).collect();
-    if locals.iter().any(|profile| !valid_id(&profile.id)) {
+    if locals.iter().any(|profile| !valid_profile_id(&profile.id)) {
         return Err(OperationError::LocationUnavailable(vec![]));
     }
     if locals.len() > PROFILES_LIMIT {

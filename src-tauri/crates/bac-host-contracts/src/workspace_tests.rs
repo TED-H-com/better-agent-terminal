@@ -24,12 +24,26 @@ fn canonical_digest_sorts_keys_and_matches_empty_workspace() {
 fn request_ids_and_static_error_fields_are_checked() {
     for bad in ["", "bad/id", "has space", "é", &"a".repeat(129)] {
         assert!(!valid_id(bad));
+        assert!(!valid_profile_id(bad));
         assert_eq!(
             parse_request("bac:workspace-read", &json!({"profileId":bad})),
             Err(OperationError::InvalidRequest("params.profileId"))
         );
     }
     assert!(valid_id("A-1_.:z"));
+    assert!(valid_id("a:b"));
+    assert_eq!(
+        parse_request("bac:session-locate", &json!({"sessionId":"a:b"})),
+        Ok(Request::SessionLocate(LocateRequest {
+            session_id: "a:b".into(),
+        }))
+    );
+    assert!(valid_profile_id("A-1_.z"));
+    assert!(!valid_profile_id("a:b"));
+    assert_eq!(
+        parse_request("bac:workspace-read", &json!({"profileId":"a:b"})),
+        Err(OperationError::InvalidRequest("params.profileId"))
+    );
     assert_eq!(
         parse_request(
             "bac:session-locate",
@@ -41,6 +55,109 @@ fn request_ids_and_static_error_fields_are_checked() {
         OperationError::WorkspaceTooLarge.reply()["error"]["details"],
         json!({"maxBytes":520192})
     );
+}
+
+#[test]
+fn profile_id_grammar_allows_cjk_bounds_and_rejects_non_cjk_and_colon() {
+    let chinese = "\u{4e2d}\u{6587}-_\u{4e00}\u{9fff}.1";
+    assert!(valid_profile_id(chinese));
+    assert!(!valid_id(chinese));
+    assert_eq!(
+        parse_request("bac:workspace-read", &json!({"profileId": chinese})),
+        Ok(Request::WorkspaceRead(ReadRequest {
+            profile_id: chinese.into(),
+        }))
+    );
+    assert_eq!(
+        parse_request("bac:session-locate", &json!({"sessionId": chinese})),
+        Err(OperationError::InvalidRequest("params.sessionId"))
+    );
+
+    let cjk_42 = "\u{4e00}".repeat(42);
+    assert_eq!(cjk_42.len(), 126);
+    assert!(valid_profile_id(&cjk_42));
+    assert!(parse_request("bac:workspace-read", &json!({"profileId": cjk_42})).is_ok());
+
+    let cjk_128 = format!("{cjk_42}ab");
+    assert_eq!(cjk_128.len(), 128);
+    assert!(valid_profile_id(&cjk_128));
+
+    let cjk_129 = format!("{cjk_42}abc");
+    assert_eq!(cjk_129.len(), 129);
+    assert!(!valid_profile_id(&cjk_129));
+
+    let cjk_43 = "\u{4e00}".repeat(43);
+    assert_eq!(cjk_43.len(), 129);
+    assert!(!valid_profile_id(&cjk_43));
+    assert_eq!(
+        parse_request("bac:workspace-read", &json!({"profileId": cjk_43})),
+        Err(OperationError::InvalidRequest("params.profileId"))
+    );
+
+    for rejected in ["\u{3042}", "\u{ac00}", "\u{4dff}", "\u{a000}", "a:b"] {
+        assert!(!valid_profile_id(rejected));
+        assert_eq!(
+            parse_request("bac:workspace-read", &json!({"profileId": rejected})),
+            Err(OperationError::InvalidRequest("params.profileId"))
+        );
+        let bad_catalog = catalog(rejected);
+        assert_eq!(
+            require_local_profile(&bad_catalog, rejected),
+            Err(OperationError::ProfileNotFound)
+        );
+        assert!(matches!(
+            execute_read(
+                HOST,
+                &read_request(rejected),
+                &bad_catalog,
+                &[],
+                || panic!("invalid catalog must not read disk"),
+                first_document
+            ),
+            Err(OperationError::ProfileNotFound)
+        ));
+        assert!(matches!(
+            execute_locate(
+                HOST,
+                &locate_request("t"),
+                &bad_catalog,
+                &[],
+                &[],
+                vec![],
+                saved_document
+            ),
+            Err(OperationError::LocationUnavailable(ids)) if ids.is_empty()
+        ));
+    }
+
+    for accepted in [chinese, &cjk_42, ".", ".."] {
+        assert!(valid_profile_id(accepted));
+        let doc = document(json!([{"id":"w"}]), json!([{"id":"a:b","workspaceId":"w"}]));
+        let entries = vec![entry(accepted, "w1", None, doc)];
+        let read = execute_read(
+            HOST,
+            &read_request(accepted),
+            &catalog(accepted),
+            &entries,
+            || panic!("live selection"),
+            first_document,
+        )
+        .unwrap();
+        assert_eq!(read.profile_id, accepted);
+        let located = execute_locate(
+            HOST,
+            &locate_request("a:b"),
+            &catalog(accepted),
+            &entries,
+            &[],
+            vec![],
+            saved_document,
+        )
+        .unwrap();
+        assert_eq!(located.disposition, Disposition::Located);
+        assert_eq!(located.locations[0].profile_id, accepted);
+        assert_eq!(located.locations[0].terminal_id, "a:b");
+    }
 }
 
 #[test]
@@ -607,6 +724,102 @@ fn saved_file_rejects_non_regular_files_and_oversized_metadata_without_blocking(
     let (result, count) = read_bounded_saved_file_measured(&regular_link, Some);
     assert!(matches!(result, Ok(SavedFileOutcome::Snapshot { .. })));
     assert_eq!(count, fs::metadata(&regular).unwrap().len() as usize);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn reserved_profile_ids_respect_platform_and_skip_filesystem() {
+    use std::{
+        fs,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    let mut reserved = vec![
+        "CON", "con", "Con", "PRN", "prn", "AUX", "aux", "NUL", "nul", "con.foo", "CON.a.b",
+        "NUL.", "prn.1", "aux.txt",
+    ];
+    let mut owned = Vec::new();
+    for n in 0..=9 {
+        owned.push(format!("COM{n}"));
+        owned.push(format!("com{n}"));
+        owned.push(format!("CoM{n}.ext"));
+        owned.push(format!("LPT{n}"));
+        owned.push(format!("lpt{n}"));
+        owned.push(format!("LpT{n}.json"));
+    }
+    for s in &owned {
+        reserved.push(s.as_str());
+    }
+    for id in &reserved {
+        assert!(
+            is_reserved_profile_id(id, true),
+            "expected Windows reserved for {id}"
+        );
+        assert!(
+            !is_reserved_profile_id(id, false),
+            "expected non-reserved on non-Windows for {id}"
+        );
+    }
+    for id in [
+        "",
+        ".",
+        "..",
+        ".con",
+        "console",
+        "null",
+        "com",
+        "com10",
+        "lpt",
+        "lpt10",
+        "mycon",
+        "con\u{4e00}",
+        "\u{4e2d}\u{6587}",
+    ] {
+        assert!(
+            !is_reserved_profile_id(id, true),
+            "unexpected match for {id}"
+        );
+        assert!(
+            !is_reserved_profile_id(id, false),
+            "unexpected non-Windows match for {id}"
+        );
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "bac-reserved-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let valid_snapshot = br#"{"version":2,"windows":[{"workspaces":[],"terminals":[]}]}"#;
+    let con_path = dir.join("CON.json");
+    let con_sub_path = dir.join("con.sub.json");
+    let missing_nul = dir.join("NUL.json");
+    fs::write(&con_path, valid_snapshot).unwrap();
+    fs::write(&con_sub_path, valid_snapshot).unwrap();
+
+    for path in [&con_path, &con_sub_path, &missing_nul] {
+        let invoked = AtomicUsize::new(0);
+        let (result, count) = read_bounded_saved_file_measured_for_platform(path, true, |value| {
+            invoked.fetch_add(1, Ordering::SeqCst);
+            Some(value)
+        });
+        assert!(matches!(result, Err(SavedReadError::Unreadable)));
+        assert_eq!(count, 0);
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+    }
+
+    let (result, _) = read_bounded_saved_file_measured_for_platform(&con_path, false, Some);
+    assert!(matches!(result, Ok(SavedFileOutcome::Snapshot { .. })));
+    let (result, _) = read_bounded_saved_file_measured_for_platform(&con_sub_path, false, Some);
+    assert!(matches!(result, Ok(SavedFileOutcome::Snapshot { .. })));
+    let (result, count) = read_bounded_saved_file_measured_for_platform(&missing_nul, false, Some);
+    assert!(matches!(result, Ok(SavedFileOutcome::NoSavedWindows)));
+    assert_eq!(count, 0);
 
     fs::remove_dir_all(dir).unwrap();
 }
