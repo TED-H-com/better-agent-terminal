@@ -1215,4 +1215,408 @@ mod bac_tests {
             }
         }
     }
+
+    #[cfg(not(feature = "desktop"))]
+    type CapturedEvents = Arc<Mutex<Vec<(String, Value)>>>;
+
+    #[cfg(not(feature = "desktop"))]
+    fn append_host(data_dir: Option<PathBuf>) -> (HostContext, CapturedEvents) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let mut host = crate::host_context::HeadlessHost::new(
+            data_dir,
+            Arc::new(move |topic, payload| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((topic.into(), payload.clone()));
+            }),
+        );
+        host.manage(crate::event_hub::RuntimeEventHubState::default());
+        host.manage(crate::remote_server::RustRemoteServerState::default());
+        (HostContext::from_headless(Arc::new(host)), events)
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    fn append_fixture_dir(tag: &str) -> PathBuf {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "bac-dispatch-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profiles = dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        let index = serde_json::json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"CON","name":"Con","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"remote","name":"Remote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let snapshot = serde_json::json!({"version":2,"windows":[{"workspaces":[{"id":"w"}],"terminals":[{"id":"t","workspaceId":"w"}]}]});
+        let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap();
+        fs::write(profiles.join("default.json"), &snapshot_bytes).unwrap();
+        #[cfg(not(windows))]
+        fs::write(profiles.join("CON.json"), &snapshot_bytes).unwrap();
+        dir
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    fn read_profile_revision(ctx: &HostContext, profile_id: &str) -> (Value, String) {
+        let read = dispatch(
+            ctx,
+            "fixture-host",
+            workspace::Request::WorkspaceRead(workspace::ReadRequest {
+                profile_id: profile_id.into(),
+            }),
+        )
+        .unwrap();
+        let revision = read["revision"].as_str().unwrap().to_owned();
+        (read, revision)
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    fn append_request_with(
+        profile_id: &str,
+        expected_revision: &str,
+        terminal_id: &str,
+        workspace_id: &str,
+        title: &str,
+    ) -> workspace::AppendRequest {
+        let parsed = workspace::parse_request(
+            "bac:workspace-add-terminal",
+            &serde_json::json!({
+                "profileId": profile_id,
+                "expectedRevision": expected_revision,
+                "terminal": {
+                    "id": terminal_id,
+                    "workspaceId": workspace_id,
+                    "title": title,
+                    "type": "terminal",
+                    "cwd": "/repo",
+                    "agentPreset": "codex-agent-worktree",
+                    "model": null,
+                    "agentParams": null,
+                    "worktreeBranch": null
+                }
+            }),
+        )
+        .expect("valid request");
+        let workspace::Request::WorkspaceAddTerminal(request) = parsed else {
+            panic!("expected WorkspaceAddTerminal");
+        };
+        request
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    fn append_request(
+        profile_id: &str,
+        expected_revision: &str,
+        terminal_id: &str,
+    ) -> workspace::AppendRequest {
+        append_request_with(profile_id, expected_revision, terminal_id, "w", "Term 2")
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    fn profile_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let profiles = dir.join("profiles");
+        let Ok(entries) = std::fs::read_dir(&profiles) else {
+            return Vec::new();
+        };
+        let mut files: Vec<(String, Vec<u8>)> = entries
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().into_string().unwrap();
+                let bytes = std::fs::read(entry.path()).unwrap();
+                (name, bytes)
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    #[test]
+    fn dispatch_append_to_saved_profile_writes_once_and_emits_profile_changed() {
+        use workspace::Request;
+
+        let dir = append_fixture_dir("append-once");
+        let (ctx, events) = append_host(Some(dir.clone()));
+        let (_, rev_before) = read_profile_revision(&ctx, "default");
+        let request = append_request("default", &rev_before, "t2");
+
+        let reply = dispatch(&ctx, "fixture-host", Request::WorkspaceAddTerminal(request)).unwrap();
+        let object = reply.as_object().expect("reply object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "appended",
+                "hostId",
+                "profileId",
+                "revision",
+                "source",
+                "terminalId",
+                "windowId",
+            ]
+        );
+        assert_eq!(reply["hostId"], "fixture-host");
+        assert_eq!(reply["profileId"], "default");
+        assert_eq!(reply["source"], "persisted");
+        assert_eq!(reply["windowId"], Value::Null);
+        assert_eq!(reply["terminalId"], "t2");
+        assert_eq!(reply["appended"], true);
+        let rev_after = reply["revision"].as_str().expect("revision string");
+        assert_ne!(rev_after, rev_before);
+
+        let (read_after, read_rev) = read_profile_revision(&ctx, "default");
+        assert_eq!(read_rev, rev_after);
+        let terminal_ids: Vec<&str> = read_after["document"]["terminals"]
+            .as_array()
+            .expect("terminals array")
+            .iter()
+            .map(|term| term["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(terminal_ids, vec!["t", "t2"]);
+
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "profile:changed");
+        let changed_ids: Vec<&str> = captured[0].1["profiles"]
+            .as_array()
+            .expect("profiles array")
+            .iter()
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        assert!(
+            changed_ids.contains(&"default"),
+            "expected default in {changed_ids:?}"
+        );
+        drop(captured);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    #[test]
+    fn dispatch_append_noop_and_refusals_write_nothing_and_emit_nothing() {
+        use workspace::{OperationError, Request};
+
+        let dir = append_fixture_dir("append-noop-refusal");
+        let (ctx, events) = append_host(Some(dir.clone()));
+        let (_, rev_initial) = read_profile_revision(&ctx, "default");
+        let first = dispatch(
+            &ctx,
+            "fixture-host",
+            Request::WorkspaceAddTerminal(append_request("default", &rev_initial, "t2")),
+        )
+        .unwrap();
+        assert_eq!(first["appended"], true);
+        let rev_current = first["revision"].as_str().unwrap().to_owned();
+        assert_eq!(events.lock().unwrap().len(), 1);
+        events.lock().unwrap().clear();
+        let baseline = profile_files(&dir);
+
+        let noop = dispatch(
+            &ctx,
+            "fixture-host",
+            Request::WorkspaceAddTerminal(append_request("default", &rev_current, "t2")),
+        )
+        .unwrap();
+        assert_eq!(noop["appended"], false);
+        assert_eq!(noop["revision"], rev_current);
+        assert_eq!(profile_files(&dir), baseline);
+        assert!(events.lock().unwrap().is_empty());
+
+        let conflict = append_request_with("default", &rev_current, "t2", "w", "Other Title");
+        assert_eq!(
+            dispatch(
+                &ctx,
+                "fixture-host",
+                Request::WorkspaceAddTerminal(conflict)
+            ),
+            Err(OperationError::TerminalExists {
+                terminal_id: "t2".into(),
+                current_revision: rev_current.clone(),
+            })
+        );
+        assert_eq!(profile_files(&dir), baseline);
+        assert!(events.lock().unwrap().is_empty());
+
+        let stale = append_request("default", &rev_initial, "t3");
+        assert_eq!(
+            dispatch(&ctx, "fixture-host", Request::WorkspaceAddTerminal(stale)),
+            Err(OperationError::RevisionMismatch {
+                current_revision: rev_current.clone(),
+            })
+        );
+        assert_eq!(profile_files(&dir), baseline);
+        assert!(events.lock().unwrap().is_empty());
+
+        let unknown_ws = append_request_with("default", &rev_current, "t3", "missing-ws", "Term 2");
+        assert_eq!(
+            dispatch(
+                &ctx,
+                "fixture-host",
+                Request::WorkspaceAddTerminal(unknown_ws)
+            ),
+            Err(OperationError::WorkspaceNotFound("missing-ws".into()))
+        );
+        assert_eq!(profile_files(&dir), baseline);
+        assert!(events.lock().unwrap().is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(all(not(feature = "desktop"), not(windows)))]
+    #[test]
+    fn dispatch_append_checks_the_profile_before_any_write() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        use workspace::{OperationError, Request};
+
+        let dir = append_fixture_dir("append-profile-checks");
+        let (ctx, events) = append_host(Some(dir.clone()));
+        let (_, con_rev) = read_profile_revision(&ctx, "CON");
+        let con_request = append_request("CON", &con_rev, "t2");
+        let initial_files = profile_files(&dir);
+
+        assert_eq!(
+            dispatch_append(&ctx, "fixture-host", &con_request, true),
+            Err(OperationError::WorkspaceUnavailable)
+        );
+        assert_eq!(profile_files(&dir), initial_files);
+        assert!(events.lock().unwrap().is_empty());
+
+        let con_reply = dispatch_append(&ctx, "fixture-host", &con_request, false).unwrap();
+        assert_eq!(con_reply["appended"], true);
+        assert_eq!(con_reply["profileId"], "CON");
+        assert_eq!(events.lock().unwrap().len(), 1);
+        events.lock().unwrap().clear();
+        let baseline = profile_files(&dir);
+
+        let default_request = append_request("default", &con_rev, "t2");
+        let (no_dir_ctx, no_dir_events) = append_host(None);
+        assert_eq!(
+            dispatch(
+                &no_dir_ctx,
+                "fixture-host",
+                Request::WorkspaceAddTerminal(default_request.clone())
+            ),
+            Err(OperationError::WorkspaceUnavailable)
+        );
+        assert_eq!(profile_files(&dir), baseline);
+        assert!(no_dir_events.lock().unwrap().is_empty());
+
+        let empty_dir = std::env::temp_dir().join(format!(
+            "bac-dispatch-noindex-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(empty_dir.join("profiles")).unwrap();
+        let (empty_ctx, empty_events) = append_host(Some(empty_dir.clone()));
+        assert_eq!(
+            dispatch(
+                &empty_ctx,
+                "fixture-host",
+                Request::WorkspaceAddTerminal(default_request)
+            ),
+            Err(OperationError::WorkspaceUnavailable)
+        );
+        assert!(profile_files(&empty_dir).is_empty());
+        assert!(empty_events.lock().unwrap().is_empty());
+        fs::remove_dir_all(empty_dir).unwrap();
+
+        let unknown_request = append_request("missing", &con_rev, "t2");
+        assert_eq!(
+            dispatch(
+                &ctx,
+                "fixture-host",
+                Request::WorkspaceAddTerminal(unknown_request)
+            ),
+            Err(OperationError::ProfileNotFound)
+        );
+        assert_eq!(profile_files(&dir), baseline);
+        assert!(events.lock().unwrap().is_empty());
+
+        let remote_request = append_request("remote", &con_rev, "t2");
+        assert_eq!(
+            dispatch(
+                &ctx,
+                "fixture-host",
+                Request::WorkspaceAddTerminal(remote_request)
+            ),
+            Err(OperationError::ProfileNotLocal)
+        );
+        assert_eq!(profile_files(&dir), baseline);
+        assert!(events.lock().unwrap().is_empty());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    #[test]
+    fn dispatch_append_reply_survives_a_panicking_event_sink() {
+        use workspace::Request;
+
+        let dir = append_fixture_dir("append-panic-sink");
+        let mut host = crate::host_context::HeadlessHost::new(
+            Some(dir.clone()),
+            Arc::new(|topic, _| panic!("sink panicked on {topic}")),
+        );
+        host.manage(crate::event_hub::RuntimeEventHubState::default());
+        host.manage(crate::remote_server::RustRemoteServerState::default());
+        let ctx = HostContext::from_headless(Arc::new(host));
+
+        let (_, rev_before) = read_profile_revision(&ctx, "default");
+        let reply = dispatch(
+            &ctx,
+            "fixture-host",
+            Request::WorkspaceAddTerminal(append_request("default", &rev_before, "t2")),
+        )
+        .unwrap();
+        assert_eq!(reply["appended"], true);
+        let rev_after = reply["revision"].as_str().unwrap().to_owned();
+
+        let saved_raw = std::fs::read(dir.join("profiles").join("default.json")).unwrap();
+        let saved: Value = serde_json::from_slice(&saved_raw).unwrap();
+        let saved_ids: Vec<&str> = saved["windows"][0]["terminals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|term| term["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(saved_ids, vec!["t", "t2"]);
+
+        let (read_after, read_rev) = read_profile_revision(&ctx, "default");
+        assert_eq!(read_rev, rev_after);
+        assert_eq!(read_after["document"]["terminals"][1]["id"], "t2");
+
+        let retry = dispatch(
+            &ctx,
+            "fixture-host",
+            Request::WorkspaceAddTerminal(append_request("default", &rev_after, "t2")),
+        )
+        .unwrap();
+        assert_eq!(retry["appended"], false);
+        assert_eq!(retry["revision"], rev_after);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
