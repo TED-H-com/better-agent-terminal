@@ -2,15 +2,16 @@
 
 Authentication adds only `capabilities.bac = {"protocol":"bac/1","minor":0}`
 to version 2 results. Authentication does no identity I/O. Version 1 is unchanged.
-`serverVersion` remains the upstream version. All four feature flags are false.
+`serverVersion` remains the upstream version. `workspaceRead` and `sessionLocate`
+are true; `workspaceAddTerminal` and `gitObserve` are false.
 
 `bac:hello` takes `{protocol:"bac/1", minor:0, expectedHostId?:string}` in the
 existing invoke envelope. Validation order is shape, size, presence of `contextId`,
 version, storage, expected identity. The 65,536-byte request limit measures compact
 re-serialization of the decoded frame, not received bytes. Any `contextId` value,
 including null, is refused. Results are bounded to 524,288 bytes including the
-invoke-result envelope. Other BAC names require hello, then return
-`UNSUPPORTED_FEATURE` for the four advertised features or `UNKNOWN_CHANNEL`.
+invoke-result envelope. Other BAC names require hello. Disabled features return
+`UNSUPPORTED_FEATURE`; unknown channels return `UNKNOWN_CHANNEL`.
 
 A refused hello retains an existing negotiation except `HOST_MISMATCH`, which
 revokes it and returns the actual host ID. State transitions are serialized, not
@@ -115,3 +116,106 @@ results; upstream v3.2.18 does not cap that frame. The constant advertisement ad
 37 serialized bytes. A baseline result of 4,194,303 bytes therefore becomes a
 REMOTE_RESPONSE_TOO_LARGE error. This known fork interaction must disappear when
 the cap is removed from authentication; no cap change is part of this contract.
+
+
+## Read-only workspace and session location
+
+`bac:workspace-read` accepts exactly `{ "profileId": <ProfileId> }` and
+`bac:session-locate` accepts exactly `{ "sessionId": <SessionId> }`. A
+`SessionId` is 1–128 UTF-8 bytes, each in `[A-Za-z0-9_.:-]`. A `ProfileId` is
+1–128 UTF-8 bytes, each character ASCII alphanumeric, `_`, `.`, `-`, or in
+`U+4E00`–`U+9FFF` inclusive (`:` is not allowed). This grammar applies to
+request fields and catalog addressability only; stored workspace, terminal, and
+window IDs are not rewritten or rejected by workspace read. Invalid input returns
+`INVALID_REQUEST` with a static `details.field`, without echoing caller values.
+Feature operations use the host ID negotiated by `bac:hello` and release the
+negotiation lock before reading application state.
+
+Read returns `hostId`, `profileId`, `source` (`live` or `persisted`), nullable
+`windowId`, `revision`, `document`, and `appendTargetEligible`. A local profile
+uses the latest nonempty regular in-memory window; detached windows are never the
+read target. Otherwise it uses the first saved window; no saved windows produce
+the five-field empty workspace with `appendTargetEligible: false`. The document
+is not overlaid with runtime metadata. `appendTargetEligible` reports structural
+preconditions and, for saved snapshots, requires exactly one saved window. For
+saved snapshots, `appendTargetEligible` also requires the raw first window itself
+to contain `workspaces` and `terminals` arrays of objects with non-empty string
+`id` fields, even when the rendered `document` defaults missing fields to `[]`.
+
+```json
+{"hostId":"h_0123456789abcdef0123456789abcdef","profileId":"default","source":"persisted","windowId":null,"revision":"sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c","document":{"workspaces":[],"activeWorkspaceId":null,"activeGroup":null,"terminals":[],"activeTerminalId":null},"appendTargetEligible":false}
+```
+
+A document revision is `sha256:` followed by the lowercase SHA-256 of compact
+UTF-8 JSON with object keys recursively sorted and array order retained. `null`
+and absent fields remain distinct. The empty example hashes the canonical
+100-byte serialization, not the empty byte string.
+
+Locate observes the in-memory registry, then local catalog profiles and saved
+profile windows sequentially; it does not promise an atomic cross-source view.
+It returns `hostId`, `locationRevision`, `disposition` (`unregistered`,
+`located`, or `ambiguous`), `consistency: "sequential"`, `atomic: false`, and
+sorted `locations`. Each row contains `profileId`, `workspaceId`, `terminalId`,
+nullable `windowId`, `source`, and `profileRevision`. A regular live placement
+suppresses a matching saved placement; a detached window contributes only its
+own workspace and suppresses no saved placement. Exact five-tuples are
+deduplicated. A row's `profileRevision` is the revision workspace read would
+return for that profile from the same observation, not a digest of the window
+where that row was found. `locationRevision` hashes the sorted multiset of
+profile, source, window, and document revision tuples across all observed local
+documents.
+
+Before the desktop host loads its registry, `windows.json` is not consulted;
+read and locate use saved profiles. An empty in-memory registry means no live
+placement, including in desktop-compiled servers. Neither operation seeds,
+repairs, or hydrates the catalog or registry. Under the profile index lock, local
+catalog reads inspect both `index.json` and `index.json.bak` with
+`symlink_metadata` before reading; each must be absent or a regular file of at
+most 8 MiB (with at least one present), otherwise the operation returns
+`WORKSPACE_UNAVAILABLE` (or `LOCATION_UNAVAILABLE` with empty `profileIds` for
+locate) without reading either catalog file. Remote and uncatalogued registry
+entries are ignored. Saved profile reads inspect `metadata` (following symlinks) before opening,
+open with `O_NONBLOCK` on Unix, and require `is_file()` on the opened handle
+before reading. On Windows, any saved profile whose ID prefix before the first
+`.` equals (ASCII case-insensitive) `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`,
+or `LPT0`–`LPT9` is treated as unreadable with 0 bytes read without touching the
+filesystem. Missing paths and dangling symlinks produce no saved windows
+with 0 bytes read; non-regular entries and metadata or open failures report
+unreadability with 0 bytes read without retrying; regular files whose metadata
+exceeds 8 MiB immediately report too large with 0 bytes read without retrying.
+Readable regular files use a single parsed buffer, at most 8 MiB per file, with
+up to three attempts for torn or invalid JSON and 20 ms between attempts. A
+locate scan reads no more than 64 MiB in total.
+
+The 11-key `bac:hello` limits map is unchanged: `requestBytes: 65536`,
+`resultBytes: 524288`, `registrationBytes: 16384`, `profiles: 256`,
+`terminals: 4096`, `locationMatches: 100`, `gitStatusBytes: 4194304`,
+`gitIndexBytes: 16777216`, `gitPaths: 10000`, `gitTimeoutMs: 5000`, and
+`gitAttempts: 2`. Compact canonical workspace documents and complete compact
+locate results are limited to 520,192 bytes. A registry `windowId` is limited
+to 1,024 UTF-8 bytes in JSON encoding, including quotes and escapes. If any
+regular or detached window of the target local profile exceeds that bound,
+read returns `WORKSPACE_UNAVAILABLE` without saved fallback; locate lists that
+profile in `LOCATION_UNAVAILABLE.details.profileIds`. Locate also limits local
+profiles to 256, observed terminals to 4,096 before filtering, and matching rows
+to 100. These bounds keep the complete replies within the 524,288-byte frame
+limit.
+
+Operation failures have `{ "ok": false, "error": { "code", "message",
+"retryable": false, "details" } }`:
+
+| Code | Message | Details |
+|---|---|---|
+| `INVALID_REQUEST` | `Invalid BAC request` | `{ "field": <static path> }` |
+| `PROFILE_NOT_FOUND` | `Local profile not found` | `{}` |
+| `PROFILE_NOT_LOCAL` | `BAC requires a local profile` | `{}` |
+| `WORKSPACE_UNAVAILABLE` | `Canonical workspace is unavailable` | `{}` |
+| `WORKSPACE_TOO_LARGE` | `Canonical workspace exceeds limit` | `{ "maxBytes": 520192 }` |
+| `LOCATION_UNAVAILABLE` | `Session locations are unavailable` | `{ "profileIds": <sorted unique IDs> }` |
+| `LOCATION_TOO_LARGE` | `Session locations exceed limit` | `{}` |
+| `INTERNAL_ERROR` | `BAC request failed` | `{}` |
+
+A catalog failure or invalid local catalog ID returns `LOCATION_UNAVAILABLE`
+with an empty `profileIds` list. Unreadable local saved documents or oversized
+window IDs contribute their profile IDs. The append and git channels remain
+unavailable.

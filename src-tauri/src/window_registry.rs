@@ -6,6 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
+// bac-hook: registry-adapter
+#[path = "bac/window_registry.rs"]
+pub(crate) mod bac_workspace;
 
 const WINDOWS_FILE: &str = "windows.json";
 const WORKSPACES_FILE: &str = "workspaces.json";

@@ -130,7 +130,7 @@
       "reason": "Derived graph includes restored Rust security versions, local GLib, PM libc and bat-error-log.",
       "plan": "keep",
       "planReason": "Follow bac/SYNC.md#raise-a-rust-dependency-floor; compare parsed lock records so only intended packages differ, then require --locked resolution, floors and the exact backport source.",
-      "added": 180,
+      "added": 182,
       "removed": 86,
       "digest": null
     },
@@ -158,6 +158,21 @@
       "added": 30,
       "removed": 0,
       "digest": "1809a0abe46aa80fa9a0c230f1425c2a82982eda479da66943bd1a0c3e115c47"
+    },
+    {
+      "path": "src-tauri/crates/bat-app-storage/src/profile.rs",
+      "kind": "hook",
+      "feature": "read-only workspace contracts",
+      "reason": "The marked hooks expose catalog reading without credential hydration and the existing snapshot migration so bounded reads parse the file only once.",
+      "plan": "keep",
+      "planReason": "Retain the smallest storage access and visibility hooks while read-only BAC operations use upstream formats.",
+      "added": 9,
+      "removed": 2,
+      "digest": "ffc993227330f7b29f6735d7c8693e6ea1491c0bfa1d60fd8bbddcb1365b3206",
+      "hooks": [
+        "catalog-without-hydration",
+        "snapshot-migrate-visibility"
+      ]
     },
     {
       "path": "src-tauri/crates/bat-pty/src/pty.rs",
@@ -232,6 +247,20 @@
         "host-dispatch",
         "host-reply-id",
         "host-fixture-tests"
+      ]
+    },
+    {
+      "path": "src-tauri/src/window_registry.rs",
+      "kind": "hook",
+      "feature": "read-only workspace contracts",
+      "reason": "A marked module hook lets the BAC observer access the in-memory registry without loading or mutating it.",
+      "plan": "keep",
+      "planReason": "Retain minimal registry module registration while the implementation remains in the BAC adapter.",
+      "added": 3,
+      "removed": 0,
+      "digest": "a8bc2b5c7a31bafad7d4c13ab4cf73d0ecb1031671624b7f07707b1d7029c825",
+      "hooks": [
+        "registry-adapter"
       ]
     },
     {
@@ -335,6 +364,10 @@
       "feature": "error log"
     },
     {
+      "path": "src-tauri/src/bac/catalog.rs",
+      "feature": "read-only workspace contracts"
+    },
+    {
       "path": "src-tauri/src/bac/remote_server.rs",
       "feature": "opt-in host contracts"
     },
@@ -345,6 +378,10 @@
     {
       "path": "src-tauri/src/bac/remote_server_tests.rs",
       "feature": "opt-in host contracts"
+    },
+    {
+      "path": "src-tauri/src/bac/window_registry.rs",
+      "feature": "read-only workspace contracts"
     },
     {
       "path": "src-tauri/src/codex_pm_runtime.rs",

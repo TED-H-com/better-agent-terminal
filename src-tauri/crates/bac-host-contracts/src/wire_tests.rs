@@ -13,9 +13,13 @@ fn hello() -> Value {
     f
 }
 fn call(c: &Connection, f: &Value) -> Value {
-    c.invoke(true, f["channel"].as_str().unwrap_or(""), f, || {
-        Ok(HOST.into())
-    })
+    c.invoke(
+        true,
+        f["channel"].as_str().unwrap_or(""),
+        f,
+        || Ok(HOST.into()),
+        |_, _| panic!("unexpected feature dispatch"),
+    )
 }
 fn code(value: &Value) -> &str {
     value["error"]["code"].as_str().unwrap()
@@ -108,7 +112,7 @@ fn every_common_error_has_the_exact_envelope() {
 fn opt_in_precedes_every_non_hello_validation_and_is_connection_local() {
     for name in STAGE_A_CHANNELS
         .iter()
-        .map(|(n, _)| *n)
+        .map(|(n, _, _)| *n)
         .chain(["bac:unknown"])
     {
         let mut f = frame(name);
@@ -130,14 +134,14 @@ fn hello_is_idempotent_and_features_are_unavailable() {
     assert_eq!(first["ok"], true);
     assert_eq!(first, call(&c, &hello()));
     assert_eq!(first["value"]["hostId"], HOST);
-    for (_, v) in first["value"]["features"].as_object().unwrap() {
-        assert_eq!(v, false);
-    }
-    for (name, feature) in STAGE_A_CHANNELS {
-        assert_eq!(
-            call(&c, &frame(name)),
-            Error::UnsupportedFeature(feature).reply()
-        );
+    for (name, feature, enabled) in STAGE_A_CHANNELS {
+        assert_eq!(first["value"]["features"][feature], enabled);
+        if !enabled {
+            assert_eq!(
+                call(&c, &frame(name)),
+                Error::UnsupportedFeature(feature).reply()
+            );
+        }
     }
     assert_eq!(
         call(&c, &frame("bac:future")),
@@ -196,7 +200,7 @@ fn invalid_shapes_never_touch_storage() {
     for f in cases {
         let result = Connection::default().invoke(true, "bac:hello", &f, || {
             panic!("invalid shape read storage")
-        });
+        }, |_, _| panic!("unexpected feature dispatch"));
         assert_eq!(code(&result), "INVALID_REQUEST", "{f}");
     }
 }
@@ -206,12 +210,12 @@ fn size_precedes_context_and_context_precedes_storage() {
     let mut f = hello();
     f["contextId"] = Value::Null;
     assert_eq!(
-        code(&c.invoke(true, "bac:hello", &f, || panic!("context touched storage"))),
+        code(&c.invoke(true, "bac:hello", &f, || panic!("context touched storage"), |_, _| panic!("unexpected feature dispatch"))),
         "CONTEXT_NOT_SUPPORTED"
     );
     f["params"]["protocol"] = json!("x".repeat(REQUEST_BYTES));
     assert_eq!(
-        code(&c.invoke(true, "bac:hello", &f, || panic!("oversize touched storage"))),
+        code(&c.invoke(true, "bac:hello", &f, || panic!("oversize touched storage"), |_, _| panic!("unexpected feature dispatch"))),
         "PAYLOAD_TOO_LARGE"
     );
     f["params"]["minor"] = Value::Null;
@@ -226,7 +230,7 @@ fn version_precedes_storage_and_errors_do_not_opt_in() {
         assert_eq!(
             c.invoke(v2, "bac:hello", &f, || panic!(
                 "unsupported version must not touch storage"
-            )),
+            ), |_, _| panic!("unexpected feature dispatch")),
             Error::UnsupportedVersion.reply()
         );
         assert_eq!(code(&call(&c, &frame("bac:future"))), "NOT_OPTED_IN");
@@ -237,7 +241,7 @@ fn version_precedes_storage_and_errors_do_not_opt_in() {
         Error::Internal,
     ] {
         assert_eq!(
-            c.invoke(true, "bac:hello", &hello(), || Err(err.clone())),
+            c.invoke(true, "bac:hello", &hello(), || Err(err.clone()), |_, _| panic!("unexpected feature dispatch")),
             err.reply()
         );
         assert_eq!(code(&call(&c, &frame("bac:future"))), "NOT_OPTED_IN");
@@ -300,7 +304,7 @@ fn non_hello_does_not_load_identity_again() {
     c.invoke(true, "bac:future", &frame("bac:future"), || {
         n.fetch_add(1, Ordering::SeqCst);
         Ok(HOST.into())
-    });
+    }, |_, _| panic!("unexpected feature dispatch"));
     assert_eq!(n.load(Ordering::SeqCst), 0);
 }
 #[test]
@@ -311,4 +315,145 @@ fn poisoned_connection_returns_internal_error() {
         panic!("injected poison");
     });
     assert_eq!(call(&c, &hello()), Error::Internal.reply());
+}
+
+#[test]
+fn hello_features_and_limits_match_dispatch_constants() {
+    let value = hello_value(HOST);
+    assert_eq!(
+        value["features"].as_object().unwrap().len(),
+        STAGE_A_CHANNELS.len()
+    );
+    for (_, feature, enabled) in STAGE_A_CHANNELS {
+        assert_eq!(value["features"][feature], enabled);
+    }
+    assert_eq!(
+        value["limits"],
+        json!({
+            "requestBytes":REQUEST_BYTES,"resultBytes":RESULT_BYTES,
+            "registrationBytes":REGISTRATION_BYTES,"profiles":PROFILES_LIMIT,
+            "terminals":TERMINALS_LIMIT,"locationMatches":LOCATION_MATCHES_LIMIT,
+            "gitStatusBytes":GIT_STATUS_BYTES_LIMIT,"gitIndexBytes":GIT_INDEX_BYTES_LIMIT,
+            "gitPaths":GIT_PATHS_LIMIT,"gitTimeoutMs":GIT_TIMEOUT_MS_LIMIT,
+            "gitAttempts":GIT_ATTEMPTS_LIMIT
+        })
+    );
+}
+
+#[test]
+fn dispatch_releases_negotiation_guard_before_run() {
+    use std::{sync::mpsc, time::Duration};
+    let connection = Arc::new(Connection::default());
+    assert_eq!(call(&connection, &hello())["ok"], true);
+    let mut request = frame("bac:workspace-read");
+    request["params"] = json!({"profileId":"default"});
+    let inside = connection.clone();
+    let result = connection.invoke(
+        true,
+        "bac:workspace-read",
+        &request,
+        || panic!("feature must not load identity"),
+        |_, _| {
+            let (send, receive) = mpsc::channel();
+            let other = std::thread::spawn(move || {
+                send.send(call(&inside, &hello())).unwrap();
+            });
+            let concurrent = receive
+                .recv_timeout(Duration::from_secs(5))
+                .expect("hello blocked while feature ran");
+            assert_eq!(concurrent["ok"], true);
+            other.join().unwrap();
+            Ok(json!({"complete":true}))
+        },
+    );
+    assert_eq!(result["value"]["complete"], true);
+}
+
+#[test]
+fn dispatch_disabled_feature_never_calls_run() {
+    let connection = Connection::default();
+    assert_eq!(call(&connection, &hello())["ok"], true);
+    for (name, feature, enabled) in STAGE_A_CHANNELS {
+        if !enabled {
+            let reply = connection.invoke(
+                true,
+                name,
+                &frame(name),
+                || panic!("feature must not load identity"),
+                |_, _| panic!("disabled feature ran"),
+            );
+            assert_eq!(reply, Error::UnsupportedFeature(feature).reply());
+        }
+    }
+}
+
+#[test]
+fn dispatch_invalid_params_never_calls_run() {
+    let connection = Connection::default();
+    assert_eq!(call(&connection, &hello())["ok"], true);
+    for (name, key, field) in [
+        ("bac:workspace-read", "profileId", "params.profileId"),
+        ("bac:session-locate", "sessionId", "params.sessionId"),
+    ] {
+        for (params, invalid_field) in [
+            (Value::Null, "params"),
+            (json!({}), field),
+            (json!({(key): null}), field),
+            (json!({(key): ""}), field),
+            (json!({(key): "bad/id"}), field),
+            (json!({(key): "x".repeat(129)}), field),
+            (json!({(key): "valid", "extra": true}), "params"),
+        ] {
+            let mut request = frame(name);
+            request["params"] = params;
+            let reply = connection.invoke(
+                true,
+                name,
+                &request,
+                || panic!("feature must not load identity"),
+                |_, _| panic!("invalid request ran"),
+            );
+            assert_eq!(
+                reply,
+                crate::workspace::OperationError::InvalidRequest(invalid_field).reply()
+            );
+        }
+    }
+}
+
+#[test]
+fn dispatch_passes_negotiated_host_id_and_revokes_on_mismatch() {
+    let connection = Connection::default();
+    assert_eq!(call(&connection, &hello())["ok"], true);
+    for (channel, params) in [
+        ("bac:workspace-read", json!({"profileId":"default"})),
+        ("bac:session-locate", json!({"sessionId":"terminal"})),
+    ] {
+        let mut request = frame(channel);
+        request["params"] = params;
+        let reply = connection.invoke(
+            true,
+            channel,
+            &request,
+            || panic!("feature must not load identity"),
+            |host, _| {
+                assert_eq!(host, HOST);
+                Ok(json!({"host":host}))
+            },
+        );
+        assert_eq!(reply["value"]["host"], HOST);
+    }
+    let mut bad_hello = hello();
+    bad_hello["params"]["expectedHostId"] = json!("h_ffffffffffffffffffffffffffffffff");
+    assert_eq!(code(&call(&connection, &bad_hello)), "HOST_MISMATCH");
+    let mut request = frame("bac:workspace-read");
+    request["params"] = json!({"profileId":"default"});
+    let reply = connection.invoke(
+        true,
+        "bac:workspace-read",
+        &request,
+        || panic!("revoked feature loaded identity"),
+        |_, _| panic!("revoked feature ran"),
+    );
+    assert_eq!(code(&reply), "NOT_OPTED_IN");
 }

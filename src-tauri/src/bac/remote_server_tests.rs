@@ -245,6 +245,8 @@ mod bac_tests {
                 error(invoke(&mut a, json!({"channel":name,"params":{}}))),
                 if name == "bac:future" {
                     "UNKNOWN_CHANNEL"
+                } else if name == "bac:workspace-read" || name == "bac:session-locate" {
+                    "INVALID_REQUEST"
                 } else {
                     "UNSUPPORTED_FEATURE"
                 }
@@ -279,6 +281,201 @@ mod bac_tests {
         assert_eq!(hello(&mut reconnect), first);
         b.close(None).unwrap();
         reconnect.close(None).unwrap();
+    }
+    #[test]
+    fn ws_read_and_locate_empty_registry_persisted_roundtrip() {
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"empty","name":"Empty","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"remote","name":"Remote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        let snapshot = json!({"version":2,"windows":[{"workspaces":[{"id":"w"}],
+            "terminals":[{"id":"t","workspaceId":"w"}]}]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("default.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("empty.json"),
+            br#"{"version":2,"windows":[]}"#,
+        )
+        .unwrap();
+
+        let (mut ws, _, _) = connect(&host, true);
+        let first = hello(&mut ws);
+        assert_eq!(first["ok"], true);
+        assert_eq!(
+            first["value"]["features"],
+            json!({
+                "workspaceRead":true,"workspaceAddTerminal":false,"sessionLocate":true,"gitObserve":false
+            })
+        );
+        assert_eq!(
+            first["value"]["limits"],
+            json!({
+                "requestBytes":65536,"resultBytes":524288,"registrationBytes":16384,
+                "profiles":256,"terminals":4096,"locationMatches":100,"gitStatusBytes":4194304,
+                "gitIndexBytes":16777216,"gitPaths":10000,"gitTimeoutMs":5000,"gitAttempts":2
+            })
+        );
+        let read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"default"}}),
+        );
+        assert_eq!(read["ok"], true);
+        assert_eq!(read["value"]["source"], "persisted");
+        assert!(read["value"]["windowId"].is_null());
+        assert_eq!(read["value"]["document"]["terminals"][0]["id"], "t");
+        let empty = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"empty"}}),
+        );
+        assert_eq!(
+            empty["value"]["revision"],
+            "sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c"
+        );
+        assert_eq!(empty["value"]["appendTargetEligible"], false);
+        let locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t"}}),
+        );
+        assert_eq!(locate["value"]["disposition"], "located");
+        assert_eq!(locate["value"]["consistency"], "sequential");
+        assert_eq!(locate["value"]["atomic"], false);
+        assert_eq!(locate["value"]["locations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            locate["value"]["locations"][0]["profileRevision"],
+            read["value"]["revision"]
+        );
+
+        // A test gate holds the bounded saved read inside dispatch while a second
+        // invoke on this same connection must still complete its hello.
+        let (ready_rx, release_tx, _gate_guard) = bac::install_saved_read_gate(&profiles);
+        ws.send(Message::Text(
+            json!({"type":"invoke","id":"slow-read",
+            "channel":"bac:workspace-read","params":{"profileId":"default"}})
+            .to_string()
+            .into(),
+        ))
+        .unwrap();
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("saved read did not start");
+        ws.send(Message::Text(
+            json!({"type":"invoke","id":"during-read",
+            "channel":"bac:hello","params":{"protocol":"bac/1","minor":0}})
+            .to_string()
+            .into(),
+        ))
+        .unwrap();
+        loop {
+            let value = decode_remote_text_frame(&ws.read().unwrap().into_text().unwrap()).unwrap();
+            if value["id"] == "during-read" {
+                assert_eq!(value["result"], first);
+                break;
+            }
+            assert_ne!(
+                value["id"], "slow-read",
+                "slow read returned before release"
+            );
+        }
+        release_tx.send(()).unwrap();
+        loop {
+            let value = decode_remote_text_frame(&ws.read().unwrap().into_text().unwrap()).unwrap();
+            if value["id"] == "slow-read" {
+                assert_eq!(value["result"]["ok"], true);
+                assert_eq!(
+                    value["result"]["value"]["revision"],
+                    read["value"]["revision"]
+                );
+                break;
+            }
+        }
+        ws.close(None).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ws_locate_fifo_profile_returns_location_unavailable_and_does_not_block_followup() {
+        use std::{
+            ffi::CString,
+            os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+            sync::mpsc,
+        };
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"fifo-profile","name":"FIFO","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        let snapshot = json!({"version":2,"windows":[{"workspaces":[{"id":"w"}],
+            "terminals":[{"id":"t","workspaceId":"w"}]}]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("default.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        let fifo_path = profiles.join("fifo-profile.json");
+        let fifo = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let (mut ws, _, _) = connect(&host, true);
+        assert_eq!(hello(&mut ws)["ok"], true);
+
+        let run_locate = |mut ws: Socket| -> (Socket, Value) {
+            let (tx, rx) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let reply = invoke(
+                    &mut ws,
+                    json!({"channel":"bac:session-locate","params":{"sessionId":"t"}}),
+                );
+                let _ = tx.send((ws, reply));
+            });
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(pair) => {
+                    handle.join().unwrap();
+                    pair
+                }
+                Err(error) => {
+                    let _ = fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo_path);
+                    let _ = handle.join();
+                    panic!("bac:session-locate did not return within 5s: {error}");
+                }
+            }
+        };
+
+        let (ws, first) = run_locate(ws);
+        assert_eq!(first["ok"], false);
+        assert_eq!(first["error"]["code"], "LOCATION_UNAVAILABLE");
+        assert_eq!(
+            first["error"]["details"],
+            json!({"profileIds":["fifo-profile"]})
+        );
+
+        let (mut ws, second) = run_locate(ws);
+        assert_eq!(second["ok"], false);
+        assert_eq!(second["error"]["code"], "LOCATION_UNAVAILABLE");
+        assert_eq!(
+            second["error"]["details"],
+            json!({"profileIds":["fifo-profile"]})
+        );
+
+        ws.close(None).unwrap();
     }
     #[test]
     fn wire_hello_validation_and_expected_identity() {
@@ -511,5 +708,341 @@ mod bac_tests {
             }
             ws.close(None).unwrap();
         }
+    }
+
+    #[test]
+    fn ws_profile_id_grammar_supports_chinese_rejects_colon_and_keeps_session_id() {
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let chinese = "\u{4e2d}\u{6587}";
+        let cjk_42 = "\u{4e00}".repeat(42);
+        let cjk_43 = "\u{4e00}".repeat(43);
+        let index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":chinese,"name":"Chinese","type":"local","createdAt":0,"updatedAt":0},
+            {"id":cjk_42,"name":"MaxCJK","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let chinese_snapshot = json!({"version":2,"windows":[{"workspaces":[{"id":"w"}],
+            "terminals":[{"id":"a:b","workspaceId":"w"}]}]});
+        fs::write(
+            profiles.join(format!("{chinese}.json")),
+            serde_json::to_vec(&chinese_snapshot).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join(format!("{cjk_42}.json")),
+            br#"{"version":2,"windows":[{"workspaces":[{"id":"w42"}],"terminals":[]}]}"#,
+        )
+        .unwrap();
+
+        let (mut ws, _, _) = connect(&host, true);
+        assert_eq!(hello(&mut ws)["ok"], true);
+
+        let read_cn = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":chinese}}),
+        );
+        assert_eq!(read_cn["ok"], true);
+        assert_eq!(read_cn["value"]["profileId"], chinese);
+        assert_eq!(read_cn["value"]["document"]["terminals"][0]["id"], "a:b");
+
+        let read_42 = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":cjk_42}}),
+        );
+        assert_eq!(read_42["ok"], true);
+        assert_eq!(read_42["value"]["document"]["workspaces"][0]["id"], "w42");
+
+        for invalid_profile in ["a:b", &cjk_43, "\u{3042}", "\u{ac00}"] {
+            let reply = invoke(
+                &mut ws,
+                json!({"channel":"bac:workspace-read","params":{"profileId":invalid_profile}}),
+            );
+            assert_eq!(error(reply.clone()), "INVALID_REQUEST");
+            assert_eq!(reply["error"]["details"]["field"], "params.profileId");
+        }
+
+        let locate_colon = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"a:b"}}),
+        );
+        assert_eq!(locate_colon["ok"], true);
+        assert_eq!(locate_colon["value"]["disposition"], "located");
+        assert_eq!(locate_colon["value"]["locations"][0]["profileId"], chinese);
+        assert_eq!(
+            locate_colon["value"]["locations"][0]["profileRevision"],
+            read_cn["value"]["revision"]
+        );
+
+        let locate_chinese_session = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":chinese}}),
+        );
+        assert_eq!(error(locate_chinese_session.clone()), "INVALID_REQUEST");
+        assert_eq!(
+            locate_chinese_session["error"]["details"]["field"],
+            "params.sessionId"
+        );
+
+        let bad_index = json!({"profiles":[
+            {"id":"a:b","name":"BadColon","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&bad_index).unwrap(),
+        )
+        .unwrap();
+        let locate_bad_catalog = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"a:b"}}),
+        );
+        assert_eq!(error(locate_bad_catalog.clone()), "LOCATION_UNAVAILABLE");
+        assert_eq!(locate_bad_catalog["error"]["details"]["profileIds"], json!([]));
+
+        ws.close(None).unwrap();
+    }
+
+    #[test]
+    fn ws_duplicate_catalog_ids_first_entry_decides_across_read_and_locate() {
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let write_snapshot = |id: &str, session_id: &str| {
+            let snapshot = json!({
+                "version": 2,
+                "windows": [{
+                    "workspaces": [{"id": "w"}],
+                    "terminals": [{"id": session_id, "workspaceId": "w"}]
+                }]
+            });
+            fs::write(
+                profiles.join(format!("{id}.json")),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+        };
+        write_snapshot("dup", "t-dup");
+        write_snapshot("remote_first", "t-rf");
+        write_snapshot("local_first", "t-lf");
+
+        let dup_index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"dup","name":"Dup1","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"dup","name":"Dup2","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"remote_first","name":"RFRemote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0},
+            {"id":"remote_first","name":"RFLocal","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"local_first","name":"LFLocal","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"local_first","name":"LFRemote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&dup_index).unwrap(),
+        )
+        .unwrap();
+
+        let (mut ws, _, _) = connect(&host, true);
+        assert_eq!(hello(&mut ws)["ok"], true);
+
+        let dup_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"dup"}}),
+        );
+        assert_eq!(dup_read["ok"], true);
+        assert_eq!(dup_read["value"]["document"]["terminals"][0]["id"], "t-dup");
+
+        let rf_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"remote_first"}}),
+        );
+        assert_eq!(error(rf_read), "PROFILE_NOT_LOCAL");
+
+        let lf_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"local_first"}}),
+        );
+        assert_eq!(lf_read["ok"], true);
+        assert_eq!(lf_read["value"]["document"]["terminals"][0]["id"], "t-lf");
+
+        let dup_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-dup"}}),
+        );
+        assert_eq!(dup_locate["ok"], true);
+        assert_eq!(dup_locate["value"]["disposition"], "located");
+        assert_eq!(dup_locate["value"]["locations"].as_array().unwrap().len(), 1);
+        assert_eq!(dup_locate["value"]["locations"][0]["profileId"], "dup");
+        assert_eq!(
+            dup_locate["value"]["locations"][0]["profileRevision"],
+            dup_read["value"]["revision"]
+        );
+
+        let rf_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-rf"}}),
+        );
+        assert_eq!(rf_locate["ok"], true);
+        assert_eq!(rf_locate["value"]["disposition"], "unregistered");
+        assert_eq!(rf_locate["value"]["locations"], json!([]));
+
+        let lf_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-lf"}}),
+        );
+        assert_eq!(lf_locate["ok"], true);
+        assert_eq!(lf_locate["value"]["disposition"], "located");
+        assert_eq!(lf_locate["value"]["locations"].as_array().unwrap().len(), 1);
+        assert_eq!(lf_locate["value"]["locations"][0]["profileId"], "local_first");
+        assert_eq!(
+            lf_locate["value"]["locations"][0]["profileRevision"],
+            lf_read["value"]["revision"]
+        );
+
+        let single_index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"dup","name":"Dup1","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"remote_first","name":"RFRemote","type":"remote","remoteToken":"fixture-only","createdAt":0,"updatedAt":0},
+            {"id":"local_first","name":"LFLocal","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&single_index).unwrap(),
+        )
+        .unwrap();
+
+        let single_dup_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"dup"}}),
+        );
+        let single_dup_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-dup"}}),
+        );
+        let single_lf_locate = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-lf"}}),
+        );
+        assert_eq!(dup_read, single_dup_read);
+        assert_eq!(dup_locate, single_dup_locate);
+        assert_eq!(
+            dup_locate["value"]["locationRevision"],
+            single_dup_locate["value"]["locationRevision"]
+        );
+        assert_eq!(lf_locate, single_lf_locate);
+
+        ws.close(None).unwrap();
+    }
+
+    #[test]
+    fn ws_read_corrupt_first_saved_window_renders_document_but_is_ineligible() {
+        let host = TestHost::new();
+        let profiles = host.dir.join("profiles");
+        let index = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"empty_obj","name":"EmptyObj","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"null_win","name":"NullWin","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"num_win","name":"NumWin","type":"local","createdAt":0,"updatedAt":0},
+            {"id":"no_ws_id","name":"NoWsId","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+
+        let valid_snapshot = json!({
+            "version": 2,
+            "windows": [{
+                "workspaces": [{"id": "w"}],
+                "terminals": [{"id": "t-valid", "workspaceId": "w"}]
+            }]
+        });
+        fs::write(
+            profiles.join("default.json"),
+            serde_json::to_vec(&valid_snapshot).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("empty_obj.json"),
+            br#"{"version":2,"windows":[{}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("null_win.json"),
+            br#"{"version":2,"windows":[null]}"#,
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("num_win.json"),
+            br#"{"version":2,"windows":[42]}"#,
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("no_ws_id.json"),
+            br#"{"version":2,"windows":[{"workspaces":[{}],"terminals":[]}]}"#,
+        )
+        .unwrap();
+
+        let (mut ws, _, _) = connect(&host, true);
+        assert_eq!(hello(&mut ws)["ok"], true);
+
+        let empty_doc = bac_host_contracts::workspace::empty_workspace_document();
+        for id in ["empty_obj", "null_win", "num_win"] {
+            let reply = invoke(
+                &mut ws,
+                json!({"channel":"bac:workspace-read","params":{"profileId":id}}),
+            );
+            assert_eq!(reply["ok"], true);
+            assert_eq!(reply["value"]["source"], "persisted");
+            assert!(reply["value"]["windowId"].is_null());
+            assert_eq!(reply["value"]["document"], empty_doc);
+            assert_eq!(reply["value"]["appendTargetEligible"], false);
+        }
+
+        let no_ws_id = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"no_ws_id"}}),
+        );
+        assert_eq!(no_ws_id["ok"], true);
+        assert_eq!(no_ws_id["value"]["document"]["workspaces"], json!([{}]));
+        assert_eq!(no_ws_id["value"]["document"]["terminals"], json!([]));
+        assert_eq!(no_ws_id["value"]["appendTargetEligible"], false);
+
+        let locate_bad = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-valid"}}),
+        );
+        assert_eq!(error(locate_bad.clone()), "LOCATION_UNAVAILABLE");
+        assert_eq!(
+            locate_bad["error"]["details"]["profileIds"],
+            json!(["empty_obj", "no_ws_id", "null_win", "num_win"])
+        );
+
+        let valid_read = invoke(
+            &mut ws,
+            json!({"channel":"bac:workspace-read","params":{"profileId":"default"}}),
+        );
+        assert_eq!(valid_read["ok"], true);
+        assert_eq!(valid_read["value"]["appendTargetEligible"], true);
+
+        let only_default = json!({"profiles":[
+            {"id":"default","name":"Default","type":"local","createdAt":0,"updatedAt":0}
+        ],"activeProfileIds":[]});
+        fs::write(
+            profiles.join("index.json"),
+            serde_json::to_vec(&only_default).unwrap(),
+        )
+        .unwrap();
+        let locate_valid = invoke(
+            &mut ws,
+            json!({"channel":"bac:session-locate","params":{"sessionId":"t-valid"}}),
+        );
+        assert_eq!(locate_valid["ok"], true);
+        assert_eq!(locate_valid["value"]["disposition"], "located");
+
+        ws.close(None).unwrap();
     }
 }
