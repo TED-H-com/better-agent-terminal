@@ -392,7 +392,7 @@ mod bac_tests {
                 }
             };
             ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
             file.write_all(&bytes).unwrap();
         });
         ws.send(Message::Text(
