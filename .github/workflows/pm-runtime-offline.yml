@@ -26,9 +26,14 @@ jobs:
           - source: upstream-baseline
             repository: tony1223/better-agent-terminal
             ref: 07e80f56275075195d05d58cf67a208934874557
+            # At this revision the result of this test on Linux depends on timing in
+            # the code under test, so the baseline job does not run it. Decide again
+            # whenever ref changes: docs/design/pm-runtime-offline-verification.md.
+            skipped_rust_test: "remote_server::tests::login_deadline_bounds_partial_reads_and_can_be_cleared_after_auth"
           - source: feature
             repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
             ref: ${{ github.event.pull_request.head.sha || github.sha }}
+            skipped_rust_test: ""
     env:
       CI: "true"
       CARGO_BUILD_JOBS: "2"
@@ -166,9 +171,25 @@ jobs:
         run: pnpm run check:tauri-rust --locked --no-default-features --features headless
 
       - name: Test full headless Rust workspace
-        run: >-
-          pnpm run test:tauri-rust --locked --no-default-features
-          --features headless --no-fail-fast -- --test-threads=1
+        env:
+          SKIPPED_RUST_TEST: ${{ matrix.skipped_rust_test }}
+        run: |
+          set -euo pipefail
+          test_args=(--test-threads=1)
+          if test -n "$SKIPPED_RUST_TEST"; then
+            # A name that is not exactly one test of this source fails the job
+            # instead of being skipped silently.
+            pnpm run test:tauri-rust --locked --no-default-features \
+              --features headless -- --list > "$RUNNER_TEMP/rust-tests.txt"
+            if test "$(grep -Fxc "$SKIPPED_RUST_TEST: test" "$RUNNER_TEMP/rust-tests.txt")" != 1; then
+              echo "::error::skipped_rust_test does not name exactly one test of this source: $SKIPPED_RUST_TEST"
+              exit 1
+            fi
+            test_args+=(--exact --skip "$SKIPPED_RUST_TEST")
+            printf 'Not run in this job: `%s`\n' "$SKIPPED_RUST_TEST" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          pnpm run test:tauri-rust --locked --no-default-features \
+            --features headless --no-fail-fast -- "${test_args[@]}"
 
       - name: Require unchanged tracked source
         run: git diff --exit-code HEAD

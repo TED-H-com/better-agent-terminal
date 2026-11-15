@@ -79,6 +79,8 @@ Use a dedicated sync branch and retain review evidence outside the repository. T
 
    Remove stale entries only after reviewing why they disappeared; reconcile own-directory collisions explicitly. Review every changed digest, reason, plan and hook declaration. `--update` cannot add a human explanation or resolve an ownership conflict. Lock counts remain informational, with native consistency and floor checks replacing digest pins.
 
+   Set `ref` of the `upstream-baseline` entry in `.github/workflows/pm-runtime-offline.yml` to the same commit; `bac-ci.yml` fails while it differs from `bac/UPSTREAM_BASE.json`. That entry's `skipped_rust_test` names one upstream test whose result on Linux depended on timing at v3.2.18 (`docs/design/pm-runtime-offline-verification.md`). Decide it again for the new base: read `DeadlineTcpStream::read` in the release's `src-tauri/src/remote_server.rs`, and remove the entry when that read no longer returns the socket's own timeout while a deadline is set. The job fails by itself when the named test no longer exists.
+
 6. **Run validation with an isolated home.** Prepare dependencies first. Keep package-manager/toolchain caches available when changing HOME; the example preserves standard cache locations without using the real home for application state.
 
    ```sh

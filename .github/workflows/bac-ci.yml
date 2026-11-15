@@ -37,6 +37,14 @@ jobs:
         run: node --test bac/tools/tests/*.test.mjs
       - name: Check security floor and local backport provenance
         run: node bac/tools/check-security-floor.mjs
+      - name: Require the offline verification baseline to be the recorded upstream base
+        run: |
+          base=$(node -p "require('./bac/UPSTREAM_BASE.json').commit")
+          [[ "$base" =~ ^[0-9a-f]{40}$ ]]
+          if test "$(grep -Ec "^ +ref: $base\$" .github/workflows/pm-runtime-offline.yml)" != 1; then
+            echo "::error::pm-runtime-offline.yml does not pin the upstream base recorded in bac/UPSTREAM_BASE.json ($base)."
+            exit 1
+          fi
       - name: Verify exact GLib backported source
         run: python3 scripts/verify-vendored-glib.py
       - name: Check TypeScript and build renderer
