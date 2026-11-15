@@ -2,8 +2,8 @@
 
 Authentication adds only `capabilities.bac = {"protocol":"bac/1","minor":0}`
 to version 2 results. Authentication does no identity I/O. Version 1 is unchanged.
-`serverVersion` remains the upstream version. `workspaceRead` and `sessionLocate`
-are true; `workspaceAddTerminal` and `gitObserve` are false.
+`serverVersion` remains the upstream version. `workspaceRead`, `sessionLocate` and
+`workspaceAddTerminal` are true; `gitObserve` is false.
 
 `bac:hello` takes `{protocol:"bac/1", minor:0, expectedHostId?:string}` in the
 existing invoke envelope. Validation order is shape, size, presence of `contextId`,
@@ -217,5 +217,210 @@ Operation failures have `{ "ok": false, "error": { "code", "message",
 
 A catalog failure or invalid local catalog ID returns `LOCATION_UNAVAILABLE`
 with an empty `profileIds` list. Unreadable local saved documents or oversized
-window IDs contribute their profile IDs. The append and git channels remain
-unavailable.
+window IDs contribute their profile IDs. The git channel remains unavailable.
+
+## Workspace terminal append
+
+`bac:workspace-add-terminal` accepts
+`{ "profileId": <ProfileId>, "expectedRevision": <Revision>, "terminal": <Registration> }`
+with no additional keys. `profileId` uses the `ProfileId` grammar
+(`valid_profile_id`), and `expectedRevision` must be `sha256:` followed by 64
+lowercase hexadecimal ASCII digits (`valid_revision`). `terminal` must be a JSON
+object whose compact UTF-8 encoding is at most `REGISTRATION_BYTES` (`16,384`
+bytes) and whose keys are drawn only from `id`, `workspaceId`, `title`, `type`,
+`cwd`, `agentPreset`, `model`, `permissionMode`, `agentParams`, `worktreePath`,
+and `worktreeBranch`:
+
+- `id` and `workspaceId`: `Id` grammar (`valid_id`, 1–128 ASCII bytes in `[A-Za-z0-9_.:-]`).
+- `title` and `cwd`: non-empty UTF-8 strings without NUL (`\0`).
+- `type`: `"terminal"`.
+- `agentPreset`: `"claude-code"`, `"claude-code-worktree"`, `"codex-agent"`, or `"codex-agent-worktree"`.
+- `model`, `permissionMode`, and `worktreePath`: optional; when present and non-`null`, each must be a non-empty string without NUL.
+- `agentParams`: optional; when present and non-`null`, a JSON object of at most `AGENT_PARAMS_LIMIT` (`32`, in `bac_host_contracts::workspace`) entries with non-empty NUL-free string keys and NUL-free string values.
+- `worktreeBranch`: optional; may be omitted, `null`, or a non-empty string without NUL.
+
+Invalid parameters return `INVALID_REQUEST` with a static `details.field`
+(`params`, `params.profileId`, `params.expectedRevision`, `params.terminal`, or
+`params.terminal.<field>`).
+
+`normalize_registration` produces the terminal JSON object written into the
+workspace document: it writes the six required keys, omits `model`,
+`permissionMode`, `agentParams`, and `worktreePath` when absent or `null`, omits
+`worktreeBranch` when absent on the wire, and preserves an explicit
+`"worktreeBranch": null` or string value. This omission rule applies only to the
+registration object inside the stored workspace document, never to BAC wire
+envelopes. Existing top-level, workspace, and terminal foreign keys in the
+document are preserved.
+
+`prepare_append` evaluates the target document in order:
+
+1. If `windowId` exceeds `WINDOW_ID_JSON_BYTES` (`1,024` compact JSON bytes
+   including quotes) or the current document fails `structural_preconditions_ok`,
+   refuse with `WORKSPACE_UNAVAILABLE`.
+2. Compute `(current_revision, current_bytes)` via `canonical_digest`.
+3. If `terminals` already contains an entry with `terminal.id`, compare the
+   stored terminal and normalized candidate with `effective_registration_equal`
+   after applying the runtime overlay to both (defaulting missing `type` to
+   `"terminal"`, treating absent and `null` as equal for `model`,
+   `permissionMode`, and `worktreePath`, distinguishing absent, `null`, and
+   string for `worktreeBranch`, and treating absent, `null`, and `{}` as equal
+   for `agentParams`):
+   - If effectively equal and `current_bytes > DOCUMENT_MAX_BYTES` (`520,192`),
+     refuse with `WORKSPACE_TOO_LARGE` (`{ "maxBytes": 520192 }`).
+   - If effectively equal and within `DOCUMENT_MAX_BYTES`, return an idempotent
+     no-op `AppendResult` (`hostId`, `profileId`, `source`, `windowId`,
+     `terminalId`, `appended: false`, `revision: current_revision`) even if
+     `expectedRevision` does not match or `workspaceId` is absent.
+   - Otherwise refuse with `TERMINAL_EXISTS`.
+4. If `expectedRevision != current_revision`, refuse with `REVISION_MISMATCH`.
+5. If `terminal.workspaceId` does not match any entry in `workspaces`, refuse
+   with `WORKSPACE_NOT_FOUND`.
+6. Append the normalized registration to `terminals`, check `canonical_digest`
+   byte length against `DOCUMENT_MAX_BYTES` (`520,192`) before the runtime
+   overlay, apply the runtime overlay, and check `canonical_digest` byte length
+   against `DOCUMENT_MAX_BYTES` again after the overlay. If either check exceeds
+   `DOCUMENT_MAX_BYTES`, refuse with `WORKSPACE_TOO_LARGE`. `prepare_append`
+   returns the prospective document after the runtime overlay.
+
+`verify_readback` confirms that a readback document satisfies
+`structural_preconditions_ok`, matches the overlaid prospective document for
+`terminal.id` under `effective_registration_equal`, and has canonical size at
+most `DOCUMENT_MAX_BYTES`, returning `WRITE_FAILED` otherwise.
+
+Append bounds reuse the existing constants (`REQUEST_BYTES = 65_536`,
+`RESULT_BYTES = 524_288`, `REGISTRATION_BYTES = 16_384`,
+`PROFILES_LIMIT = 256`, `TERMINALS_LIMIT = 4_096`,
+`LOCATION_MATCHES_LIMIT = 100`, `DOCUMENT_MAX_BYTES = 520_192`,
+`WINDOW_ID_JSON_BYTES = 1_024`, `SAVED_FILE_MAX_BYTES = 8_388_608`,
+`CATALOG_FILE_MAX_BYTES = 8_388_608`, `SAVED_TOTAL_MAX_BYTES = 67_108_864`) plus
+`AGENT_PARAMS_LIMIT = 32`. The largest live `bac:workspace-add-terminal` result
+frame (`770`-byte `id`, `1,024`-byte JSON `windowId`, `130`-byte `profileId` and
+`terminalId`, `appended: false`) serializes to `2,318` bytes, within
+`RESULT_BYTES` (`524,288`).
+
+Append-specific operation errors:
+
+| Code | Message | Retryable | Details |
+|---|---|---|---|
+| `WORKSPACE_NOT_FOUND` | `Target workspace not found` | `false` | `{ "workspaceId": <workspaceId> }` |
+| `TERMINAL_EXISTS` | `Terminal ID has a different registration` | `false` | `{ "terminalId": <terminalId>, "currentRevision": <revision> }` |
+| `REVISION_MISMATCH` | `Workspace revision changed` | `true` | `{ "currentRevision": <revision> }` |
+| `WRITE_FAILED` | `Canonical workspace save failed; read back before retry` | `false` | `{ "outcome": "unknown" }` |
+
+For a saved profile (`source: "persisted"`, `windowId: null`), `append_persisted`
+executes inside a single profile-index transaction (`update_index_at`) with the
+following guarantees:
+
+- Reserved Windows profile names (`is_reserved_profile_id`) are refused with
+  `WORKSPACE_UNAVAILABLE` before opening any file.
+- Inside the index lock, `catalog_files_acceptable` rechecks that `index.json`
+  and `index.json.bak` are each absent or a regular file of at most
+  `CATALOG_FILE_MAX_BYTES` (`8,388,608` bytes) with at least one present, and
+  `require_local_profile` checks the first catalog entry matching `profileId`
+  (`PROFILE_NOT_FOUND` or `PROFILE_NOT_LOCAL`).
+- The profile snapshot is read with `read_bounded_saved_file` and
+  `migrate_snapshot`. `NoSavedWindows` (missing file, dangling symlink, or
+  `"windows": []`) evaluates against `empty_workspace_document()` without
+  seeding or creating a profile file (stopping at `WORKSPACE_NOT_FOUND` when
+  `expectedRevision` matches the empty workspace revision).
+- Saved-profile append eligibility shares `saved_windows_append_eligible` with
+  `bac:workspace-read`: only a single-window snapshot whose raw `windows[0]` and
+  extracted workspace document satisfy the read eligibility check is accepted;
+  multi-window or otherwise ineligible snapshots return `WORKSPACE_UNAVAILABLE`
+  with the profile file untouched.
+- After `prepare_append` produces the overlaid prospective document (or aborts
+  without writing on an idempotent no-op or refusal), the snapshot is written
+  through upstream's profile writer (`snapshot_from_workspace` and
+  `write_snapshot_at`), re-read with `read_bounded_saved_file`, verified with
+  `verify_readback`, and activated in the profile index
+  (`activate_profile_in_index`) before the index commit.
+- Stage and unwind rule: the index closure runs inside `catch_unwind`. Before
+  the snapshot write starts, any I/O error or structural refusal returns
+  `WORKSPACE_UNAVAILABLE` (or the specific refusal), and a panic returns
+  `INTERNAL_ERROR`, without writing. Once the snapshot write starts (snapshot
+  write, readback verification, index commit, or a panic at or after that
+  point), any failure returns `WRITE_FAILED` with `{ "outcome": "unknown" }`.
+
+For a live window (`source: "live"`, `windowId: "<id>"`), `append` /
+`append_state` executes against the in-memory `WindowRegistryState` without
+loading, repairing, or seeding the registry (`ensure_entries_ready` is not
+called before target selection) with the following guarantees:
+
+- Target selection shares `live_target` with `bac:workspace-read`
+  (`execute_read`): among the profile's regular (`detached_workspace_id` is
+  `None`) registry entries that have content (`snapshot_has_content`), the entry
+  with the highest `last_active_at` is selected (`select_regular_entry`).
+- If any registry entry of `profileId` (regular or detached) has a `windowId`
+  whose compact JSON encoding exceeds `WINDOW_ID_JSON_BYTES` (`1,024` bytes
+  including quotes), `live_target` refuses with `WORKSPACE_UNAVAILABLE` without
+  falling back to the saved profile.
+- When `live_target` returns `None` because the profile has no regular window
+  with content (detached-only, contentless-only, or an empty registry),
+  `entries` is unlocked and the append delegates to the saved-profile path while
+  `runtime_meta` stays locked, passing `apply_runtime_workspace_meta` for
+  `profileId` as the runtime overlay.
+- The live write goes through upstream's own save path
+  (`save_workspace_locked`), so the files (`windows.json`, `workspace.json` when
+  `windowId == "main"`, and `profiles/<profileId>.json`) and bytes written are
+  the same writer and the same bytes as upstream's `workspace:save` for the same
+  document.
+- Upstream's snapshot writers (`persist_entries_at`,
+  `write_global_workspace_at`, `write_profile_snapshot_at`) do not report disk
+  write errors; after `save_workspace_locked` returns `true`, the updated
+  registry entry is read back via `workspace_value_from_snapshot` and checked
+  with `verify_readback`, so the reply revision and staged document reflect the
+  registry readback.
+- `prepare_append` applies `apply_runtime_workspace_meta` to produce the
+  prospective document and `save_workspace_locked` applies
+  `apply_runtime_workspace_meta` before storing the snapshot, so the runtime
+  overlay is part of the written document.
+- Lock, stage, and unwind rule: `runtime_meta` and `entries` are locked in that
+  order (a poisoned mutex returns `INTERNAL_ERROR` without recovery). Target
+  selection and `prepare_append` run inside `catch_unwind`; before the write
+  starts, any refusal returns its specific error and any panic returns
+  `INTERNAL_ERROR` without calling the writer or poisoning the registry mutexes.
+  From the write onward (including a writer return of `false`, a missing entry
+  or mismatch on readback, or any panic during the write or readback), any
+  failure returns `WRITE_FAILED` with `{ "outcome": "unknown" }` while leaving
+  the registry mutexes unpoisoned. The saved-profile fallback returns the
+  saved-profile path's own result (its refusals, its no-op, and its
+  `WRITE_FAILED`), and only a panic that escapes it is `WRITE_FAILED` with
+  `{ "outcome": "unknown" }` while leaving the registry mutexes unpoisoned.
+- `live_window_ids_for_profile` / `live_window_ids_state` collects live webview
+  window IDs before locking `entries`, returns the profile's regular live window
+  IDs in registry order, skips detached and closed windows, and returns an empty
+  list if `entries` is poisoned.
+
+Dispatch and events (`dispatch_append`, `append_events`, `emit_append_events`)
+enforce the following guarantees:
+
+- Order of checks: `dispatch` routes `bac:workspace-add-terminal` to
+  `dispatch_append` before any registry observation. A reserved Windows profile
+  name (`is_reserved_profile_id`) is refused with `WORKSPACE_UNAVAILABLE` before
+  any file is opened; an unresolved host data directory or a missing or
+  unacceptable catalog (`read_local_catalog` / `catalog_files_acceptable`)
+  returns `WORKSPACE_UNAVAILABLE`; then `require_local_profile` resolves the
+  first catalog entry of `profileId` (`PROFILE_NOT_FOUND` or
+  `PROFILE_NOT_LOCAL`). The append takes no separate registry snapshot: on
+  desktop builds, the choice between the live window and the saved profile is
+  made under the registry locks (`runtime_meta` then `entries`); on headless
+  builds, the append delegates directly to `append_persisted`.
+- Events: emitted only after every registry and profile-index lock is released,
+  inside `catch_unwind`; an error or panic while sending never changes the
+  reply, and a no-op (`appended: false`) or a refusal sends nothing. A
+  live-window append sends `workspace:reload` with
+  `{ "profileId", "windowId", "data" }` to that window (`emit_to`) and the same
+  payload to remote clients (`broadcast_event`), and no `profile:changed`
+  (matching upstream's `workspace:save` with a window ID). A saved-profile
+  append sends `profile:changed` (upstream's payload), then `workspace:reload`
+  with `{ "windowId", "data" }` to each open regular window of the profile
+  (`live_window_ids_for_profile`) and `{ "profileId", "data" }` to remote
+  clients (matching upstream's `workspace:save` without a window ID). In every
+  `workspace:reload` event, `data` is the pretty-printed document read back
+  inside the locked write (`staged.document`), never read again after the locks
+  are released.
+- Feature gate: `WORKSPACE_ADD_TERMINAL_ENABLED` is `true`, and `bac:hello`
+  advertises `workspaceAddTerminal: true`. Like the other enabled features, the
+  channel answers `NOT_OPTED_IN` before hello; after hello its params are parsed
+  first, and a request that does not parse answers `INVALID_REQUEST` without
+  running the append.

@@ -20,6 +20,7 @@ pub const SAVED_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const CATALOG_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const SAVED_TOTAL_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const WINDOW_ID_JSON_BYTES: usize = 1_024;
+pub const AGENT_PARAMS_LIMIT: usize = 32;
 pub const SAVED_READ_MAX_ATTEMPTS: usize = 3;
 pub const SAVED_READ_RETRY_DELAY: Duration = Duration::from_millis(20);
 
@@ -31,10 +32,59 @@ pub struct ReadRequest {
 pub struct LocateRequest {
     pub session_id: String,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPreset {
+    ClaudeCode,
+    ClaudeCodeWorktree,
+    CodexAgent,
+    CodexAgentWorktree,
+}
+impl AgentPreset {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::ClaudeCodeWorktree => "claude-code-worktree",
+            Self::CodexAgent => "codex-agent",
+            Self::CodexAgentWorktree => "codex-agent-worktree",
+        }
+    }
+
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "claude-code" => Some(Self::ClaudeCode),
+            "claude-code-worktree" => Some(Self::ClaudeCodeWorktree),
+            "codex-agent" => Some(Self::CodexAgent),
+            "codex-agent-worktree" => Some(Self::CodexAgentWorktree),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Registration {
+    pub id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub agent_preset: AgentPreset,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub agent_params: Option<BTreeMap<String, String>>,
+    pub worktree_path: Option<String>,
+    pub worktree_branch: Option<Option<String>>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendRequest {
+    pub profile_id: String,
+    pub expected_revision: String,
+    pub terminal: Registration,
+}
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     WorkspaceRead(ReadRequest),
     SessionLocate(LocateRequest),
+    WorkspaceAddTerminal(AppendRequest),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -94,6 +144,34 @@ pub struct LocateResult {
     pub atomic: bool,
     pub locations: Vec<LocateRow>,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendResult {
+    pub host_id: String,
+    pub profile_id: String,
+    pub source: Source,
+    pub window_id: Option<String>,
+    pub terminal_id: String,
+    pub appended: bool,
+    pub revision: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedAppend {
+    pub result: AppendResult,
+    pub document: Option<String>,
+    pub profile_changed: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TxAbort {
+    Noop(AppendResult),
+    Refused(OperationError),
+}
+impl std::fmt::Display for TxAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BAC workspace transaction aborted")
+    }
+}
+impl std::error::Error for TxAbort {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationError {
@@ -102,47 +180,94 @@ pub enum OperationError {
     ProfileNotLocal,
     WorkspaceUnavailable,
     WorkspaceTooLarge,
+    WorkspaceNotFound(String),
+    TerminalExists {
+        terminal_id: String,
+        current_revision: String,
+    },
+    RevisionMismatch {
+        current_revision: String,
+    },
+    WriteFailed,
     LocationUnavailable(Vec<String>),
     LocationTooLarge,
     Internal,
 }
 impl OperationError {
     pub fn reply(&self) -> Value {
-        let (code, message, details) = match self {
+        let (code, message, retryable, details) = match self {
             Self::InvalidRequest(field) => (
                 "INVALID_REQUEST",
                 "Invalid BAC request",
+                false,
                 json!({"field":field}),
             ),
-            Self::ProfileNotFound => ("PROFILE_NOT_FOUND", "Local profile not found", json!({})),
+            Self::ProfileNotFound => (
+                "PROFILE_NOT_FOUND",
+                "Local profile not found",
+                false,
+                json!({}),
+            ),
             Self::ProfileNotLocal => (
                 "PROFILE_NOT_LOCAL",
                 "BAC requires a local profile",
+                false,
                 json!({}),
             ),
             Self::WorkspaceUnavailable => (
                 "WORKSPACE_UNAVAILABLE",
                 "Canonical workspace is unavailable",
+                false,
                 json!({}),
             ),
             Self::WorkspaceTooLarge => (
                 "WORKSPACE_TOO_LARGE",
                 "Canonical workspace exceeds limit",
+                false,
                 json!({"maxBytes":DOCUMENT_MAX_BYTES}),
+            ),
+            Self::WorkspaceNotFound(workspace_id) => (
+                "WORKSPACE_NOT_FOUND",
+                "Target workspace not found",
+                false,
+                json!({"workspaceId":workspace_id}),
+            ),
+            Self::TerminalExists {
+                terminal_id,
+                current_revision,
+            } => (
+                "TERMINAL_EXISTS",
+                "Terminal ID has a different registration",
+                false,
+                json!({"terminalId":terminal_id,"currentRevision":current_revision}),
+            ),
+            Self::RevisionMismatch { current_revision } => (
+                "REVISION_MISMATCH",
+                "Workspace revision changed",
+                true,
+                json!({"currentRevision":current_revision}),
+            ),
+            Self::WriteFailed => (
+                "WRITE_FAILED",
+                "Canonical workspace save failed; read back before retry",
+                false,
+                json!({"outcome":"unknown"}),
             ),
             Self::LocationUnavailable(ids) => (
                 "LOCATION_UNAVAILABLE",
                 "Session locations are unavailable",
+                false,
                 json!({"profileIds":ids}),
             ),
             Self::LocationTooLarge => (
                 "LOCATION_TOO_LARGE",
                 "Session locations exceed limit",
+                false,
                 json!({}),
             ),
-            Self::Internal => ("INTERNAL_ERROR", "BAC request failed", json!({})),
+            Self::Internal => ("INTERNAL_ERROR", "BAC request failed", false, json!({})),
         };
-        crate::wire::error_reply(code, message, false, details)
+        crate::wire::error_reply(code, message, retryable, details)
     }
 }
 
@@ -193,10 +318,189 @@ pub fn window_id_within_bound(id: &str) -> bool {
     serde_json::to_string(id).is_ok_and(|encoded| encoded.len() <= WINDOW_ID_JSON_BYTES)
 }
 
+pub fn valid_revision(s: &str) -> bool {
+    s.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn valid_non_empty_text(s: &str) -> bool {
+    !s.is_empty() && !s.contains('\0')
+}
+
+fn parse_optional_string(
+    object: &Map<String, Value>,
+    key: &str,
+    field: &'static str,
+) -> Result<Option<String>, OperationError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if valid_non_empty_text(value) => Ok(Some(value.clone())),
+        Some(_) => Err(OperationError::InvalidRequest(field)),
+    }
+}
+
+fn parse_registration(terminal_value: &Value) -> Result<Registration, OperationError> {
+    let terminal = terminal_value
+        .as_object()
+        .ok_or(OperationError::InvalidRequest("params.terminal"))?;
+    const TERMINAL_KEYS: [&str; 11] = [
+        "id",
+        "workspaceId",
+        "title",
+        "type",
+        "cwd",
+        "agentPreset",
+        "model",
+        "permissionMode",
+        "agentParams",
+        "worktreePath",
+        "worktreeBranch",
+    ];
+    if terminal
+        .keys()
+        .any(|name| !TERMINAL_KEYS.contains(&name.as_str()))
+    {
+        return Err(OperationError::InvalidRequest("params.terminal"));
+    }
+    let id = terminal
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .ok_or(OperationError::InvalidRequest("params.terminal.id"))?
+        .to_owned();
+    let workspace_id = terminal
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .ok_or(OperationError::InvalidRequest(
+            "params.terminal.workspaceId",
+        ))?
+        .to_owned();
+    let title = terminal
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|s| valid_non_empty_text(s))
+        .ok_or(OperationError::InvalidRequest("params.terminal.title"))?
+        .to_owned();
+    if terminal.get("type").and_then(Value::as_str) != Some("terminal") {
+        return Err(OperationError::InvalidRequest("params.terminal.type"));
+    }
+    let cwd = terminal
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| valid_non_empty_text(s))
+        .ok_or(OperationError::InvalidRequest("params.terminal.cwd"))?
+        .to_owned();
+    let agent_preset = terminal
+        .get("agentPreset")
+        .and_then(Value::as_str)
+        .and_then(AgentPreset::from_wire)
+        .ok_or(OperationError::InvalidRequest(
+            "params.terminal.agentPreset",
+        ))?;
+    let model = parse_optional_string(terminal, "model", "params.terminal.model")?;
+    let permission_mode =
+        parse_optional_string(terminal, "permissionMode", "params.terminal.permissionMode")?;
+    let agent_params = match terminal.get("agentParams") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(entries)) => {
+            if entries.len() > AGENT_PARAMS_LIMIT {
+                return Err(OperationError::InvalidRequest(
+                    "params.terminal.agentParams",
+                ));
+            }
+            let mut parsed = BTreeMap::new();
+            for (key, value) in entries {
+                let Some(val) = value.as_str() else {
+                    return Err(OperationError::InvalidRequest(
+                        "params.terminal.agentParams",
+                    ));
+                };
+                if !valid_non_empty_text(key) || val.contains('\0') {
+                    return Err(OperationError::InvalidRequest(
+                        "params.terminal.agentParams",
+                    ));
+                }
+                parsed.insert(key.clone(), val.to_owned());
+            }
+            Some(parsed)
+        }
+        Some(_) => {
+            return Err(OperationError::InvalidRequest(
+                "params.terminal.agentParams",
+            ))
+        }
+    };
+    let worktree_path =
+        parse_optional_string(terminal, "worktreePath", "params.terminal.worktreePath")?;
+    let worktree_branch = match terminal.get("worktreeBranch") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(branch)) if valid_non_empty_text(branch) => Some(Some(branch.clone())),
+        Some(_) => {
+            return Err(OperationError::InvalidRequest(
+                "params.terminal.worktreeBranch",
+            ))
+        }
+    };
+    if serde_json::to_vec(terminal_value)
+        .map_err(|_| OperationError::Internal)?
+        .len()
+        > REGISTRATION_BYTES
+    {
+        return Err(OperationError::InvalidRequest("params.terminal"));
+    }
+    Ok(Registration {
+        id,
+        workspace_id,
+        title,
+        cwd,
+        agent_preset,
+        model,
+        permission_mode,
+        agent_params,
+        worktree_path,
+        worktree_branch,
+    })
+}
+
 pub fn parse_request(channel: &str, params: &Value) -> Result<Request, OperationError> {
     let object = params
         .as_object()
         .ok_or(OperationError::InvalidRequest("params"))?;
+    if channel == "bac:workspace-add-terminal" {
+        if object
+            .keys()
+            .any(|name| !["profileId", "expectedRevision", "terminal"].contains(&name.as_str()))
+        {
+            return Err(OperationError::InvalidRequest("params"));
+        }
+        let profile_id = object
+            .get("profileId")
+            .and_then(Value::as_str)
+            .filter(|id| valid_profile_id(id))
+            .ok_or(OperationError::InvalidRequest("params.profileId"))?
+            .to_owned();
+        let expected_revision = object
+            .get("expectedRevision")
+            .and_then(Value::as_str)
+            .filter(|rev| valid_revision(rev))
+            .ok_or(OperationError::InvalidRequest("params.expectedRevision"))?
+            .to_owned();
+        let terminal_value = object
+            .get("terminal")
+            .ok_or(OperationError::InvalidRequest("params.terminal"))?;
+        let terminal = parse_registration(terminal_value)?;
+        return Ok(Request::WorkspaceAddTerminal(AppendRequest {
+            profile_id,
+            expected_revision,
+            terminal,
+        }));
+    }
     let (key, field, validator): (_, _, fn(&str) -> bool) = match channel {
         "bac:workspace-read" => ("profileId", "params.profileId", valid_profile_id),
         "bac:session-locate" => ("sessionId", "params.sessionId", valid_id),
@@ -216,6 +520,33 @@ pub fn parse_request(channel: &str, params: &Value) -> Result<Request, Operation
         "bac:session-locate" => Ok(Request::SessionLocate(LocateRequest { session_id: id })),
         _ => Err(OperationError::InvalidRequest("params")),
     }
+}
+
+fn catalog_file_is_acceptable(path: &Path) -> Result<bool, OperationError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.len() > CATALOG_FILE_MAX_BYTES as u64 {
+                Err(OperationError::WorkspaceUnavailable)
+            } else {
+                Ok(true)
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(OperationError::WorkspaceUnavailable),
+    }
+}
+
+pub fn catalog_files_acceptable(dir: &Path) -> Result<(), OperationError> {
+    let mut has_regular_index = false;
+    for name in ["index.json", "index.json.bak"] {
+        if catalog_file_is_acceptable(&dir.join(name))? {
+            has_regular_index = true;
+        }
+    }
+    if !has_regular_index {
+        return Err(OperationError::WorkspaceUnavailable);
+    }
+    Ok(())
 }
 
 pub fn require_local_profile(
@@ -302,6 +633,19 @@ pub fn select_regular_entry<'a>(
                 && entry.has_content
         })
         .max_by_key(|entry| entry.last_active_at)
+}
+
+pub fn live_target<'a>(
+    entries: &'a [RegistryWindowSnapshot],
+    profile_id: &str,
+) -> Result<Option<&'a RegistryWindowSnapshot>, OperationError> {
+    if entries
+        .iter()
+        .any(|entry| entry.profile_id == profile_id && !window_id_within_bound(&entry.id))
+    {
+        return Err(OperationError::WorkspaceUnavailable);
+    }
+    Ok(select_regular_entry(entries, profile_id))
 }
 
 #[derive(Clone, Debug)]
@@ -426,6 +770,12 @@ fn read_bounded_saved_file_measured_for_platform(
     (Err(SavedReadError::Unreadable), last_size)
 }
 
+pub fn saved_windows_append_eligible(windows: &[Value], document: &Value) -> bool {
+    windows.len() == 1
+        && windows.first().is_some_and(locate_document_is_readable)
+        && structural_preconditions_ok(document)
+}
+
 /// Assemble one read from an already-observed registry and a lazy persisted read.
 pub fn execute_read(
     host_id: &str,
@@ -436,14 +786,8 @@ pub fn execute_read(
     first_document: impl FnOnce(&[Value]) -> Option<Value>,
 ) -> Result<ReadResult, OperationError> {
     require_local_profile(catalog, &request.profile_id)?;
-    if entries
-        .iter()
-        .any(|entry| entry.profile_id == request.profile_id && !window_id_within_bound(&entry.id))
-    {
-        return Err(OperationError::WorkspaceUnavailable);
-    }
     let (document, source, window_id, eligible) =
-        if let Some(entry) = select_regular_entry(entries, &request.profile_id) {
+        if let Some(entry) = live_target(entries, &request.profile_id)? {
             let document = entry.workspace_document.clone();
             let eligible = structural_preconditions_ok(&document);
             (document, Source::Live, Some(entry.id.clone()), eligible)
@@ -453,11 +797,9 @@ pub fn execute_read(
                     (empty_workspace_document(), Source::Persisted, None, false)
                 }
                 SavedFileOutcome::Snapshot { windows, .. } => {
-                    let eligible_first_window = windows.len() == 1
-                        && windows.first().is_some_and(locate_document_is_readable);
                     let document =
                         first_document(&windows).ok_or(OperationError::WorkspaceUnavailable)?;
-                    let eligible = eligible_first_window && structural_preconditions_ok(&document);
+                    let eligible = saved_windows_append_eligible(&windows, &document);
                     (document, Source::Persisted, None, eligible)
                 }
             }
@@ -711,6 +1053,214 @@ pub fn execute_locate(
         return Err(OperationError::LocationTooLarge);
     }
     Ok(result)
+}
+
+pub fn normalize_registration(reg: &Registration) -> Value {
+    let mut map = Map::new();
+    map.insert("id".into(), Value::String(reg.id.clone()));
+    map.insert(
+        "workspaceId".into(),
+        Value::String(reg.workspace_id.clone()),
+    );
+    map.insert("title".into(), Value::String(reg.title.clone()));
+    map.insert("type".into(), Value::String("terminal".into()));
+    map.insert("cwd".into(), Value::String(reg.cwd.clone()));
+    map.insert(
+        "agentPreset".into(),
+        Value::String(reg.agent_preset.as_str().into()),
+    );
+    if let Some(model) = &reg.model {
+        map.insert("model".into(), Value::String(model.clone()));
+    }
+    if let Some(permission_mode) = &reg.permission_mode {
+        map.insert(
+            "permissionMode".into(),
+            Value::String(permission_mode.clone()),
+        );
+    }
+    if let Some(agent_params) = &reg.agent_params {
+        let params = agent_params
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect::<Map<_, _>>();
+        map.insert("agentParams".into(), Value::Object(params));
+    }
+    if let Some(worktree_path) = &reg.worktree_path {
+        map.insert("worktreePath".into(), Value::String(worktree_path.clone()));
+    }
+    match &reg.worktree_branch {
+        None => {}
+        Some(None) => {
+            map.insert("worktreeBranch".into(), Value::Null);
+        }
+        Some(Some(branch)) => {
+            map.insert("worktreeBranch".into(), Value::String(branch.clone()));
+        }
+    }
+    Value::Object(map)
+}
+
+fn find_terminal<'a>(value: &'a Value, terminal_id: &str) -> Option<&'a Map<String, Value>> {
+    if let Some(terminals) = value.get("terminals").and_then(Value::as_array) {
+        return terminals.iter().find_map(|item| {
+            let obj = item.as_object()?;
+            (obj.get("id").and_then(Value::as_str) == Some(terminal_id)).then_some(obj)
+        });
+    }
+    let obj = value.as_object()?;
+    (obj.get("id").and_then(Value::as_str) == Some(terminal_id)).then_some(obj)
+}
+
+pub fn effective_registration_equal(
+    stored_doc_with_overlay: &Value,
+    candidate_with_overlay: &Value,
+    terminal_id: &str,
+) -> bool {
+    let Some(stored) = find_terminal(stored_doc_with_overlay, terminal_id) else {
+        return false;
+    };
+    let Some(candidate) = find_terminal(candidate_with_overlay, terminal_id) else {
+        return false;
+    };
+    let default_type = Value::String("terminal".into());
+    if stored.get("type").unwrap_or(&default_type) != candidate.get("type").unwrap_or(&default_type)
+    {
+        return false;
+    }
+    for required in ["id", "workspaceId", "title", "cwd", "agentPreset"] {
+        if stored.get(required) != candidate.get(required) {
+            return false;
+        }
+    }
+    for optional in ["model", "permissionMode", "worktreePath"] {
+        if stored.get(optional).filter(|v| !v.is_null())
+            != candidate.get(optional).filter(|v| !v.is_null())
+        {
+            return false;
+        }
+    }
+    if stored.get("worktreeBranch") != candidate.get("worktreeBranch") {
+        return false;
+    }
+    let empty_params = Value::Object(Map::new());
+    let stored_params = stored
+        .get("agentParams")
+        .filter(|v| !v.is_null())
+        .unwrap_or(&empty_params);
+    let candidate_params = candidate
+        .get("agentParams")
+        .filter(|v| !v.is_null())
+        .unwrap_or(&empty_params);
+    stored_params == candidate_params
+}
+
+#[allow(clippy::result_large_err)]
+pub fn prepare_append(
+    host_id: &str,
+    request: &AppendRequest,
+    source: Source,
+    window_id: Option<String>,
+    current_doc: &Value,
+    mut overlay: impl FnMut(&mut Value),
+) -> Result<Value, TxAbort> {
+    if window_id
+        .as_deref()
+        .is_some_and(|id| !window_id_within_bound(id))
+        || !structural_preconditions_ok(current_doc)
+    {
+        return Err(TxAbort::Refused(OperationError::WorkspaceUnavailable));
+    }
+    let (current_revision, current_bytes) =
+        canonical_digest(current_doc).map_err(TxAbort::Refused)?;
+    let terminal_exists = current_doc
+        .get("terminals")
+        .and_then(Value::as_array)
+        .is_some_and(|terminals| {
+            terminals.iter().any(|item| {
+                item.get("id").and_then(Value::as_str) == Some(request.terminal.id.as_str())
+            })
+        });
+    let normalized = normalize_registration(&request.terminal);
+    if terminal_exists {
+        let mut stored_with_overlay = current_doc.clone();
+        overlay(&mut stored_with_overlay);
+        let mut candidate_with_overlay = json!({"terminals": [normalized]});
+        overlay(&mut candidate_with_overlay);
+        if effective_registration_equal(
+            &stored_with_overlay,
+            &candidate_with_overlay,
+            &request.terminal.id,
+        ) {
+            if current_bytes > DOCUMENT_MAX_BYTES {
+                return Err(TxAbort::Refused(OperationError::WorkspaceTooLarge));
+            }
+            return Err(TxAbort::Noop(AppendResult {
+                host_id: host_id.to_owned(),
+                profile_id: request.profile_id.clone(),
+                source,
+                window_id,
+                terminal_id: request.terminal.id.clone(),
+                appended: false,
+                revision: current_revision,
+            }));
+        }
+        return Err(TxAbort::Refused(OperationError::TerminalExists {
+            terminal_id: request.terminal.id.clone(),
+            current_revision,
+        }));
+    }
+    if request.expected_revision != current_revision {
+        return Err(TxAbort::Refused(OperationError::RevisionMismatch {
+            current_revision,
+        }));
+    }
+    let workspace_exists = current_doc
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .is_some_and(|workspaces| {
+            workspaces.iter().any(|item| {
+                item.get("id").and_then(Value::as_str)
+                    == Some(request.terminal.workspace_id.as_str())
+            })
+        });
+    if !workspace_exists {
+        return Err(TxAbort::Refused(OperationError::WorkspaceNotFound(
+            request.terminal.workspace_id.clone(),
+        )));
+    }
+    let mut prospective = current_doc.clone();
+    let Some(terminals) = prospective
+        .get_mut("terminals")
+        .and_then(Value::as_array_mut)
+    else {
+        return Err(TxAbort::Refused(OperationError::WorkspaceUnavailable));
+    };
+    terminals.push(normalized);
+    let (_, pre_overlay_bytes) = canonical_digest(&prospective).map_err(TxAbort::Refused)?;
+    overlay(&mut prospective);
+    let (_, post_overlay_bytes) = canonical_digest(&prospective).map_err(TxAbort::Refused)?;
+    if pre_overlay_bytes > DOCUMENT_MAX_BYTES || post_overlay_bytes > DOCUMENT_MAX_BYTES {
+        return Err(TxAbort::Refused(OperationError::WorkspaceTooLarge));
+    }
+    Ok(prospective)
+}
+
+pub fn verify_readback(
+    readback_doc: &Value,
+    expected_with_overlay: &Value,
+    terminal_id: &str,
+) -> Result<String, OperationError> {
+    if !structural_preconditions_ok(readback_doc)
+        || !effective_registration_equal(readback_doc, expected_with_overlay, terminal_id)
+    {
+        return Err(OperationError::WriteFailed);
+    }
+    let (new_revision, bytes) =
+        canonical_digest(readback_doc).map_err(|_| OperationError::WriteFailed)?;
+    if bytes > DOCUMENT_MAX_BYTES {
+        return Err(OperationError::WriteFailed);
+    }
+    Ok(new_revision)
 }
 
 #[cfg(test)]

@@ -198,9 +198,13 @@ fn invalid_shapes_never_touch_storage() {
         cases.push(f);
     }
     for f in cases {
-        let result = Connection::default().invoke(true, "bac:hello", &f, || {
-            panic!("invalid shape read storage")
-        }, |_, _| panic!("unexpected feature dispatch"));
+        let result = Connection::default().invoke(
+            true,
+            "bac:hello",
+            &f,
+            || panic!("invalid shape read storage"),
+            |_, _| panic!("unexpected feature dispatch"),
+        );
         assert_eq!(code(&result), "INVALID_REQUEST", "{f}");
     }
 }
@@ -210,12 +214,24 @@ fn size_precedes_context_and_context_precedes_storage() {
     let mut f = hello();
     f["contextId"] = Value::Null;
     assert_eq!(
-        code(&c.invoke(true, "bac:hello", &f, || panic!("context touched storage"), |_, _| panic!("unexpected feature dispatch"))),
+        code(&c.invoke(
+            true,
+            "bac:hello",
+            &f,
+            || panic!("context touched storage"),
+            |_, _| panic!("unexpected feature dispatch")
+        )),
         "CONTEXT_NOT_SUPPORTED"
     );
     f["params"]["protocol"] = json!("x".repeat(REQUEST_BYTES));
     assert_eq!(
-        code(&c.invoke(true, "bac:hello", &f, || panic!("oversize touched storage"), |_, _| panic!("unexpected feature dispatch"))),
+        code(&c.invoke(
+            true,
+            "bac:hello",
+            &f,
+            || panic!("oversize touched storage"),
+            |_, _| panic!("unexpected feature dispatch")
+        )),
         "PAYLOAD_TOO_LARGE"
     );
     f["params"]["minor"] = Value::Null;
@@ -228,9 +244,13 @@ fn version_precedes_storage_and_errors_do_not_opt_in() {
         let mut f = hello();
         f["params"] = json!({"protocol":protocol,"minor":minor});
         assert_eq!(
-            c.invoke(v2, "bac:hello", &f, || panic!(
-                "unsupported version must not touch storage"
-            ), |_, _| panic!("unexpected feature dispatch")),
+            c.invoke(
+                v2,
+                "bac:hello",
+                &f,
+                || panic!("unsupported version must not touch storage"),
+                |_, _| panic!("unexpected feature dispatch")
+            ),
             Error::UnsupportedVersion.reply()
         );
         assert_eq!(code(&call(&c, &frame("bac:future"))), "NOT_OPTED_IN");
@@ -241,7 +261,13 @@ fn version_precedes_storage_and_errors_do_not_opt_in() {
         Error::Internal,
     ] {
         assert_eq!(
-            c.invoke(true, "bac:hello", &hello(), || Err(err.clone()), |_, _| panic!("unexpected feature dispatch")),
+            c.invoke(
+                true,
+                "bac:hello",
+                &hello(),
+                || Err(err.clone()),
+                |_, _| panic!("unexpected feature dispatch")
+            ),
             err.reply()
         );
         assert_eq!(code(&call(&c, &frame("bac:future"))), "NOT_OPTED_IN");
@@ -301,10 +327,16 @@ fn non_hello_does_not_load_identity_again() {
     let c = Connection::default();
     call(&c, &hello());
     let n = AtomicUsize::new(0);
-    c.invoke(true, "bac:future", &frame("bac:future"), || {
-        n.fetch_add(1, Ordering::SeqCst);
-        Ok(HOST.into())
-    }, |_, _| panic!("unexpected feature dispatch"));
+    c.invoke(
+        true,
+        "bac:future",
+        &frame("bac:future"),
+        || {
+            n.fetch_add(1, Ordering::SeqCst);
+            Ok(HOST.into())
+        },
+        |_, _| panic!("unexpected feature dispatch"),
+    );
     assert_eq!(n.load(Ordering::SeqCst), 0);
 }
 #[test]
@@ -419,6 +451,248 @@ fn dispatch_invalid_params_never_calls_run() {
             );
         }
     }
+
+    let empty_rev = "sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c";
+    let base_terminal = || {
+        json!({
+            "id": "t1",
+            "workspaceId": "w1",
+            "title": "Shell",
+            "type": "terminal",
+            "cwd": "/tmp",
+            "agentPreset": "claude-code"
+        })
+    };
+    let valid_params = |terminal: Value| {
+        json!({
+            "profileId": "default",
+            "expectedRevision": empty_rev,
+            "terminal": terminal
+        })
+    };
+    assert!(crate::workspace::parse_request(
+        "bac:workspace-add-terminal",
+        &valid_params(base_terminal())
+    )
+    .is_ok());
+
+    let mut thirty_three_params = serde_json::Map::new();
+    for i in 0..=crate::workspace::AGENT_PARAMS_LIMIT {
+        thirty_three_params.insert(format!("k{i}"), json!("v"));
+    }
+    let mut max_terminal = base_terminal();
+    let base_terminal_len = serde_json::to_vec(&max_terminal).unwrap().len();
+    max_terminal["title"] =
+        json!("x".repeat("Shell".len() + REGISTRATION_BYTES - base_terminal_len));
+    assert_eq!(
+        serde_json::to_vec(&max_terminal).unwrap().len(),
+        REGISTRATION_BYTES
+    );
+    assert!(crate::workspace::parse_request(
+        "bac:workspace-add-terminal",
+        &valid_params(max_terminal)
+    )
+    .is_ok());
+
+    let mut oversized_terminal = base_terminal();
+    oversized_terminal["title"] =
+        json!("x".repeat("Shell".len() + REGISTRATION_BYTES - base_terminal_len + 1));
+    assert_eq!(
+        serde_json::to_vec(&oversized_terminal).unwrap().len(),
+        REGISTRATION_BYTES + 1
+    );
+
+    let with_terminal_field = |key: &str, value: Value| {
+        let mut t = base_terminal();
+        t[key] = value;
+        valid_params(t)
+    };
+
+    for (params, invalid_field) in [
+        (Value::Null, "params"),
+        (json!({}), "params.profileId"),
+        (
+            json!({
+                "profileId": "default",
+                "expectedRevision": empty_rev,
+                "terminal": base_terminal(),
+                "extra": true
+            }),
+            "params",
+        ),
+        (
+            json!({
+                "profileId": "a:b",
+                "expectedRevision": empty_rev,
+                "terminal": base_terminal()
+            }),
+            "params.profileId",
+        ),
+        (
+            json!({
+                "profileId": "default",
+                "expectedRevision": "sha256:66C1B7A04A05EE220E10341C9BAEC59BDF92885B193C2838D527A235D2CA5A9C",
+                "terminal": base_terminal()
+            }),
+            "params.expectedRevision",
+        ),
+        (
+            json!({
+                "profileId": "default",
+                "expectedRevision": "md5:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c",
+                "terminal": base_terminal()
+            }),
+            "params.expectedRevision",
+        ),
+        (
+            json!({
+                "profileId": "default",
+                "expectedRevision": "sha256:66c1b7",
+                "terminal": base_terminal()
+            }),
+            "params.expectedRevision",
+        ),
+        (valid_params(Value::Null), "params.terminal"),
+        (with_terminal_field("extra", json!(true)), "params.terminal"),
+        (
+            with_terminal_field("id", json!("bad/id")),
+            "params.terminal.id",
+        ),
+        (
+            with_terminal_field("workspaceId", json!("")),
+            "params.terminal.workspaceId",
+        ),
+        (
+            with_terminal_field("title", json!("")),
+            "params.terminal.title",
+        ),
+        (
+            with_terminal_field("title", json!("a\0b")),
+            "params.terminal.title",
+        ),
+        (
+            with_terminal_field("type", json!("other")),
+            "params.terminal.type",
+        ),
+        (with_terminal_field("cwd", json!("")), "params.terminal.cwd"),
+        (
+            with_terminal_field("cwd", json!("a\0b")),
+            "params.terminal.cwd",
+        ),
+        (
+            with_terminal_field("agentPreset", json!("invalid-preset")),
+            "params.terminal.agentPreset",
+        ),
+        (
+            with_terminal_field("model", json!("")),
+            "params.terminal.model",
+        ),
+        (
+            with_terminal_field("permissionMode", json!("")),
+            "params.terminal.permissionMode",
+        ),
+        (
+            with_terminal_field("agentParams", Value::Object(thirty_three_params)),
+            "params.terminal.agentParams",
+        ),
+        (
+            with_terminal_field("agentParams", json!({"": "v"})),
+            "params.terminal.agentParams",
+        ),
+        (
+            with_terminal_field("agentParams", json!({"k": "a\0b"})),
+            "params.terminal.agentParams",
+        ),
+        (
+            with_terminal_field("worktreePath", json!("")),
+            "params.terminal.worktreePath",
+        ),
+        (
+            with_terminal_field("worktreeBranch", json!("")),
+            "params.terminal.worktreeBranch",
+        ),
+        (valid_params(oversized_terminal), "params.terminal"),
+    ] {
+        let err = crate::workspace::parse_request("bac:workspace-add-terminal", &params)
+            .expect_err("invalid append request must be rejected");
+        assert_eq!(
+            err,
+            crate::workspace::OperationError::InvalidRequest(invalid_field)
+        );
+        assert_eq!(
+            err.reply()["error"]["details"],
+            json!({"field": invalid_field})
+        );
+        let mut request = frame("bac:workspace-add-terminal");
+        request["params"] = params;
+        let reply = connection.invoke(
+            true,
+            "bac:workspace-add-terminal",
+            &request,
+            || panic!("feature must not load identity"),
+            |_, _| panic!("invalid request ran"),
+        );
+        assert_eq!(
+            reply,
+            crate::workspace::OperationError::InvalidRequest(invalid_field).reply()
+        );
+    }
+}
+
+#[test]
+fn dispatch_passes_the_parsed_append_request_to_run() {
+    let empty_rev = "sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c";
+    let base_terminal = || {
+        json!({
+            "id": "t1",
+            "workspaceId": "w1",
+            "title": "Shell",
+            "type": "terminal",
+            "cwd": "/tmp",
+            "agentPreset": "claude-code"
+        })
+    };
+    let valid_params = |terminal: Value| {
+        json!({
+            "profileId": "default",
+            "expectedRevision": empty_rev,
+            "terminal": terminal
+        })
+    };
+    let params = valid_params(base_terminal());
+    let expected = crate::workspace::parse_request("bac:workspace-add-terminal", &params).unwrap();
+    let mut request = frame("bac:workspace-add-terminal");
+    request["params"] = params;
+    let connection = Connection::default();
+    assert_eq!(call(&connection, &hello())["ok"], true);
+    let calls = AtomicUsize::new(0);
+    let value = json!({"terminalId":"t1","appended":true});
+    let reply = connection.invoke(
+        true,
+        "bac:workspace-add-terminal",
+        &request,
+        || panic!("feature must not load identity"),
+        |host, parsed| {
+            assert_eq!(calls.fetch_add(1, Ordering::SeqCst), 0);
+            assert_eq!(host, HOST);
+            assert_eq!(parsed, expected);
+            Ok(value.clone())
+        },
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reply, json!({"ok":true,"value":value}));
+
+    let fresh = Connection::default();
+    assert_eq!(
+        fresh.invoke(
+            true,
+            "bac:workspace-add-terminal",
+            &request,
+            || panic!("feature must not load identity"),
+            |_, _| panic!("unnegotiated request ran"),
+        ),
+        Error::NotOptedIn.reply()
+    );
 }
 
 #[test]

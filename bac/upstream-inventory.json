@@ -219,6 +219,20 @@
       "digest": "c13236548b555da945422c1aa6abddf0a163481ebb0d39d1ae2955eec82959f4"
     },
     {
+      "path": "src-tauri/src/commands/profile.rs",
+      "kind": "hook",
+      "feature": "workspace terminal append",
+      "reason": "A marked module hook lets the BAC profile adapter access the persistent profile store and helpers.",
+      "plan": "keep",
+      "planReason": "Retain minimal profile module registration while the implementation remains in the BAC adapter.",
+      "added": 3,
+      "removed": 0,
+      "digest": "a7d54e376344e5941242e37dc1a78b63b777646db4223f3d5b8afbeebe4bfe59",
+      "hooks": [
+        "profile-adapter"
+      ]
+    },
+    {
       "path": "src-tauri/src/lib.rs",
       "kind": "hook",
       "feature": "error log and archive paging",
@@ -252,15 +266,16 @@
     {
       "path": "src-tauri/src/window_registry.rs",
       "kind": "hook",
-      "feature": "read-only workspace contracts",
+      "feature": "read-only workspace contracts and workspace terminal append",
       "reason": "A marked module hook lets the BAC observer access the in-memory registry without loading or mutating it.",
       "plan": "keep",
       "planReason": "Retain minimal registry module registration while the implementation remains in the BAC adapter.",
-      "added": 3,
-      "removed": 0,
-      "digest": "a8bc2b5c7a31bafad7d4c13ab4cf73d0ecb1031671624b7f07707b1d7029c825",
+      "added": 19,
+      "removed": 5,
+      "digest": "c26451648d24ef959d46ab9262c84b761f1be748c245521f738777ed7177cc6a",
       "hooks": [
-        "registry-adapter"
+        "registry-adapter",
+        "live-writer-body"
       ]
     },
     {
@@ -366,6 +381,10 @@
     {
       "path": "src-tauri/src/bac/catalog.rs",
       "feature": "read-only workspace contracts"
+    },
+    {
+      "path": "src-tauri/src/bac/commands_profile.rs",
+      "feature": "workspace terminal append"
     },
     {
       "path": "src-tauri/src/bac/remote_server.rs",

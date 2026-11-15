@@ -9,37 +9,15 @@
     )
 )]
 
-use bac_host_contracts::workspace::{CatalogEntry, OperationError, CATALOG_FILE_MAX_BYTES};
-use std::{io, panic::AssertUnwindSafe, path::Path};
-
-fn catalog_file_is_acceptable(path: &Path) -> Result<bool, OperationError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_file() || metadata.len() > CATALOG_FILE_MAX_BYTES as u64 {
-                Err(OperationError::WorkspaceUnavailable)
-            } else {
-                Ok(true)
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(OperationError::WorkspaceUnavailable),
-    }
-}
+use bac_host_contracts::workspace::{catalog_files_acceptable, CatalogEntry, OperationError};
+use std::{panic::AssertUnwindSafe, path::Path};
 
 fn read_local_profile_index(
     dir: &Path,
 ) -> Result<bat_app_storage::profile::ProfileIndex, OperationError> {
     let guard = bat_app_storage::profile::profile_index_guard();
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut has_regular_index = false;
-        for name in ["index.json", "index.json.bak"] {
-            if catalog_file_is_acceptable(&dir.join(name))? {
-                has_regular_index = true;
-            }
-        }
-        if !has_regular_index {
-            return Err(OperationError::WorkspaceUnavailable);
-        }
+        catalog_files_acceptable(dir)?;
         bat_app_storage::profile::read_catalog_unlocked(dir)
             .map_err(|_| OperationError::WorkspaceUnavailable)
     }))
@@ -50,19 +28,15 @@ fn read_local_profile_index(
 
 pub(super) fn read_local_catalog(dir: &Path) -> Result<Vec<CatalogEntry>, OperationError> {
     let index = read_local_profile_index(dir)?;
-    Ok(index
-        .profiles
-        .into_iter()
-        .map(|profile| CatalogEntry {
-            id: profile.id,
-            is_local: profile.kind == "local",
-        })
-        .collect())
+    Ok(crate::commands::profile::bac_workspace::catalog_entries(
+        &index,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bac_host_contracts::workspace::CATALOG_FILE_MAX_BYTES;
     use serde_json::json;
     use std::{
         fs,

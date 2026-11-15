@@ -1042,3 +1042,527 @@ fn persisted_read_eligibility_requires_readable_raw_first_window() {
     }));
     assert!(valid_single.append_target_eligible);
 }
+
+fn sample_registration(id: &str, workspace_id: &str) -> Registration {
+    Registration {
+        id: id.into(),
+        workspace_id: workspace_id.into(),
+        title: "Agent".into(),
+        cwd: "/work".into(),
+        agent_preset: AgentPreset::ClaudeCode,
+        model: None,
+        permission_mode: None,
+        agent_params: None,
+        worktree_path: None,
+        worktree_branch: None,
+    }
+}
+
+#[test]
+fn append_b5_decision_order_and_effective_comparison() {
+    let stale_rev = "sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c";
+    let base_reg = sample_registration("t1", "missing-ws");
+    let req_stale = AppendRequest {
+        profile_id: "default".into(),
+        expected_revision: stale_rev.into(),
+        terminal: base_reg.clone(),
+    };
+
+    // 1. Structural error precedes everything else (even matching terminal ID or stale revision).
+    let broken_doc = json!({"workspaces": [{"id": "w1"}]});
+    assert_eq!(
+        prepare_append(
+            HOST,
+            &req_stale,
+            Source::Persisted,
+            None,
+            &broken_doc,
+            |_| {}
+        ),
+        Err(TxAbort::Refused(OperationError::WorkspaceUnavailable))
+    );
+
+    // 2. Same terminal ID + identical effective registration -> Noop (even with stale expectedRevision
+    //    and missing workspaceId; missing agentParams vs {}, null model vs absent, missing type vs "terminal").
+    let stored_same = document(
+        json!([]),
+        json!([{
+            "id": "t1",
+            "workspaceId": "missing-ws",
+            "title": "Agent",
+            "cwd": "/work",
+            "agentPreset": "claude-code",
+            "model": null,
+            "agentParams": {},
+            "sessionId": "s-foreign"
+        }]),
+    );
+    let stored_same_rev = canonical_digest(&stored_same).unwrap().0;
+    assert_eq!(
+        prepare_append(
+            HOST,
+            &req_stale,
+            Source::Live,
+            Some("win-1".into()),
+            &stored_same,
+            |_| {}
+        ),
+        Err(TxAbort::Noop(AppendResult {
+            host_id: HOST.into(),
+            profile_id: "default".into(),
+            source: Source::Live,
+            window_id: Some("win-1".into()),
+            terminal_id: "t1".into(),
+            appended: false,
+            revision: stored_same_rev.clone(),
+        }))
+    );
+
+    // 2b (D12). A no-op on a stored document whose canonical size exceeds DOCUMENT_MAX_BYTES
+    //           returns WORKSPACE_TOO_LARGE.
+    let mut oversized_noop_doc = stored_same.clone();
+    oversized_noop_doc["workspaces"] = json!([{"id": "w1", "pad": ""}]);
+    let base_noop_bytes = canonical_digest(&oversized_noop_doc).unwrap().1;
+    oversized_noop_doc["workspaces"][0]["pad"] =
+        json!("x".repeat(DOCUMENT_MAX_BYTES - base_noop_bytes + 1));
+    assert_eq!(
+        canonical_digest(&oversized_noop_doc).unwrap().1,
+        DOCUMENT_MAX_BYTES + 1
+    );
+    assert_eq!(
+        prepare_append(
+            HOST,
+            &req_stale,
+            Source::Persisted,
+            None,
+            &oversized_noop_doc,
+            |_| {}
+        ),
+        Err(TxAbort::Refused(OperationError::WorkspaceTooLarge))
+    );
+
+    // 3. Same terminal ID + differing effective field -> TERMINAL_EXISTS {terminalId, currentRevision}
+    //    (precedes REVISION_MISMATCH and WORKSPACE_NOT_FOUND).
+    let mut req_diff = req_stale.clone();
+    req_diff.terminal.title = "Different".into();
+    let conflict = prepare_append(
+        HOST,
+        &req_diff,
+        Source::Persisted,
+        None,
+        &stored_same,
+        |_| {},
+    )
+    .expect_err("conflicting terminal ID must abort");
+    assert_eq!(
+        conflict,
+        TxAbort::Refused(OperationError::TerminalExists {
+            terminal_id: "t1".into(),
+            current_revision: stored_same_rev.clone(),
+        })
+    );
+    assert_eq!(
+        OperationError::TerminalExists {
+            terminal_id: "t1".into(),
+            current_revision: stored_same_rev.clone(),
+        }
+        .reply()["error"]["details"],
+        json!({"terminalId": "t1", "currentRevision": stored_same_rev})
+    );
+
+    // 4. New terminal ID + mismatched expectedRevision -> REVISION_MISMATCH {currentRevision}
+    //    (precedes WORKSPACE_NOT_FOUND).
+    let doc_with_ws = document(json!([{"id": "w1"}]), json!([]));
+    let current_rev = canonical_digest(&doc_with_ws).unwrap().0;
+    let mismatch = prepare_append(
+        HOST,
+        &req_stale,
+        Source::Persisted,
+        None,
+        &doc_with_ws,
+        |_| {},
+    )
+    .expect_err("stale revision must abort");
+    assert_eq!(
+        mismatch,
+        TxAbort::Refused(OperationError::RevisionMismatch {
+            current_revision: current_rev.clone(),
+        })
+    );
+    let mismatch_reply = OperationError::RevisionMismatch {
+        current_revision: current_rev.clone(),
+    }
+    .reply();
+    assert_eq!(mismatch_reply["error"]["retryable"], true);
+    assert_eq!(
+        mismatch_reply["error"]["details"],
+        json!({"currentRevision": current_rev})
+    );
+
+    // 5. Matching expectedRevision + missing workspaceId -> WORKSPACE_NOT_FOUND {workspaceId}.
+    let mut req_missing_ws = req_stale.clone();
+    req_missing_ws.expected_revision = current_rev.clone();
+    assert_eq!(
+        prepare_append(
+            HOST,
+            &req_missing_ws,
+            Source::Persisted,
+            None,
+            &doc_with_ws,
+            |_| {}
+        ),
+        Err(TxAbort::Refused(OperationError::WorkspaceNotFound(
+            "missing-ws".into()
+        )))
+    );
+    assert_eq!(
+        OperationError::WorkspaceNotFound("missing-ws".into()).reply()["error"]["details"],
+        json!({"workspaceId": "missing-ws"})
+    );
+
+    // 6. Prospective canonical doc > 520,192 B (before or after overlay) -> WORKSPACE_TOO_LARGE,
+    //    and <= 520,192 B returns the prospective document AFTER the runtime overlay (D13).
+    let mut req_ok = req_missing_ws;
+    req_ok.terminal.workspace_id = "w1".into();
+    let mut sized_doc = document(json!([{"id": "w1", "pad": ""}]), json!([]));
+    let mut probe = sized_doc.clone();
+    probe["terminals"]
+        .as_array_mut()
+        .unwrap()
+        .push(normalize_registration(&req_ok.terminal));
+    let base_prospective_bytes = canonical_digest(&probe).unwrap().1;
+    let exact_pad = DOCUMENT_MAX_BYTES - base_prospective_bytes;
+
+    sized_doc["workspaces"][0]["pad"] = json!("x".repeat(exact_pad + 1));
+    req_ok.expected_revision = canonical_digest(&sized_doc).unwrap().0;
+    assert_eq!(
+        prepare_append(HOST, &req_ok, Source::Persisted, None, &sized_doc, |_| {}).unwrap_err(),
+        TxAbort::Refused(OperationError::WorkspaceTooLarge)
+    );
+
+    sized_doc["workspaces"][0]["pad"] = json!("x".repeat(exact_pad));
+    req_ok.expected_revision = canonical_digest(&sized_doc).unwrap().0;
+    assert_eq!(
+        prepare_append(HOST, &req_ok, Source::Persisted, None, &sized_doc, |doc| {
+            doc["activeTerminalId"] = json!("term-1");
+        })
+        .unwrap_err(),
+        TxAbort::Refused(OperationError::WorkspaceTooLarge)
+    );
+
+    let mut small_doc = document(json!([{"id": "w1"}]), json!([]));
+    req_ok.expected_revision = canonical_digest(&small_doc).unwrap().0;
+    let overlaid = prepare_append(
+        HOST,
+        &req_ok,
+        Source::Live,
+        Some("w".into()),
+        &small_doc,
+        |doc| {
+            doc["terminals"][0]["cwd"] = json!("/overlaid");
+        },
+    )
+    .expect("valid append within bound must succeed");
+    small_doc["terminals"] = json!([normalize_registration(&req_ok.terminal)]);
+    small_doc["terminals"][0]["cwd"] = json!("/overlaid");
+    assert_eq!(overlaid, small_doc);
+}
+
+#[test]
+fn registration_normalization_omits_absent_and_null_except_worktree_branch() {
+    let empty_rev = "sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c";
+    let parsed = parse_request(
+        "bac:workspace-add-terminal",
+        &json!({
+            "profileId": "default",
+            "expectedRevision": empty_rev,
+            "terminal": {
+                "id": "t2",
+                "workspaceId": "w1",
+                "title": "Term 2",
+                "type": "terminal",
+                "cwd": "/repo",
+                "agentPreset": "codex-agent-worktree",
+                "model": null,
+                "agentParams": null,
+                "worktreeBranch": null
+            }
+        }),
+    )
+    .expect("valid request");
+    let Request::WorkspaceAddTerminal(mut append_req) = parsed else {
+        panic!("expected WorkspaceAddTerminal");
+    };
+
+    let normalized = normalize_registration(&append_req.terminal);
+    let obj = normalized.as_object().unwrap();
+    assert!(!obj.contains_key("model"));
+    assert!(!obj.contains_key("permissionMode"));
+    assert!(!obj.contains_key("agentParams"));
+    assert!(!obj.contains_key("worktreePath"));
+    assert_eq!(obj.get("worktreeBranch"), Some(&Value::Null));
+
+    let mut without_branch = append_req.terminal.clone();
+    without_branch.worktree_branch = None;
+    assert!(!normalize_registration(&without_branch)
+        .as_object()
+        .unwrap()
+        .contains_key("worktreeBranch"));
+
+    let existing_doc = json!({
+        "workspaces": [{"id": "w1", "customWorkspaceKey": 7}],
+        "activeWorkspaceId": "w1",
+        "activeGroup": null,
+        "terminals": [{
+            "id": "t1",
+            "workspaceId": "w1",
+            "title": "Existing",
+            "type": "terminal",
+            "cwd": "/existing",
+            "agentPreset": "claude-code",
+            "sessionId": "sess-99",
+            "foreignKey": {"keep": true}
+        }],
+        "activeTerminalId": "t1",
+        "topForeign": "kept"
+    });
+    append_req.expected_revision = canonical_digest(&existing_doc).unwrap().0;
+    let prospective = prepare_append(
+        HOST,
+        &append_req,
+        Source::Persisted,
+        None,
+        &existing_doc,
+        |_| {},
+    )
+    .expect("append must succeed");
+    assert_eq!(prospective["topForeign"], json!("kept"));
+    assert_eq!(prospective["workspaces"][0]["customWorkspaceKey"], json!(7));
+    assert_eq!(
+        prospective["terminals"][0]["foreignKey"],
+        json!({"keep": true})
+    );
+    assert_eq!(prospective["terminals"][0]["sessionId"], json!("sess-99"));
+    assert_eq!(prospective["terminals"][1], normalized);
+}
+
+#[test]
+fn append_live_largest_reply_fits_bound_b12() {
+    let profile_id = "p".repeat(128);
+    let terminal_id = "t".repeat(128);
+    let max_window_id = "w".repeat(1022);
+    assert!(window_id_within_bound(&max_window_id));
+
+    let doc = document(
+        json!([{"id": "w1"}]),
+        json!([{
+            "id": terminal_id,
+            "workspaceId": "w1",
+            "title": "Agent",
+            "type": "terminal",
+            "cwd": "/work",
+            "agentPreset": "claude-code"
+        }]),
+    );
+    let req = AppendRequest {
+        profile_id: profile_id.clone(),
+        expected_revision:
+            "sha256:66c1b7a04a05ee220e10341c9baec59bdf92885b193c2838d527a235d2ca5a9c".into(),
+        terminal: sample_registration(&terminal_id, "w1"),
+    };
+    let Err(TxAbort::Noop(result)) =
+        prepare_append(HOST, &req, Source::Live, Some(max_window_id), &doc, |_| {})
+    else {
+        panic!("expected noop AppendResult at 1024-byte windowId bound");
+    };
+    let id = json!("\u{1}".repeat(128));
+    let reply = json!({"ok": true, "value": result});
+    let frame = json!({"type": "invoke-result", "id": id, "result": reply});
+    let encoded_len = serde_json::to_vec(&frame).unwrap().len();
+    assert_eq!(encoded_len, 2_318);
+    assert!(encoded_len <= RESULT_BYTES);
+    assert_eq!(crate::wire::bound_result(&id, reply.clone()), reply);
+
+    let oversized_window_id = "w".repeat(1023);
+    assert!(!window_id_within_bound(&oversized_window_id));
+    let mut overlay_called = false;
+    assert_eq!(
+        prepare_append(
+            HOST,
+            &req,
+            Source::Live,
+            Some(oversized_window_id),
+            &doc,
+            |_| {
+                overlay_called = true;
+            }
+        ),
+        Err(TxAbort::Refused(OperationError::WorkspaceUnavailable))
+    );
+    assert!(!overlay_called);
+}
+
+#[test]
+fn verify_readback_rejects_missing_or_mismatched_registration() {
+    let base_doc = document(json!([{"id": "w1"}]), json!([]));
+    let rev = canonical_digest(&base_doc).unwrap().0;
+    let req = AppendRequest {
+        profile_id: "default".into(),
+        expected_revision: rev,
+        terminal: sample_registration("t1", "w1"),
+    };
+    let prospective = prepare_append(HOST, &req, Source::Persisted, None, &base_doc, |_| {})
+        .expect("prepare_append must succeed");
+    let expected_rev = canonical_digest(&prospective).unwrap().0;
+    assert_eq!(
+        verify_readback(&prospective, &prospective, "t1"),
+        Ok(expected_rev)
+    );
+
+    assert_eq!(
+        verify_readback(&base_doc, &prospective, "t1"),
+        Err(OperationError::WriteFailed)
+    );
+
+    let mut wrong_reg = prospective.clone();
+    wrong_reg["terminals"][0]["cwd"] = json!("/different");
+    assert_eq!(
+        verify_readback(&wrong_reg, &prospective, "t1"),
+        Err(OperationError::WriteFailed)
+    );
+
+    let broken = json!({"workspaces": []});
+    assert_eq!(
+        verify_readback(&broken, &prospective, "t1"),
+        Err(OperationError::WriteFailed)
+    );
+    assert_eq!(
+        OperationError::WriteFailed.reply()["error"]["details"],
+        json!({"outcome": "unknown"})
+    );
+}
+
+#[test]
+fn catalog_files_acceptable_checks_absent_regular_oversize_non_regular_and_neither() {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "bac-catalog-acceptable-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+
+    assert_eq!(
+        catalog_files_acceptable(&dir),
+        Err(OperationError::WorkspaceUnavailable)
+    );
+
+    fs::write(dir.join("index.json"), b"{}").unwrap();
+    assert_eq!(catalog_files_acceptable(&dir), Ok(()));
+    fs::remove_file(dir.join("index.json")).unwrap();
+
+    fs::write(dir.join("index.json.bak"), b"{}").unwrap();
+    assert_eq!(catalog_files_acceptable(&dir), Ok(()));
+
+    let max_exact = dir.join("index.json");
+    fs::File::create(&max_exact)
+        .unwrap()
+        .set_len(CATALOG_FILE_MAX_BYTES as u64)
+        .unwrap();
+    assert_eq!(catalog_files_acceptable(&dir), Ok(()));
+
+    for (target, peer) in [
+        ("index.json", "index.json.bak"),
+        ("index.json.bak", "index.json"),
+    ] {
+        let _ = fs::remove_file(dir.join(target));
+        let _ = fs::remove_dir_all(dir.join(target));
+        fs::write(dir.join(peer), b"{}").unwrap();
+
+        fs::File::create(dir.join(target))
+            .unwrap()
+            .set_len(CATALOG_FILE_MAX_BYTES as u64 + 1)
+            .unwrap();
+        assert_eq!(
+            catalog_files_acceptable(&dir),
+            Err(OperationError::WorkspaceUnavailable)
+        );
+        fs::remove_file(dir.join(target)).unwrap();
+
+        fs::create_dir(dir.join(target)).unwrap();
+        assert_eq!(
+            catalog_files_acceptable(&dir),
+            Err(OperationError::WorkspaceUnavailable)
+        );
+        fs::remove_dir(dir.join(target)).unwrap();
+
+        #[cfg(unix)]
+        {
+            let real = dir.join("real.json");
+            fs::write(&real, b"{}").unwrap();
+            std::os::unix::fs::symlink(&real, dir.join(target)).unwrap();
+            assert_eq!(
+                catalog_files_acceptable(&dir),
+                Err(OperationError::WorkspaceUnavailable)
+            );
+            fs::remove_file(dir.join(target)).unwrap();
+            fs::remove_file(real).unwrap();
+        }
+    }
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn saved_windows_append_eligible_requires_single_readable_window_and_valid_document() {
+    let valid_window = json!({
+        "workspaces": [{"id": "w1"}],
+        "terminals": [{"id": "t1", "workspaceId": "w1"}]
+    });
+    let valid_doc = saved_document(&valid_window).unwrap();
+
+    assert!(saved_windows_append_eligible(
+        std::slice::from_ref(&valid_window),
+        &valid_doc
+    ));
+    assert!(!saved_windows_append_eligible(&[], &valid_doc));
+    assert!(!saved_windows_append_eligible(
+        &[valid_window.clone(), valid_window.clone()],
+        &valid_doc
+    ));
+
+    let missing_terminal_id_win = json!({
+        "workspaces": [{"id": "w1"}],
+        "terminals": [{"workspaceId": "w1"}]
+    });
+    assert!(!saved_windows_append_eligible(
+        &[missing_terminal_id_win],
+        &valid_doc
+    ));
+
+    let missing_workspaces_win = json!({"terminals": []});
+    let migrated_doc = saved_document(&missing_workspaces_win).unwrap();
+    assert!(structural_preconditions_ok(&migrated_doc));
+    assert!(!saved_windows_append_eligible(
+        &[missing_workspaces_win],
+        &migrated_doc
+    ));
+
+    let dup_terminals_doc = document(
+        json!([{"id": "w1"}]),
+        json!([
+            {"id": "dup", "workspaceId": "w1"},
+            {"id": "dup", "workspaceId": "w1"}
+        ]),
+    );
+    assert!(!saved_windows_append_eligible(
+        &[valid_window],
+        &dup_terminals_doc
+    ));
+}

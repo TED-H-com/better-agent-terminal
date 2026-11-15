@@ -484,7 +484,7 @@ pub fn persist_agent_runtime_meta(app: &AppHandle, topic: &str, payload: &Value)
 }
 
 pub fn save_workspace_json(app: &AppHandle, window_id: &str, data: &str) -> bool {
-    let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
         debug_registry_log(
             app,
             format!(
@@ -497,7 +497,18 @@ pub fn save_workspace_json(app: &AppHandle, window_id: &str, data: &str) -> bool
     let state = app.state::<WindowRegistryState>();
     let runtime_meta = state.runtime_meta.lock().unwrap();
     let mut entries = state.entries.lock().unwrap();
-    ensure_entries_ready(app, &mut entries);
+    save_workspace_locked(app, window_id, value, &runtime_meta, &mut entries)
+}
+
+// bac-hook: live-writer-body
+pub(crate) fn save_workspace_locked(
+    app: &AppHandle,
+    window_id: &str,
+    mut value: Value,
+    runtime_meta: &HashMap<String, (Option<String>, Value)>,
+    entries: &mut Vec<WindowEntry>,
+) -> bool {
+    ensure_entries_ready(app, entries);
     // Ignore saves from windows that no longer have a registry entry.
     // A "Remove from profile" close fires one last workspace.save while the
     // webview tears down — resurrecting the entry there would re-add the
@@ -514,15 +525,15 @@ pub fn save_workspace_json(app: &AppHandle, window_id: &str, data: &str) -> bool
         return false;
     };
     let mut entry = entries[slot_index].clone();
-    apply_runtime_workspace_meta(&mut value, &entry.profile_id, &runtime_meta);
+    apply_runtime_workspace_meta(&mut value, &entry.profile_id, runtime_meta);
     entry.snapshot = snapshot_from_workspace_value(value);
     entry.last_active_at = now_millis();
     entries[slot_index] = entry.clone();
-    persist_entries(app, &entries);
+    persist_entries(app, entries);
     if window_id == "main" {
         write_global_workspace(app, &entry.snapshot);
     }
-    let windows = profile_windows(&entries, &entry.profile_id);
+    let windows = profile_windows(entries, &entry.profile_id);
     write_profile_snapshot(app, &entry.profile_id, &windows);
     debug_registry_log(
         app,
